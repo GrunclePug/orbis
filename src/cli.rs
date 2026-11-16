@@ -10,6 +10,7 @@ use clap::{Args, Subcommand};
 use orbis::cancel::Cancel;
 use orbis::ckan_import;
 use orbis::config::Config;
+use orbis::crafts;
 use orbis::download::DownloadEvent;
 use orbis::flags;
 use orbis::instance::{self, CopyMode, CreateOptions, Instance};
@@ -21,6 +22,7 @@ use orbis::ops::{self, Event};
 use orbis::paths::Paths;
 use orbis::repo::{self, Index};
 use orbis::resolver::{Plan, Request, ResolveError};
+use orbis::running;
 use orbis::starred::Starred;
 use orbis::steam::{self, SteamInfo};
 use orbis::version::{GameVersion, ModVersion};
@@ -128,6 +130,9 @@ pub enum Command {
     /// Manage the manual mod library.
     #[command(subcommand)]
     Manual(ManualCmd),
+    /// Manage the craft library (shared by all instances).
+    #[command(subcommand)]
+    Craft(CraftCmd),
     /// Manage the custom flag library (shared by all instances).
     #[command(subcommand)]
     Flag(FlagCmd),
@@ -312,6 +317,53 @@ pub enum InstanceCmd {
         add: Vec<String>,
         #[arg(long, value_name = "VERSION")]
         remove: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CraftCmd {
+    /// List the library, and whether each craft fits an instance.
+    List {
+        #[arg(short, long)]
+        instance: Option<String>,
+        /// List the trash instead.
+        #[arg(long)]
+        trash: bool,
+    },
+    /// Collect new and changed craft from every instance and update the others.
+    Sync,
+    /// Add a craft file to the library.
+    Add { file: PathBuf },
+    /// Add every craft under a folder (for example an old install's saves).
+    Import { dir: PathBuf },
+    /// Delete a craft from every instance (it goes to the trash).
+    Delete { craft: String },
+    /// Bring a craft back from the trash.
+    Restore { craft: String },
+    /// Delete everything in the trash for good.
+    EmptyTrash,
+    /// Show a craft's revisions.
+    History {
+        craft: String,
+        #[arg(short, long)]
+        instance: Option<String>,
+    },
+    /// Save a revision (numbered as `history` shows) as a new craft.
+    Fork {
+        craft: String,
+        revision: usize,
+        #[arg(long)]
+        name: String,
+    },
+    /// List craft that went missing and wait for a decision, or settle one
+    /// (numbered as listed).
+    Pending {
+        /// Delete this one everywhere.
+        #[arg(long, value_name = "N", conflicts_with = "put_back")]
+        delete: Option<usize>,
+        /// Copy this one back into its save.
+        #[arg(long, value_name = "N")]
+        put_back: Option<usize>,
     },
 }
 
@@ -548,9 +600,16 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
         }
         Command::Manual(c) => manual_cmd(ctx, c),
         Command::Flag(c) => flag_cmd(ctx, c),
+        Command::Craft(c) => craft_cmd(ctx, c),
         Command::Launch { instance, dry_run } => {
             let mut inst = ctx.instance(instance.as_deref())?;
+            if running::is_running(&inst.dir) {
+                bail!("{} is already running", inst.config.name);
+            }
             instance::sync(&ctx.paths, &mut inst)?;
+            if !dry_run {
+                sync_crafts(ctx);
+            }
             if inst.config.launch.via_steam {
                 let steam = ctx.steam();
                 if dry_run {
@@ -590,6 +649,9 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                 return Ok(());
             }
             let child = launch::spawn(&plan)?;
+            if let Err(e) = running::mark(&inst.dir, child.id(), "direct") {
+                eprintln!("warning: {e:#}");
+            }
             inst.config.last_played = Some(orbis::paths::now_secs());
             inst.save()?;
             writeln!(
@@ -1348,6 +1410,210 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
                 inst.config.game_version,
                 compat.join(", ")
             )?;
+            Ok(())
+        }
+    }
+}
+
+/// Syncs craft before a launch; problems are warnings, never a reason not to launch.
+fn sync_crafts(ctx: &Context) {
+    match crafts::sync(&ctx.paths) {
+        Ok(r) => {
+            let summary = r.summary();
+            if !summary.is_empty() {
+                eprintln!("{summary}");
+            }
+            for n in &r.notes {
+                eprintln!("{n}");
+            }
+        }
+        Err(e) => eprintln!("warning: craft sync failed: {e:#}"),
+    }
+}
+
+fn when_saved(secs: u64) -> String {
+    let days = orbis::paths::now_secs().saturating_sub(secs) / 86_400;
+    match days {
+        0 => "today".into(),
+        1 => "yesterday".into(),
+        d => format!("{d} days ago"),
+    }
+}
+
+fn craft_cmd(ctx: &Context, cmd: CraftCmd) -> Result<()> {
+    let mut out = io::stdout();
+    match cmd {
+        CraftCmd::List { instance, trash } => {
+            let lib = crafts::Library::load(&ctx.paths)?;
+            let index = match &instance {
+                Some(_) => Some(
+                    crafts::cached_index(&ctx.instance(instance.as_deref())?)
+                        .context("no part list for that instance yet; run `orbis craft sync`")?,
+                ),
+                None => None,
+            };
+            let providers = crafts::providers(&ctx.paths);
+            for c in lib.crafts.iter().filter(|c| c.live() != trash) {
+                let mut line = format!(
+                    "{:4} {:3} {:36} {:3} parts  {:2} rev  saved {}",
+                    c.id,
+                    c.facility.dir(),
+                    c.name,
+                    c.head().parts.len(),
+                    c.revisions.len(),
+                    when_saved(c.head().saved)
+                );
+                if let Some(d) = &c.deleted {
+                    line.push_str(&format!("  deleted in {} {}", d.from, when_saved(d.at)));
+                }
+                if let Some(idx) = &index {
+                    let missing = idx.missing(&c.head().parts);
+                    if missing.is_empty() {
+                        line.push_str("  fits");
+                    } else {
+                        line.push_str(&format!(
+                            "  needs {}",
+                            crafts::explain(&missing, &providers)
+                        ));
+                    }
+                }
+                writeln!(out, "{line}")?;
+            }
+            Ok(())
+        }
+        CraftCmd::Sync => {
+            let r = crafts::sync(&ctx.paths)?;
+            let summary = r.summary();
+            writeln!(
+                out,
+                "{}",
+                if summary.is_empty() {
+                    "Crafts: up to date"
+                } else {
+                    &summary
+                }
+            )?;
+            for n in &r.notes {
+                writeln!(out, "{n}")?;
+            }
+            if !r.running.is_empty() {
+                writeln!(out, "Skipped while running: {}", r.running.join(", "))?;
+            }
+            Ok(())
+        }
+        CraftCmd::Add { file } => {
+            let name = crafts::add_file(&ctx.paths, &file)?;
+            writeln!(
+                out,
+                "Added {name}; `orbis craft sync` copies it into instances"
+            )?;
+            Ok(())
+        }
+        CraftCmd::Import { dir } => {
+            let r = crafts::import(&ctx.paths, &dir)?;
+            for n in &r.added {
+                writeln!(out, "Added {n}")?;
+            }
+            writeln!(
+                out,
+                "{} added, {} already in the library; `orbis craft sync` copies them into instances",
+                r.added.len(),
+                r.skipped
+            )?;
+            Ok(())
+        }
+        CraftCmd::Delete { craft } => {
+            let lib = crafts::Library::load(&ctx.paths)?;
+            let c = lib.find(&craft)?;
+            crafts::delete(&ctx.paths, &c.id)?;
+            writeln!(
+                out,
+                "Deleted {}; the next sync removes it from instances",
+                c.name
+            )?;
+            Ok(())
+        }
+        CraftCmd::Restore { craft } => {
+            let lib = crafts::Library::load(&ctx.paths)?;
+            let c = lib.find(&craft)?;
+            let name = crafts::restore(&ctx.paths, &c.id)?;
+            writeln!(out, "Restored {name}")?;
+            Ok(())
+        }
+        CraftCmd::EmptyTrash => {
+            let n = crafts::empty_trash(&ctx.paths)?;
+            writeln!(out, "Deleted {n} craft for good")?;
+            Ok(())
+        }
+        CraftCmd::History { craft, instance } => {
+            let lib = crafts::Library::load(&ctx.paths)?;
+            let c = lib.find(&craft)?;
+            let index = match &instance {
+                Some(_) => crafts::cached_index(&ctx.instance(instance.as_deref())?),
+                None => None,
+            };
+            for (i, r) in c.revisions.iter().enumerate().rev() {
+                let fit = match &index {
+                    Some(idx) if crafts::fits(idx, r) => "  fits",
+                    Some(_) => "  doesn't fit",
+                    None => "",
+                };
+                writeln!(
+                    out,
+                    "{:3}  {:12} from {:28} {:3} parts{fit}",
+                    i + 1,
+                    when_saved(r.saved),
+                    r.from,
+                    r.parts.len()
+                )?;
+            }
+            Ok(())
+        }
+        CraftCmd::Fork {
+            craft,
+            revision,
+            name,
+        } => {
+            let lib = crafts::Library::load(&ctx.paths)?;
+            let c = lib.find(&craft)?;
+            let r = revision
+                .checked_sub(1)
+                .and_then(|i| c.revisions.get(i))
+                .with_context(|| format!("{} has revisions 1 to {}", c.name, c.revisions.len()))?;
+            let name = crafts::fork(&ctx.paths, &c.id, &r.hash, &name)?;
+            writeln!(out, "Saved revision {revision} of {} as {name}", c.name)?;
+            Ok(())
+        }
+        CraftCmd::Pending { delete, put_back } => {
+            let list = crafts::pending(&ctx.paths)?;
+            let pick = delete.or(put_back);
+            let Some(n) = pick else {
+                for (i, p) in list.iter().enumerate() {
+                    writeln!(
+                        out,
+                        "{:3}  {} missing from {}/{}",
+                        i + 1,
+                        p.name,
+                        p.instance_name,
+                        p.location.save
+                    )?;
+                }
+                return Ok(());
+            };
+            let p = n
+                .checked_sub(1)
+                .and_then(|i| list.get(i))
+                .with_context(|| format!("no pending craft {n}"))?;
+            crafts::resolve(&ctx.paths, p, delete.is_some())?;
+            if delete.is_some() {
+                writeln!(out, "Deleted {} everywhere", p.name)?;
+            } else {
+                writeln!(
+                    out,
+                    "{} goes back into {}/{} on the next sync",
+                    p.name, p.instance_name, p.location.save
+                )?;
+            }
             Ok(())
         }
     }

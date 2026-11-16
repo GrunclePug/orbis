@@ -386,10 +386,31 @@ pub fn steam_run(paths: &crate::paths::Paths, command: &[OsString]) -> Result<i3
     if let Some(cwd) = &r.cwd {
         cmd.current_dir(cwd);
     }
+    // While this wrapper lives, the instance's game runs.
+    let instance_dir = note
+        .as_ref()
+        .filter(|_| r.cwd.is_some())
+        .map(|n| n.instance_dir.clone());
+    if let Some(dir) = &instance_dir
+        && let Err(e) = crate::running::mark(dir, std::process::id(), "steam")
+    {
+        log::warn!("record running instance: {e:#}");
+    }
     let status = cmd
         .status()
-        .with_context(|| format!("run {}", r.args[0].to_string_lossy()))?;
-    Ok(status.code().unwrap_or(1))
+        .with_context(|| format!("run {}", r.args[0].to_string_lossy()));
+    if let Some(dir) = &instance_dir {
+        crate::running::clear(dir, std::process::id());
+        let line = match crate::crafts::sync(paths) {
+            Ok(rep) => format!("craft sync: {}\n", rep.summary()),
+            Err(e) => format!("craft sync failed: {e:#}\n"),
+        };
+        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&log) {
+            use std::io::Write as _;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+    Ok(status?.code().unwrap_or(1))
 }
 
 #[cfg(test)]

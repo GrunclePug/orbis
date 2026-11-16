@@ -15,6 +15,7 @@ use eframe::egui;
 use orbis::cancel::Cancel;
 use orbis::ckan_import;
 use orbis::config::Config;
+use orbis::crafts::{self, Facility, PendingCraft};
 use orbis::download::DownloadEvent;
 use orbis::game::Dlc;
 use orbis::instance::{self, CopyMode, CreateOptions, Instance, ModSource, PrefixMode, Registry};
@@ -29,7 +30,7 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::SteamInfo;
 use orbis::version::{GameVersion, ModVersion};
-use orbis::{backup, flags, history, logs, store};
+use orbis::{backup, flags, history, logs, running, store};
 
 /// Height of one mod table row including spacing (see `view::ROW_H`).
 pub const ROW_STEP: f32 = 30.0;
@@ -43,6 +44,7 @@ pub enum Tab {
     Mods,
     Manual,
     Flags,
+    Crafts,
     History,
     Logs,
     Settings,
@@ -319,6 +321,19 @@ pub enum Dialog {
         name: String,
     },
     DeleteFlag(String),
+    AddCraft {
+        path: String,
+    },
+    ForkCraft {
+        id: String,
+        hash: String,
+        name: String,
+    },
+    DeleteCraft {
+        id: String,
+        name: String,
+    },
+    EmptyCraftTrash,
     RenameInstance {
         id: String,
         name: String,
@@ -362,6 +377,20 @@ pub enum Msg {
     AddFlag,
     AskDeleteFlag(String),
     DeleteFlag,
+    SyncCrafts,
+    OpenAddCraft(Option<PathBuf>),
+    AddCraft,
+    ToggleCraftHistory(String),
+    SetCraftFilter(Option<Facility>),
+    SetCraftTrash(bool),
+    OpenForkCraft(String, String),
+    ForkCraft,
+    AskDeleteCraft(String),
+    DeleteCraft,
+    RestoreCraft(String),
+    AskEmptyCraftTrash,
+    EmptyCraftTrash,
+    ResolvePending(usize, bool),
     SaveInstanceSettings,
     SaveGlobalSettings,
     ToggleStar(String),
@@ -408,6 +437,7 @@ pub enum Done {
     Restored(Result<Vec<String>, String>),
     CkanImported(Result<ckan_import::Report, String>),
     Shared(Result<store::Shared, String>),
+    CraftsSynced(Result<crafts::Report, String>),
 }
 
 /// Messages from background threads.
@@ -459,6 +489,20 @@ pub struct App {
     pub flags: Vec<flags::Flag>,
     /// Flag images by flag name, loaded with the library.
     pub flag_textures: HashMap<String, egui::TextureHandle>,
+    pub crafts: crafts::Library,
+    pub craft_providers: crafts::Providers,
+    pub craft_pending: Vec<PendingCraft>,
+    /// Thumbnails by revision hash.
+    pub craft_textures: HashMap<String, egui::TextureHandle>,
+    /// The current instance's part list and craft locations.
+    pub craft_index: Option<crafts::parts::PartIndex>,
+    pub craft_state: crafts::InstanceState,
+    /// The craft whose history is open.
+    pub craft_open: Option<String>,
+    pub craft_filter: Option<Facility>,
+    pub craft_trash: bool,
+    /// A craft sync should start as soon as no other task runs.
+    crafts_sync_wanted: bool,
     pub settings: SettingsForm,
     pub global: GlobalForm,
     pub running: Vec<(String, Child)>,
@@ -526,6 +570,16 @@ impl App {
             manual: Vec::new(),
             flags: Vec::new(),
             flag_textures: HashMap::new(),
+            crafts: crafts::Library::default(),
+            craft_providers: crafts::Providers::default(),
+            craft_pending: Vec::new(),
+            craft_textures: HashMap::new(),
+            craft_index: None,
+            craft_state: crafts::InstanceState::default(),
+            craft_open: None,
+            craft_filter: None,
+            craft_trash: false,
+            crafts_sync_wanted: !opts.headless,
             settings: SettingsForm::default(),
             global: GlobalForm::default(),
             running: Vec::new(),
@@ -591,6 +645,7 @@ impl App {
         app.tab = match opts.tab.as_deref() {
             Some("manual") => Tab::Manual,
             Some("flags") => Tab::Flags,
+            Some("crafts") => Tab::Crafts,
             Some("history") => Tab::History,
             Some("logs") => Tab::Logs,
             Some("settings") => Tab::Settings,
@@ -633,6 +688,7 @@ impl App {
             Err(e) => self.error(format!("{e:#}")),
         }
         self.load_flags();
+        self.load_crafts();
         if self
             .selected
             .as_ref()
@@ -644,6 +700,82 @@ impl App {
         self.settings.for_instance = None;
         self.load_side_data();
         self.recount_upgrades();
+    }
+
+    /// Re-reads the craft library, pending craft and thumbnails.
+    fn load_crafts(&mut self) {
+        self.crafts = crafts::Library::load(&self.ctx.paths).unwrap_or_else(|e| {
+            log::warn!("crafts: {e:#}");
+            crafts::Library::default()
+        });
+        self.craft_providers = crafts::providers(&self.ctx.paths);
+        self.craft_pending = crafts::pending(&self.ctx.paths).unwrap_or_else(|e| {
+            log::warn!("pending crafts: {e:#}");
+            vec![]
+        });
+        let hashes: BTreeSet<String> = self
+            .crafts
+            .crafts
+            .iter()
+            .map(|c| c.head().hash.clone())
+            .collect();
+        self.craft_textures.retain(|h, _| hashes.contains(h));
+        for h in hashes {
+            if self.craft_textures.contains_key(&h) {
+                continue;
+            }
+            let path = crafts::thumb_path(&self.ctx.paths, &h);
+            if !path.is_file() {
+                continue;
+            }
+            match flags::rgba(&path) {
+                Ok((w, ht, px)) => {
+                    let (Ok(w), Ok(ht)) = (usize::try_from(w), usize::try_from(ht)) else {
+                        continue;
+                    };
+                    let image = egui::ColorImage::from_rgba_unmultiplied([w, ht], &px);
+                    let tex = self.egui.load_texture(
+                        format!("craft-{h}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.craft_textures.insert(h, tex);
+                }
+                Err(e) => log::warn!("{}: {e:#}", path.display()),
+            }
+        }
+        self.load_craft_side();
+    }
+
+    /// The current instance's part list and craft locations.
+    fn load_craft_side(&mut self) {
+        match self.current().map(|v| v.inst.clone()) {
+            Some(inst) => {
+                self.craft_index = crafts::cached_index(&inst);
+                self.craft_state = crafts::load_state(&inst.dir).unwrap_or_default();
+            }
+            None => {
+                self.craft_index = None;
+                self.craft_state = crafts::InstanceState::default();
+            }
+        }
+    }
+
+    /// Starts a craft sync now, or as soon as the running task finishes.
+    fn want_craft_sync(&mut self) {
+        self.crafts_sync_wanted = true;
+        self.start_craft_sync();
+    }
+
+    fn start_craft_sync(&mut self) {
+        if !self.crafts_sync_wanted || self.task.is_some() {
+            return;
+        }
+        self.crafts_sync_wanted = false;
+        let paths = self.ctx.paths.clone();
+        self.spawn("Syncing crafts", move |_| {
+            Done::CraftsSynced(crafts::sync(&paths).map_err(|e| format!("{e:#}")))
+        });
     }
 
     /// Re-reads the flag library and decodes each flag for display.
@@ -674,6 +806,7 @@ impl App {
 
     /// Reads the current instance's history, backups and unmanaged files.
     fn load_side_data(&mut self) {
+        self.load_craft_side();
         let Some(view) = self.current() else {
             self.history.clear();
             self.backups.clear();
@@ -789,6 +922,9 @@ impl App {
             } else if ext == "png" {
                 self.tab = Tab::Flags;
                 self.update(Msg::OpenAddFlag(Some(p)));
+            } else if ext == "craft" {
+                self.tab = Tab::Crafts;
+                self.update(Msg::OpenAddCraft(Some(p)));
             } else {
                 self.tab = Tab::Manual;
                 self.update(Msg::OpenAddManual(Some(p)));
@@ -839,6 +975,7 @@ impl App {
             Tab::Mods,
             Tab::Manual,
             Tab::Flags,
+            Tab::Crafts,
             Tab::History,
             Tab::Logs,
             Tab::Settings,
@@ -847,7 +984,9 @@ impl App {
             Key::ArrowDown if m.ctrl => self.cycle_instance(1),
             Key::ArrowUp if m.ctrl => self.cycle_instance(-1),
             Key::Tab if m.ctrl => self.cycle_tab(if m.shift { -1 } else { 1 }),
-            Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 if m.ctrl => {
+            Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 | Key::Num7
+                if m.ctrl =>
+            {
                 let i = [
                     Key::Num1,
                     Key::Num2,
@@ -855,6 +994,7 @@ impl App {
                     Key::Num4,
                     Key::Num5,
                     Key::Num6,
+                    Key::Num7,
                 ]
                 .iter()
                 .position(|k| *k == key)
@@ -996,6 +1136,7 @@ impl App {
             Tab::Mods,
             Tab::Manual,
             Tab::Flags,
+            Tab::Crafts,
             Tab::History,
             Tab::Logs,
             Tab::Settings,
@@ -1108,15 +1249,29 @@ impl App {
             self.task = None;
             self.finish(d);
         }
+        let mut exited = Vec::new();
         self.running
             .retain_mut(|(name, child)| match child.try_wait() {
                 Ok(None) => true,
                 Ok(Some(status)) => {
                     log::info!("{name} exited: {status}");
+                    exited.push((name.clone(), child.id()));
                     false
                 }
-                Err(_) => false,
+                Err(_) => {
+                    exited.push((name.clone(), child.id()));
+                    false
+                }
             });
+        for (id, pid) in &exited {
+            if let Some(v) = self.instances.iter().find(|v| &v.inst.id == id) {
+                running::clear(&v.inst.dir, *pid);
+            }
+        }
+        if !exited.is_empty() {
+            self.crafts_sync_wanted = true;
+        }
+        self.start_craft_sync();
     }
 
     fn finish(&mut self, done: Done) {
@@ -1205,6 +1360,7 @@ impl App {
             }
             Done::Applied(id, r) => {
                 self.reload();
+                self.crafts_sync_wanted = true;
                 match r {
                     Ok(()) => {
                         // The user may have switched instances meanwhile:
@@ -1255,6 +1411,21 @@ impl App {
                     self.error(format!("Import failed: {e}"));
                 }
             },
+            Done::CraftsSynced(r) => {
+                match r {
+                    Ok(rep) => {
+                        let summary = rep.summary();
+                        if !summary.is_empty() {
+                            self.note(summary);
+                        }
+                        for n in rep.notes {
+                            self.note(n);
+                        }
+                    }
+                    Err(e) => self.error(format!("Craft sync failed: {e}")),
+                }
+                self.load_crafts();
+            }
             Done::ManualAdded(r) => match r {
                 Ok(m) => {
                     self.note(format!("Added {} to the manual library", m.name));
@@ -1790,6 +1961,119 @@ impl App {
                     }
                 }
             }
+            Msg::SyncCrafts => self.want_craft_sync(),
+            Msg::OpenAddCraft(path) => {
+                let path = path.map(|p| p.display().to_string()).unwrap_or_default();
+                self.dialog = Some(Dialog::AddCraft { path });
+            }
+            Msg::AddCraft => {
+                if let Some(Dialog::AddCraft { path }) = self.dialog.take() {
+                    let path = PathBuf::from(path.trim());
+                    let result = if path.is_dir() {
+                        crafts::import(&self.ctx.paths, &path).map(|r| {
+                            format!(
+                                "Imported {} craft ({} already in the library)",
+                                r.added.len(),
+                                r.skipped
+                            )
+                        })
+                    } else {
+                        crafts::add_file(&self.ctx.paths, &path).map(|n| format!("Added {n}"))
+                    };
+                    match result {
+                        Ok(msg) => {
+                            self.note(msg);
+                            self.want_craft_sync();
+                            self.load_crafts();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
+            Msg::ToggleCraftHistory(id) => {
+                self.craft_open = if self.craft_open.as_ref() == Some(&id) {
+                    None
+                } else {
+                    Some(id)
+                };
+            }
+            Msg::SetCraftFilter(f) => self.craft_filter = f,
+            Msg::SetCraftTrash(on) => self.craft_trash = on,
+            Msg::OpenForkCraft(id, hash) => {
+                let name = self
+                    .crafts
+                    .get(&id)
+                    .map(|c| format!("{} (copy)", c.name))
+                    .unwrap_or_default();
+                self.dialog = Some(Dialog::ForkCraft { id, hash, name });
+            }
+            Msg::ForkCraft => {
+                if let Some(Dialog::ForkCraft { id, hash, name }) = self.dialog.take() {
+                    match crafts::fork(&self.ctx.paths, &id, &hash, &name) {
+                        Ok(n) => {
+                            self.note(format!("Saved as {n}"));
+                            self.want_craft_sync();
+                            self.load_crafts();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
+            Msg::AskDeleteCraft(id) => {
+                if let Some(c) = self.crafts.get(&id) {
+                    self.dialog = Some(Dialog::DeleteCraft {
+                        name: c.name.clone(),
+                        id,
+                    });
+                }
+            }
+            Msg::DeleteCraft => {
+                if let Some(Dialog::DeleteCraft { id, name }) = self.dialog.take() {
+                    match crafts::delete(&self.ctx.paths, &id) {
+                        Ok(()) => {
+                            self.note(format!("Deleted {name}; it's in the trash"));
+                            self.want_craft_sync();
+                            self.load_crafts();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
+            Msg::RestoreCraft(id) => match crafts::restore(&self.ctx.paths, &id) {
+                Ok(n) => {
+                    self.note(format!("Restored {n}"));
+                    self.want_craft_sync();
+                    self.load_crafts();
+                }
+                Err(e) => self.error(format!("{e:#}")),
+            },
+            Msg::AskEmptyCraftTrash => self.dialog = Some(Dialog::EmptyCraftTrash),
+            Msg::EmptyCraftTrash => {
+                self.dialog = None;
+                match crafts::empty_trash(&self.ctx.paths) {
+                    Ok(n) => {
+                        self.note(format!("Deleted {n} craft for good"));
+                        self.load_crafts();
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            Msg::ResolvePending(i, delete) => {
+                if let Some(p) = self.craft_pending.get(i).cloned() {
+                    match crafts::resolve(&self.ctx.paths, &p, delete) {
+                        Ok(()) => {
+                            self.note(if delete {
+                                format!("Deleted {} everywhere", p.name)
+                            } else {
+                                format!("Putting {} back into {}", p.name, p.location.save)
+                            });
+                            self.want_craft_sync();
+                            self.load_crafts();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
             Msg::SaveInstanceSettings => self.save_instance_settings(),
             Msg::SaveGlobalSettings => self.save_global_settings(),
             Msg::ToggleStar(id) => {
@@ -2141,6 +2425,9 @@ impl App {
                 self.steam = self.ctx.steam();
                 self.steam_launch_options = launch::current_steam_launch_options(&self.steam);
                 self.reload();
+                if self.persist {
+                    self.crafts_sync_wanted = true;
+                }
             }
         }
     }
@@ -2338,9 +2625,22 @@ impl App {
     fn launch(&mut self) {
         let Some(view) = self.current() else { return };
         let mut inst = view.inst.clone();
-        if self.running.iter().any(|(id, _)| *id == inst.id) {
+        if self.running.iter().any(|(id, _)| *id == inst.id) || running::is_running(&inst.dir) {
             self.note(format!("{} is already running", inst.config.name));
             return;
+        }
+        // Bring craft up to date before the game reads them.
+        match crafts::sync(&self.ctx.paths) {
+            Ok(rep) => {
+                let summary = rep.summary();
+                if !summary.is_empty() {
+                    self.note(summary);
+                }
+                for n in rep.notes {
+                    self.note(n);
+                }
+            }
+            Err(e) => self.note(format!("Craft sync failed: {e:#}")),
         }
         match backup::snapshot(&inst, "before launch", self.ctx.config.backups_keep) {
             Ok(Some(b)) => self.note(format!("Backed up {} save(s)", b.saves.len())),
@@ -2371,6 +2671,9 @@ impl App {
             });
         match result {
             Ok(child) => {
+                if let Err(e) = running::mark(&inst.dir, child.id(), "direct") {
+                    log::warn!("record running instance: {e:#}");
+                }
                 self.note(format!("Started {}", inst.config.name));
                 inst.config.last_played = Some(orbis::paths::now_secs());
                 if let Err(e) = inst.save() {
@@ -2590,6 +2893,24 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
+        ));
+        line(format!(
+            "crafts: {}  pending: {}",
+            self.crafts
+                .crafts
+                .iter()
+                .map(|c| {
+                    let fit = match &self.craft_index {
+                        Some(i) if crafts::fits(i, c.head()) => "",
+                        Some(_) => " (doesn't fit)",
+                        None => "",
+                    };
+                    let gone = if c.live() { "" } else { " (trash)" };
+                    format!("{}{fit}{gone}", c.name)
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.craft_pending.len()
         ));
         let dialog = match &self.dialog {
             None => "none".to_owned(),

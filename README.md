@@ -14,6 +14,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 * **CKAN mods**: browse, search, install, upgrade and remove the whole CKAN catalogue, with dependencies, conflicts, recommendations and provider choices handled the way CKAN does.
 * **Dependencies out of the way**: the Installed list shows the mods you chose; dependencies stay hidden behind a checkbox and say which mods need them.
 * **Starred mods**: star the mods you always use, then show only starred mods in any list and queue them all at once in a new instance.
+* **Shared craft**: every craft you save in any instance lands in one library and is copied into every instance that has the parts for it, with revisions, a trash and an explanation of what's missing where it doesn't fit.
 * **Custom flags**: add your own flag images once, on the Flags tab or with `orbis flag add`, and pick them in every instance.
 * **Modpacks**: export an instance's mods (optionally with craft, saves and manual mod files) and import them as a new instance; CKAN's `.ckan` modpacks work both ways.
 * **Save backups**: saves are snapshotted before every mod change and launch (only when they changed), with one-click restore of a single save or all of them.
@@ -92,6 +93,12 @@ When only one instance exists, `-i` can be left out.
 | `orbis instance launcher [<instance>] --via direct\|steam` | Start the instance directly through Proton or through Steam |
 | `orbis manual list\|add\|show\|install\|delete` | Manage the manual mod library |
 | `orbis flag list\|add <png> [--name]\|remove <name>` | Manage the custom flag library |
+| `orbis craft list [-i <instance>] [--trash]` | List the craft library and whether each craft fits an instance |
+| `orbis craft sync` | Collect new and changed craft and update every instance that isn't running |
+| `orbis craft add <file>\|import <dir>` | Add a craft file, or every craft under a folder |
+| `orbis craft delete\|restore <craft>`, `orbis craft empty-trash` | Delete a craft everywhere, bring it back, or empty the trash |
+| `orbis craft history <craft>`, `orbis craft fork <craft> <n> --name <name>` | Show a craft's revisions, or save one as a new craft |
+| `orbis craft pending [--delete <n>\|--put-back <n>]` | List or settle craft that went missing and wait for a decision |
 | `orbis launch [<instance>] [--dry-run]` | Start an instance, or print the command |
 | `orbis steam` | Show the detected Steam, KSP and Proton paths |
 | `orbis history list\|undo\|restore <id> [--before]` | Show changes, undo the last one, or restore an earlier mod list |
@@ -131,6 +138,9 @@ An instance is a directory under `~/.local/share/orbis/instances/<id>/`:
 ```
 instance.toml   name, linked install, game version, compatible versions, launch settings
 registry.json   installed mods and the files each one owns
+crafts.json     where library craft sit in this instance's saves
+parts.json      the parts this instance provides, from its last craft sync
+running.toml    the process running the game, while it runs
 game/           the KSP directory the game runs from
 prefix/         a separate Wine prefix, when the instance uses one
 ```
@@ -180,7 +190,7 @@ These always work:
 | `Ctrl+F` | Search |
 | `Ctrl+Up` / `Ctrl+Down` | Previous / next instance |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
-| `Ctrl+1` to `Ctrl+6` | Mods, Manual mods, Flags, History, Logs, Settings |
+| `Ctrl+1` to `Ctrl+7` | Mods, Manual mods, Flags, Crafts, History, Logs, Settings |
 | `Ctrl+Z` | Undo the last mod change (asks first) |
 | `F2` | Rename the instance |
 | `F5` | Re-read instances from disk |
@@ -210,6 +220,20 @@ orbis flag add ~/Pictures/my-agency.png --name "My Agency"
 ```
 
 Every instance has a `GameData/OrbisFlags/Flags` link to the library, so a flag you add shows up in every instance's flag picker under `OrbisFlags/Flags/<name>`, with nothing to install. KSP's own flags are 256 by 160 pixels; other sizes are stretched to fit. Deleting a flag makes saves and craft that used it show the default flag.
+
+## Crafts
+
+The craft library lives in `~/.local/share/orbis/crafts/`. Every craft saved in any instance is collected into it and copied into every save of every instance that has all of its parts, so a craft built in one instance shows up in the others. A craft that needs a part an instance lacks stays out of that instance, and the **Crafts** tab says which mod it needs and which instance has it.
+
+orbis syncs before each launch, when a game it started (directly or through Steam) exits, when the GUI opens or you press `F5`, after mod changes, and with **Sync now** or `orbis craft sync`. It never touches an instance whose game is running.
+
+* **Saving over a craft** makes a new revision. If the new revision needs a part another instance lacks, that instance's copy is removed; the old revision stays in the craft's **History**, where **Save as new** keeps it as a craft of its own (for a stock version, say).
+* **Saving under a new name** (Orbiter II from Orbiter I) makes a new craft. orbis doesn't guess that the two are related.
+* **Deleting a craft in KSP** deletes it from every instance and puts it in the trash, where **Restore** brings it back. When several craft vanish from one save at once, orbis asks instead of deleting them. A deleted save or a restored backup never counts as deleting its craft.
+* **Changing a craft in two instances** before a sync keeps both: the second becomes `<name> (<save>)`. The same goes for two different craft with the same name.
+* **Moving a craft** into a folder of the craft browser keeps it; orbis follows it.
+
+Autosaves (`Auto-Saved Ship`) and backup folders mods make (`*_Backup`) are left out. Whether an instance has a part comes from its mod files, checked against ModuleManager's cache once the game has been launched; parts a patch creates count once the game has run. Add craft from elsewhere with **+ Add craft** (a `.craft` file, or a folder such as an old install's `saves`, whose thumbnails come along) or by dropping a `.craft` file on the window.
 
 ## Mod store
 

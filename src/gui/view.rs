@@ -24,6 +24,7 @@ pub fn draw(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         Tab::Mods => mods_tab(app, ui, msgs),
         Tab::Manual => manual_tab(app, ui, msgs),
         Tab::Flags => flags_tab(app, ui, msgs),
+        Tab::Crafts => crafts_tab(app, ui, msgs),
         Tab::History => history_tab(app, ui, msgs),
         Tab::Logs => logs_tab(app, ui, msgs),
         Tab::Settings => settings_tab(app, ui, msgs),
@@ -41,6 +42,7 @@ fn top_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 (Tab::Mods, "Mods"),
                 (Tab::Manual, "Manual mods"),
                 (Tab::Flags, "Flags"),
+                (Tab::Crafts, "Crafts"),
                 (Tab::History, "History"),
                 (Tab::Logs, "Logs"),
                 (Tab::Settings, "Settings"),
@@ -1100,44 +1102,306 @@ fn flags_tab(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         .id_salt("flags")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for f in &app.flags {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_width(THUMB.x);
-                        ui.vertical(|ui| {
-                            match app.flag_textures.get(&f.name) {
-                                Some(tex) => {
-                                    ui.add(
-                                        egui::Image::new(tex)
-                                            .fit_to_exact_size(THUMB)
-                                            .maintain_aspect_ratio(false),
-                                    )
-                                    .on_hover_text("Stretched to 8:5, as KSP shows it");
-                                }
-                                None => {
-                                    ui.allocate_ui(THUMB, |ui| {
-                                        ui.label(RichText::new("can't show this image").weak());
-                                    });
-                                }
-                            }
-                            ui.label(RichText::new(&f.name).strong());
-                            ui.label(
-                                RichText::new(format!("{} x {}", f.width, f.height))
-                                    .small()
-                                    .weak(),
-                            );
-                            if ui
-                                .small_button("Delete")
-                                .on_hover_text("Remove from the library")
-                                .clicked()
-                            {
-                                msgs.push(Msg::AskDeleteFlag(f.name.clone()));
-                            }
+            card_rows(ui, &app.flags, THUMB.x, |ui, f| {
+                match app.flag_textures.get(&f.name) {
+                    Some(tex) => {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(THUMB)
+                                .maintain_aspect_ratio(false),
+                        )
+                        .on_hover_text("Stretched to 8:5, as KSP shows it");
+                    }
+                    None => {
+                        ui.allocate_ui(THUMB, |ui| {
+                            ui.label(RichText::new("can't show this image").weak());
                         });
-                    });
+                    }
+                }
+                ui.label(RichText::new(&f.name).strong());
+                ui.label(
+                    RichText::new(format!("{} x {}", f.width, f.height))
+                        .small()
+                        .weak(),
+                );
+                if ui
+                    .small_button("Delete")
+                    .on_hover_text("Remove from the library")
+                    .clicked()
+                {
+                    msgs.push(Msg::AskDeleteFlag(f.name.clone()));
                 }
             });
         });
+}
+
+/// Lays out cards of a fixed width in as many columns as fit.
+fn card_rows<T>(ui: &mut Ui, items: &[T], width: f32, mut card: impl FnMut(&mut Ui, &T)) {
+    let gap = ui.spacing().item_spacing.x;
+    // A group frame adds its margin and stroke on both sides.
+    let outer = width + 14.0;
+    let cols = ((ui.available_width() + gap) / (outer + gap))
+        .floor()
+        .max(1.0) as usize;
+    for row in items.chunks(cols) {
+        ui.horizontal_top(|ui| {
+            for item in row {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.vertical(|ui| card(ui, item));
+                });
+            }
+        });
+    }
+}
+
+fn crafts_tab(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
+    let busy = app.busy();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Craft library").strong());
+        ui.label(
+            RichText::new("Every craft from every instance, copied into the saves of each instance that has its parts.")
+                .weak(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("+ Add craft...").clicked() {
+                msgs.push(Msg::OpenAddCraft(None));
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Sync now"))
+                .on_hover_text("Collect new and changed craft and update every instance that isn't running")
+                .clicked()
+            {
+                msgs.push(Msg::SyncCrafts);
+            }
+        });
+    });
+    let trash = app.crafts.crafts.iter().filter(|c| !c.live()).count();
+    ui.horizontal(|ui| {
+        for (f, label) in [
+            (None, "All"),
+            (Some(orbis::crafts::Facility::Vab), "VAB"),
+            (Some(orbis::crafts::Facility::Sph), "SPH"),
+        ] {
+            if ui
+                .selectable_label(!app.craft_trash && app.craft_filter == f, label)
+                .clicked()
+            {
+                msgs.push(Msg::SetCraftTrash(false));
+                msgs.push(Msg::SetCraftFilter(f));
+            }
+        }
+        if ui
+            .selectable_label(app.craft_trash, format!("Trash ({trash})"))
+            .clicked()
+        {
+            msgs.push(Msg::SetCraftTrash(!app.craft_trash));
+        }
+        if let Some(view) = app.current() {
+            let name = &view.inst.config.name;
+            let text = match &app.craft_index {
+                Some(i) if i.confirmed => {
+                    format!("Parts in {name}: checked against the last launch")
+                }
+                Some(_) => {
+                    format!("Parts in {name}: estimated from mod files until the next launch")
+                }
+                None => format!("Parts in {name}: not read yet (sync)"),
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(text).small().weak());
+            });
+        }
+    });
+    ui.separator();
+    if !app.craft_pending.is_empty() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Missing craft").strong().color(WARN));
+            ui.label(
+                RichText::new("Several craft vanished from a save at once. Delete them everywhere, or put them back.")
+                    .small()
+                    .weak(),
+            );
+            for (i, p) in app.craft_pending.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} missing from {}/{}",
+                        p.name, p.instance_name, p.location.save
+                    ));
+                    if ui.add_enabled(!busy, egui::Button::new("Delete everywhere")).clicked() {
+                        msgs.push(Msg::ResolvePending(i, true));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Put back")).clicked() {
+                        msgs.push(Msg::ResolvePending(i, false));
+                    }
+                });
+            }
+        });
+        ui.add_space(6.0);
+    }
+    let mut shown: Vec<&orbis::crafts::Craft> = app
+        .crafts
+        .crafts
+        .iter()
+        .filter(|c| c.live() != app.craft_trash)
+        .filter(|c| app.craft_trash || app.craft_filter.is_none_or(|f| c.facility == f))
+        .collect();
+    shown.sort_by_key(|c| c.name.to_lowercase());
+    if app.craft_trash && !shown.is_empty() && ui.button("Empty trash...").clicked() {
+        msgs.push(Msg::AskEmptyCraftTrash);
+    }
+    if shown.is_empty() {
+        ui.add_space(20.0);
+        let text = if app.craft_trash {
+            "The trash is empty."
+        } else {
+            "No craft yet. Save one in KSP, or add .craft files."
+        };
+        ui.label(RichText::new(text).weak());
+        return;
+    }
+    const THUMB: egui::Vec2 = egui::vec2(208.0, 130.0);
+    let here = app.current().map(|v| v.inst.config.name.clone());
+    egui::ScrollArea::vertical()
+        .id_salt("crafts")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            card_rows(ui, &shown, THUMB.x, |ui, c| {
+                craft_card(app, ui, msgs, c, THUMB, here.as_deref());
+            });
+        });
+}
+
+fn craft_card(
+    app: &App,
+    ui: &mut Ui,
+    msgs: &mut Vec<Msg>,
+    c: &orbis::crafts::Craft,
+    thumb: egui::Vec2,
+    here: Option<&str>,
+) {
+    let head = c.head();
+    match app.craft_textures.get(&head.hash) {
+        Some(tex) => {
+            ui.add(egui::Image::new(tex).fit_to_exact_size(thumb));
+        }
+        None => {
+            ui.allocate_ui(thumb, |ui| {
+                ui.set_min_size(thumb);
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new(c.facility.dir()).heading().weak());
+                });
+            });
+        }
+    }
+    ui.label(RichText::new(&c.name).strong());
+    let revs = c.revisions.len();
+    ui.label(
+        RichText::new(format!(
+            "{} · {} parts · {revs} {} · {}",
+            c.facility.dir(),
+            head.parts.len(),
+            if revs == 1 { "revision" } else { "revisions" },
+            when(head.saved)
+        ))
+        .small()
+        .weak(),
+    );
+    if let Some(d) = &c.deleted {
+        ui.label(
+            RichText::new(format!("Deleted in {}, {}", d.from, when(d.at)))
+                .small()
+                .color(WARN),
+        );
+    } else if let Some(name) = here {
+        match &app.craft_index {
+            Some(idx) => {
+                let missing = idx.missing(&head.parts);
+                if missing.is_empty() {
+                    let saves = app
+                        .craft_state
+                        .locations
+                        .iter()
+                        .filter(|l| l.id == c.id)
+                        .count();
+                    let text = match saves {
+                        0 => format!("Fits {name} (copied on the next sync)"),
+                        1 => format!("Fits {name}: in 1 save"),
+                        n => format!("Fits {name}: in {n} saves"),
+                    };
+                    ui.label(RichText::new(text).small().color(GOOD));
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "Not in {name}: needs {}",
+                            orbis::crafts::explain(&missing, &app.craft_providers)
+                        ))
+                        .small()
+                        .color(WARN),
+                    )
+                    .on_hover_text(missing.join(", "));
+                }
+            }
+            None => {
+                ui.label(
+                    RichText::new(format!("Sync to check {name}"))
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+    }
+    ui.horizontal(|ui| {
+        let open = app.craft_open.as_ref() == Some(&c.id);
+        if ui
+            .small_button(if open { "Hide history" } else { "History" })
+            .clicked()
+        {
+            msgs.push(Msg::ToggleCraftHistory(c.id.clone()));
+        }
+        if c.live() {
+            if ui
+                .small_button("Delete")
+                .on_hover_text("Delete from every instance (to the trash)")
+                .clicked()
+            {
+                msgs.push(Msg::AskDeleteCraft(c.id.clone()));
+            }
+        } else if ui.small_button("Restore").clicked() {
+            msgs.push(Msg::RestoreCraft(c.id.clone()));
+        }
+    });
+    if app.craft_open.as_ref() != Some(&c.id) {
+        return;
+    }
+    ui.separator();
+    for (i, r) in c.revisions.iter().enumerate().rev() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("#{}", i + 1)).small().strong());
+            ui.label(
+                RichText::new(format!("{} from {}", when(r.saved), r.from))
+                    .small()
+                    .weak(),
+            );
+            if let Some(idx) = &app.craft_index
+                && here.is_some()
+            {
+                if orbis::crafts::fits(idx, r) {
+                    ui.label(RichText::new("fits").small().color(GOOD));
+                } else {
+                    ui.label(RichText::new("doesn't fit").small().color(WARN));
+                }
+            }
+            if ui
+                .small_button("Save as new...")
+                .on_hover_text("Keep this revision as its own craft")
+                .clicked()
+            {
+                msgs.push(Msg::OpenForkCraft(c.id.clone(), r.hash.clone()));
+            }
+        });
+    }
 }
 
 fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
@@ -1759,7 +2023,7 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                             ("Ctrl+F", "search"),
                             ("Ctrl+Up / Down", "previous / next instance"),
                             ("Ctrl+Tab", "next tab (Shift: previous)"),
-                            ("Ctrl+1 .. 6", "go to a tab"),
+                            ("Ctrl+1 .. 7", "go to a tab"),
                             ("Ctrl+Z", "undo the last mod change"),
                             ("F2", "rename instance"),
                             ("F5", "re-read instances"),
@@ -1823,6 +2087,36 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 });
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Add", !path.trim().is_empty(), Msg::AddFlag);
+            }
+            Dialog::AddCraft { path } => {
+                ui.heading("Add craft");
+                ui.label("A .craft file, or a folder to import every craft under it (for example an old KSP install's saves folder). Autosaves and mod backup folders are skipped.");
+                ui.add_space(6.0);
+                ui.add(egui::TextEdit::singleline(path).hint_text("/path/to/Rocket.craft or /path/to/saves").desired_width(440.0));
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Add", !path.trim().is_empty(), Msg::AddCraft);
+            }
+            Dialog::ForkCraft { name, .. } => {
+                ui.heading("Save as a new craft");
+                ui.label("This revision becomes its own craft, shared with every instance that has its parts.");
+                ui.add_space(6.0);
+                ui.add(egui::TextEdit::singleline(name).desired_width(360.0)).request_focus();
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Save", !name.trim().is_empty(), Msg::ForkCraft);
+            }
+            Dialog::DeleteCraft { name, .. } => {
+                ui.heading("Delete craft");
+                ui.label(format!(
+                    "Delete {name} from every instance? It goes to the trash, where you can restore it."
+                ));
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Delete", true, Msg::DeleteCraft);
+            }
+            Dialog::EmptyCraftTrash => {
+                ui.heading("Empty the trash");
+                ui.label("Delete every craft in the trash for good, with all their revisions?");
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Empty trash", true, Msg::EmptyCraftTrash);
             }
             Dialog::DeleteFlag(name) => {
                 ui.heading("Delete flag");

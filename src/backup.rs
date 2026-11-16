@@ -197,6 +197,8 @@ pub fn restore(inst: &Instance, id: &str, save: Option<&str>) -> Result<()> {
         None => b.saves.clone(),
     };
     create(inst, "before restore")?;
+    // The restored saves' craft are read afresh, not taken as edits or deletions.
+    crate::crafts::forget_saves(&inst.dir, &names)?;
     let from = root(inst).join(&b.id).join("saves");
     let to = inst.game_dir().join("saves");
     for n in &names {
