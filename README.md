@@ -26,6 +26,8 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1. 
 * **Proton launch**: start any instance with the Proton build Steam has mapped to KSP, inside the Steam Linux Runtime when Proton asks for it.
 * **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
 * **Reliable downloads**: parallel downloads that drop stalled connections and resume where they left off, falling back to CKAN's archive.org mirror for freely licensed mods.
+* **One copy of each mod**: every mod version is unpacked once into a shared store; on btrfs and XFS instances get reflinked copies that share disk space but keep their own files.
+* **Keyboard friendly, mouse first**: point and click by default, Enter and Esc in dialogs, and optional vim-style keys for those who want them.
 * **Safe file handling**: every installed file is tracked per mod, conflicts are refused, and a failed install rolls back.
 * **GUI and CLI**: an egui interface, plus a CLI covering every operation.
 * **Headless rendering**: the GUI renders offscreen to PNG with a text state dump, so it can be checked without a display.
@@ -90,6 +92,7 @@ When only one instance exists, `-i` can be left out.
 | `orbis backup list\|create\|restore <id> [--save <name>]` | Manage save backups |
 | `orbis logs [--log ksp\|player\|launch]` | Summarise a log: exceptions grouped and blamed on mods |
 | `orbis manual unmanaged\|adopt <folder>` | Find hand-added GameData folders and track them as manual mods |
+| `orbis cache [--clean]` | Show the mod store and download cache, or remove what no instance uses |
 | `orbis star\|unstar <mod>...` | Star or unstar mods (shared by all instances) |
 | `orbis starred` | List starred mods |
 | `orbis pack export [-i <instance>] <file>` | Export a modpack (`--craft`, `--saves <names\|all>`, `--manual-files`, `--ckan`) |
@@ -152,6 +155,33 @@ orbis works out where the files go: if the archive has a `GameData` folder anywh
 
 `--provides` lists the CKAN identifiers the mod replaces. Installing it removes the CKAN copies, and CKAN mods that depend on those identifiers are satisfied by the manual mod. `--depends` and `--conflicts` take CKAN identifiers too.
 
+### Keys
+
+Everything works with the mouse. Dialogs take Enter for their main button and Esc to cancel. Right-click an instance for Launch, Clone, Rename, Export, Open folder and Delete; double-click it to launch.
+
+Vim-style keys are off by default; turn them on under **Settings > Interface**. They act only when no text box has focus:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Next / previous mod |
+| `gg` / `G` | First / last mod |
+| `Ctrl-d` / `Ctrl-u` | Half a page down / up |
+| `Space` or `x` | Tick the mod: queue an install, or a removal |
+| `u` | Queue an upgrade |
+| `s` | Star or unstar |
+| `/` | Search |
+| `h` / `l` | Previous / next filter |
+| `J` / `K` | Next / previous instance |
+| `gt` / `gT` | Next / previous tab |
+| `Enter` | Apply queued changes |
+| `?` | Show these keys |
+
+## Mod store
+
+Downloaded archives are unpacked once into `~/.local/share/orbis/store/`, one folder per mod version, and installs copy from there. On btrfs and XFS the copy is a reflink: ten instances with the same mod use the disk space of one, yet each instance has its own files, so a mod that writes settings or caches into its folder while the game runs never affects another instance. Instances can still use different versions of a mod (a pinned modpack, say); each version is stored once. On other filesystems the copies are ordinary copies.
+
+`orbis cache` (or **Settings > Storage**) shows the store and download cache; `orbis cache --clean` removes what no instance uses.
+
 ## Safety nets
 
 **Save backups.** Before applying mod changes and before each launch, orbis copies the instance's saves into `backups/` inside the instance, but only when they changed since the last backup. The newest `backups_keep` are kept. On btrfs and XFS the copies are reflinks and take no space until a save changes. Restoring (one save, or all of them) backs up the current saves first, so a restore can itself be undone. Find them on the **History** tab or with `orbis backup`.
@@ -189,7 +219,7 @@ make test             # unit and integration tests
 make lint             # clippy with warnings as errors
 make fmt              # rustfmt
 make build            # release build
-make gui-shot         # headless GUI render to target/gui.png and target/gui.txt
+make gui-shot         # headless GUI render to target/gui.png and target/gui.txt (add ARGS="--keys jjx" to type keys)
 make clean            # remove build output
 ```
 

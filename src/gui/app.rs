@@ -27,7 +27,10 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::SteamInfo;
 use orbis::version::{GameVersion, ModVersion};
-use orbis::{backup, history, logs};
+use orbis::{backup, history, logs, store};
+
+/// Height of one mod table row including spacing (see `view::ROW_H`).
+pub const ROW_STEP: f32 = 30.0;
 use serde::{Deserialize, Serialize};
 
 use super::Options;
@@ -162,6 +165,8 @@ pub struct Prefs {
     pub starred_only: bool,
     /// "<column>-asc" or "<column>-desc"; empty for each filter's default.
     pub sort: String,
+    /// Opt-in vim-style keys.
+    pub vim_keys: bool,
     /// Unapplied changes, per instance id.
     pub queues: BTreeMap<String, Queue>,
 }
@@ -300,6 +305,11 @@ pub enum Dialog {
     Export(Box<ExportForm>),
     Import(Box<ImportForm>),
     DeleteManual(ManualMod),
+    RenameInstance {
+        id: String,
+        name: String,
+    },
+    KeyHelp,
     Error(String),
 }
 
@@ -338,6 +348,11 @@ pub enum Msg {
     SaveGlobalSettings,
     ToggleStar(String),
     SortBy(SortKey),
+    SetVimKeys(bool),
+    OpenRename,
+    RenameInstance,
+    CleanStore,
+    RefreshStorage,
     AskRestoreHistory(u64, bool),
     RestoreHistory,
     BackupNow,
@@ -440,6 +455,15 @@ pub struct App {
     log_rows_key: Option<(logs::Level, String, usize)>,
     pub log_jump: Option<usize>,
     auto_updated: bool,
+    pub vim_keys: bool,
+    /// A `g` waiting for its second key (gg, gt, gT), with the time it came.
+    pending_g: Option<f64>,
+    /// Scroll the mod table so this row is visible.
+    pub scroll_to_row: Option<usize>,
+    /// The mod table's scroll offset and visible height, from the last frame.
+    pub mods_view: (f32, f32),
+    pub focus_search: bool,
+    pub storage: Option<Result<store::Usage, String>>,
     saved_prefs: Prefs,
     /// Write `gui.toml` (off in headless mode).
     persist: bool,
@@ -490,6 +514,12 @@ impl App {
             log_rows_key: None,
             log_jump: None,
             auto_updated: false,
+            vim_keys: false,
+            pending_g: None,
+            scroll_to_row: None,
+            mods_view: (0.0, 0.0),
+            focus_search: false,
+            storage: None,
             saved_prefs: Prefs::default(),
             persist: !opts.headless,
             generation: 0,
@@ -503,6 +533,7 @@ impl App {
         app.filter = filter_from(&prefs.filter).unwrap_or(Filter::Installed);
         app.show_deps = prefs.show_deps;
         app.starred_only = prefs.starred_only;
+        app.vim_keys = prefs.vim_keys;
         app.sort = prefs
             .sort
             .split_once('-')
@@ -658,6 +689,7 @@ impl App {
     pub fn frame(&mut self, ui: &mut egui::Ui) {
         self.poll();
         self.handle_drops(ui.ctx());
+        self.handle_keys(ui.ctx());
         self.ensure_rows();
         let mut msgs = Vec::new();
         super::view::draw(self, ui, &mut msgs);
@@ -691,6 +723,151 @@ impl App {
                 self.update(Msg::OpenAddManual(Some(p)));
             }
         }
+    }
+
+    // ---- keys -----------------------------------------------------------
+
+    /// Vim-style keys, when turned on in Settings. They only act when no
+    /// text field has focus and no dialog is open.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if !self.vim_keys || self.dialog.is_some() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (events, now) = ctx.input(|i| (i.events.clone(), i.time));
+        for e in events {
+            match e {
+                egui::Event::Text(t) => {
+                    for c in t.chars() {
+                        self.vim_char(c, now);
+                    }
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
+                    let half = (self.mods_view.1 / (ROW_STEP * 2.0)).max(1.0) as isize;
+                    match key {
+                        egui::Key::D if modifiers.ctrl => self.move_selection(half),
+                        egui::Key::U if modifiers.ctrl => self.move_selection(-half),
+                        egui::Key::Enter if !self.queue.is_empty() => self.update(Msg::ApplyQueue),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn vim_char(&mut self, c: char, now: f64) {
+        let pending = self.pending_g.take().is_some_and(|t| now - t < 1.0);
+        if pending {
+            match c {
+                'g' => self.select_row(0),
+                't' => self.cycle_tab(1),
+                'T' => self.cycle_tab(-1),
+                _ => {}
+            }
+            return;
+        }
+        let on_mods = self.tab == Tab::Mods;
+        match c {
+            'g' => self.pending_g = Some(now),
+            '?' => self.dialog = Some(Dialog::KeyHelp),
+            'J' => self.cycle_instance(1),
+            'K' => self.cycle_instance(-1),
+            'j' if on_mods => self.move_selection(1),
+            'k' if on_mods => self.move_selection(-1),
+            'G' if on_mods => self.select_row(self.rows.len().saturating_sub(1)),
+            'h' if on_mods => self.cycle_filter(-1),
+            'l' if on_mods => self.cycle_filter(1),
+            '/' if on_mods => self.focus_search = true,
+            ' ' | 'x' if on_mods => {
+                if let Some(row) = self.selected_row().cloned() {
+                    if row.dlc {
+                        return;
+                    }
+                    if row.installed.is_some() {
+                        self.update(Msg::ToggleRemove(row.id));
+                    } else if row.latest.is_some() {
+                        self.update(Msg::ToggleInstall(row.id));
+                    }
+                }
+            }
+            'u' if on_mods => {
+                if let Some(row) = self.selected_row().filter(|r| r.upgradable()).cloned() {
+                    self.update(Msg::ToggleUpgrade(row.id));
+                }
+            }
+            's' if on_mods => {
+                if let Some(row) = self.selected_row().filter(|r| !r.dlc).cloned() {
+                    self.update(Msg::ToggleStar(row.id));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn selected_row(&self) -> Option<&Row> {
+        let id = self.selected_mod.as_ref()?;
+        self.rows.iter().find(|r| &r.id == id)
+    }
+
+    fn select_row(&mut self, i: usize) {
+        if let Some(row) = self.rows.get(i) {
+            self.selected_mod = Some(row.id.clone());
+            self.scroll_to_row = Some(i);
+        }
+    }
+
+    fn move_selection(&mut self, by: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_mod
+            .as_ref()
+            .and_then(|id| self.rows.iter().position(|r| &r.id == id));
+        let next = match current {
+            Some(i) => i.saturating_add_signed(by).min(self.rows.len() - 1),
+            None => 0,
+        };
+        self.select_row(next);
+    }
+
+    fn cycle_filter(&mut self, by: isize) {
+        let all = Filter::ALL;
+        let i = all.iter().position(|f| *f == self.filter).unwrap_or(0);
+        let next = (i as isize + by).rem_euclid(all.len() as isize) as usize;
+        self.update(Msg::SetFilter(all[next]));
+    }
+
+    fn cycle_tab(&mut self, by: isize) {
+        let all = [
+            Tab::Mods,
+            Tab::Manual,
+            Tab::History,
+            Tab::Logs,
+            Tab::Settings,
+        ];
+        let i = all.iter().position(|t| *t == self.tab).unwrap_or(0);
+        let next = (i as isize + by).rem_euclid(all.len() as isize) as usize;
+        self.update(Msg::SetTab(all[next]));
+    }
+
+    fn cycle_instance(&mut self, by: isize) {
+        if self.instances.is_empty() {
+            return;
+        }
+        let i = self
+            .selected
+            .as_ref()
+            .and_then(|s| self.instances.iter().position(|v| &v.inst.id == s))
+            .unwrap_or(0);
+        let next = (i as isize + by).rem_euclid(self.instances.len() as isize) as usize;
+        let id = self.instances[next].inst.id.clone();
+        self.update(Msg::SelectInstance(id));
     }
 
     // ---- background work --------------------------------------------
@@ -1365,6 +1542,43 @@ impl App {
                 self.generation += 1;
             }
             Msg::SetShowDeps(v) => self.show_deps = v,
+            Msg::SetVimKeys(v) => self.vim_keys = v,
+            Msg::OpenRename => {
+                if let Some(v) = self.current() {
+                    self.dialog = Some(Dialog::RenameInstance {
+                        id: v.inst.id.clone(),
+                        name: v.inst.config.name.clone(),
+                    });
+                }
+            }
+            Msg::RenameInstance => {
+                if let Some(Dialog::RenameInstance { id, name }) = self.dialog.take()
+                    && let Some(v) = self.instances.iter().find(|v| v.inst.id == id)
+                {
+                    let mut inst = v.inst.clone();
+                    inst.config.name = name.trim().to_owned();
+                    match inst.save() {
+                        Ok(()) => {
+                            self.note(format!("Renamed to {}", inst.config.name));
+                            self.reload();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
+            Msg::RefreshStorage => {
+                self.storage = Some(store::usage(&self.ctx.paths).map_err(|e| format!("{e:#}")));
+            }
+            Msg::CleanStore => {
+                match store::clean(&self.ctx.paths) {
+                    Ok((n, bytes)) => self.note(format!(
+                        "Removed {n} unused entries ({:.1} MiB)",
+                        bytes as f64 / 1_048_576.0
+                    )),
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+                self.update(Msg::RefreshStorage);
+            }
             Msg::SortBy(key) => {
                 self.sort = match self.sort {
                     Some((k, desc)) if k == key => Some((key, !desc)),
@@ -1745,6 +1959,7 @@ impl App {
             filter: filter_name(self.filter).to_owned(),
             show_deps: self.show_deps,
             starred_only: self.starred_only,
+            vim_keys: self.vim_keys,
             sort: self.sort.map_or(String::new(), |(k, d)| {
                 format!("{}-{}", k.name(), if d { "desc" } else { "asc" })
             }),

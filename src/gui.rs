@@ -47,6 +47,10 @@ pub struct Options {
     /// Start on this filter: installed, available, upgradable or all.
     #[arg(long)]
     pub filter: Option<String>,
+    /// Headless: type these characters, one per frame, before the
+    /// screenshot (to check keyboard handling).
+    #[arg(long)]
+    pub keys: Option<String>,
 }
 
 const DEFAULT_SIZE: &str = "1400x860";
@@ -66,6 +70,7 @@ impl Default for Options {
             search: None,
             select: None,
             filter: None,
+            keys: None,
         }
     }
 }

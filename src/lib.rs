@@ -18,5 +18,6 @@ pub mod repo;
 pub mod resolver;
 pub mod starred;
 pub mod steam;
+pub mod store;
 pub mod vdf;
 pub mod version;

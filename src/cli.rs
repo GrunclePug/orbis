@@ -21,7 +21,7 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::{self, SteamInfo};
 use orbis::version::{GameVersion, ModVersion};
-use orbis::{backup, history, logs};
+use orbis::{backup, history, logs, store};
 
 use crate::gui;
 
@@ -148,6 +148,12 @@ pub enum Command {
     /// Change history and rollback.
     #[command(subcommand)]
     History(HistoryCmd),
+    /// Show the mod store and download cache, or clean out what no instance uses.
+    Cache {
+        /// Remove stored mods and downloads that no instance uses.
+        #[arg(long)]
+        clean: bool,
+    },
     /// Summarise a log: exceptions grouped, with the mods they came from.
     Logs {
         #[arg(short, long)]
@@ -536,6 +542,31 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
         }
         Command::Pack(c) => pack_cmd(ctx, c),
         Command::Backup(c) => backup_cmd(ctx, c),
+        Command::Cache { clean } => {
+            let mib = |b: u64| b as f64 / 1_048_576.0;
+            if clean {
+                let (n, bytes) = store::clean(&ctx.paths)?;
+                println!("Removed {n} unused entries ({:.1} MiB)", mib(bytes));
+                return Ok(());
+            }
+            let u = store::usage(&ctx.paths)?;
+            println!(
+                "store:     {} mods, {:.1} MiB unpacked (shared with instances by reflink where possible)",
+                u.store_entries,
+                mib(u.store_bytes)
+            );
+            println!(
+                "downloads: {} archives, {:.1} MiB",
+                u.download_files,
+                mib(u.download_bytes)
+            );
+            println!(
+                "unused:    {} entries, {:.1} MiB (orbis cache --clean)",
+                u.unused_entries,
+                mib(u.unused_bytes)
+            );
+            Ok(())
+        }
         Command::History(c) => history_cmd(ctx, c),
         Command::Logs { instance, log } => {
             let inst = ctx.instance(instance.as_deref())?;

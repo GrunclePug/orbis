@@ -16,6 +16,7 @@ use crate::metadata::{Kind, Module};
 use crate::paths::{self, Paths};
 use crate::repo::Index;
 use crate::resolver::{Change, Plan, Present, Reason, Request, ResolveError, Resolver};
+use crate::store;
 
 /// Progress reported while applying changes.
 #[derive(Debug)]
@@ -174,7 +175,7 @@ fn apply_changes(
         let _ = events.send(Event::Status(format!("Installing {id} {}", module.version)));
         let (files, source) = if let Some(mid) = id.strip_prefix(manual::PREFIX) {
             let m = manual::find(paths, mid)?;
-            let src = m.source(paths);
+            let src = store::manual_source(paths, &m)?;
             (
                 install_source(inst, &reg, &src, &m.install)?,
                 ModSource::Manual,
@@ -185,7 +186,8 @@ fn apply_changes(
             let archive = archives
                 .get(id)
                 .with_context(|| format!("{id} was not downloaded"))?;
-            let src = Source::Zip(archive.clone());
+            let src = store::ckan_source(paths, archive)
+                .with_context(|| format!("unpack {id} {}", module.version))?;
             let files = install_source(inst, &reg, &src, &module.directives())
                 .with_context(|| format!("install {id} {}", module.version))?;
             (files, ModSource::Ckan)

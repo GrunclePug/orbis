@@ -196,6 +196,33 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                         if resp.clicked() {
                             msgs.push(Msg::SelectInstance(v.inst.id.clone()));
                         }
+                        if resp.double_clicked() {
+                            msgs.push(Msg::Launch);
+                        }
+                        let id = v.inst.id.clone();
+                        resp.on_hover_text("Double-click to launch; right-click for more")
+                            .context_menu(|ui| {
+                                let mut item =
+                                    |ui: &mut Ui, label: &str, msg: Msg, enabled: bool| {
+                                        if ui
+                                            .add_enabled(enabled, egui::Button::new(label))
+                                            .clicked()
+                                        {
+                                            msgs.push(Msg::SelectInstance(id.clone()));
+                                            msgs.push(msg);
+                                            ui.close();
+                                        }
+                                    };
+                                let idle = !app.busy();
+                                item(ui, "Launch", Msg::Launch, true);
+                                ui.separator();
+                                item(ui, "Clone...", Msg::OpenClone, idle);
+                                item(ui, "Rename...", Msg::OpenRename, true);
+                                item(ui, "Export modpack...", Msg::OpenExport, idle);
+                                item(ui, "Open folder", Msg::OpenFolder(v.inst.game_dir()), true);
+                                ui.separator();
+                                item(ui, "Delete...", Msg::OpenDelete, idle);
+                            });
                     }
                 });
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -260,11 +287,15 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             }
         }
         ui.separator();
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut app.search)
                 .hint_text("Search name, author, tag")
                 .desired_width(260.0),
         );
+        if app.focus_search {
+            search.request_focus();
+            app.focus_search = false;
+        }
         if !app.search.is_empty() && ui.small_button("x").clicked() {
             app.search.clear();
         }
@@ -314,15 +345,26 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     let width = ui.available_width();
     let cols = columns(width);
     header(ui, &cols, app.sort, msgs);
-    egui::ScrollArea::vertical()
+    let step = ROW_H + ui.spacing().item_spacing.y;
+    let mut area = egui::ScrollArea::vertical()
         .id_salt("mods")
-        .auto_shrink([false, false])
-        .show_rows(ui, ROW_H, app.rows.len(), |ui, range| {
-            for i in range {
-                let row = &app.rows[i];
-                mod_row(app, ui, row, &cols, msgs);
-            }
-        });
+        .auto_shrink([false, false]);
+    if let Some(i) = app.scroll_to_row.take() {
+        let (offset, height) = app.mods_view;
+        let top = i as f32 * step;
+        if top < offset {
+            area = area.vertical_scroll_offset(top);
+        } else if top + step > offset + height {
+            area = area.vertical_scroll_offset(top + step - height);
+        }
+    }
+    let out = area.show_rows(ui, ROW_H, app.rows.len(), |ui, range| {
+        for i in range {
+            let row = &app.rows[i];
+            mod_row(app, ui, row, &cols, msgs);
+        }
+    });
+    app.mods_view = (out.state.clamped_offset().y, out.inner_rect.height());
 }
 
 fn queue_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
@@ -1091,6 +1133,55 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 ui.separator();
             }
 
+            ui.label(RichText::new("Interface").heading());
+            let mut vim = app.vim_keys;
+            if ui
+                .checkbox(&mut vim, "Vim-style keys (j/k to move, Space to tick, / to search; ? lists them all)")
+                .changed()
+            {
+                msgs.push(Msg::SetVimKeys(vim));
+            }
+            ui.label(
+                RichText::new("Off by default: everything works with the mouse. Enter and Esc always confirm and cancel dialogs.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(RichText::new("Storage").heading());
+            ui.label(
+                RichText::new(
+                    "Each mod version is unpacked once into the store; instances get reflinked copies (on btrfs and XFS they share disk space but keep their own files).",
+                )
+                .small()
+                .weak(),
+            );
+            match &app.storage {
+                None => msgs.push(Msg::RefreshStorage),
+                Some(Err(e)) => {
+                    ui.label(RichText::new(e).color(WARN));
+                }
+                Some(Ok(u)) => {
+                    let mib = |b: u64| b as f64 / 1_048_576.0;
+                    ui.label(format!("Store: {} mods, {:.1} MiB unpacked", u.store_entries, mib(u.store_bytes)));
+                    ui.label(format!("Downloads: {} archives, {:.1} MiB", u.download_files, mib(u.download_bytes)));
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Not used by any instance: {} ({:.1} MiB)",
+                            u.unused_entries,
+                            mib(u.unused_bytes)
+                        ));
+                        if ui
+                            .add_enabled(u.unused_entries > 0 && !app.busy(), egui::Button::new("Clean up"))
+                            .clicked()
+                        {
+                            msgs.push(Msg::CleanStore);
+                        }
+                    });
+                }
+            }
+            ui.add_space(12.0);
+            ui.separator();
             ui.label(RichText::new("Steam and Proton").heading());
             egui::Grid::new("steam")
                 .num_columns(2)
@@ -1453,9 +1544,44 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Create", !busy && !name.trim().is_empty(), Msg::CreateInstance);
             }
+            Dialog::RenameInstance { name, .. } => {
+                ui.heading("Rename instance");
+                ui.add(egui::TextEdit::singleline(name).desired_width(360.0)).request_focus();
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Rename", !name.trim().is_empty(), Msg::RenameInstance);
+            }
+            Dialog::KeyHelp => {
+                ui.heading("Vim keys");
+                egui::Grid::new("keys").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                    for (k, what) in [
+                        ("j / k", "next / previous mod"),
+                        ("gg / G", "first / last mod"),
+                        ("Ctrl-d / Ctrl-u", "half a page down / up"),
+                        ("Space or x", "tick: queue install, or queue removal"),
+                        ("u", "queue an upgrade"),
+                        ("s", "star or unstar"),
+                        ("/", "search (Esc leaves the search box)"),
+                        ("h / l", "previous / next filter"),
+                        ("J / K", "next / previous instance"),
+                        ("gt / gT", "next / previous tab"),
+                        ("Enter", "apply queued changes; in dialogs, the main button"),
+                        ("Esc", "close a dialog"),
+                        ("?", "this help"),
+                    ] {
+                        ui.label(RichText::new(k).monospace().strong());
+                        ui.label(what);
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    msgs.push(Msg::CloseDialog);
+                }
+            }
             Dialog::CloneInstance { name, with_saves, .. } => {
                 ui.heading("Clone instance");
-                ui.add(egui::TextEdit::singleline(name).desired_width(360.0));
+                ui.label("A copy with the same mods and settings, under a new name.");
+                ui.add(egui::TextEdit::singleline(name).desired_width(360.0)).request_focus();
                 ui.checkbox(with_saves, "Copy saves");
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Clone", !busy && !name.trim().is_empty(), Msg::CloneInstance);
@@ -1720,12 +1846,15 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
     }
 }
 
+/// A dialog's main button and Cancel. Enter presses the main button.
 fn buttons(ui: &mut Ui, msgs: &mut Vec<Msg>, ok: &str, enabled: bool, msg: Msg) {
+    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     ui.horizontal(|ui| {
-        if ui
+        let clicked = ui
             .add_enabled(enabled, egui::Button::new(RichText::new(ok).strong()))
-            .clicked()
-        {
+            .on_hover_text("Enter")
+            .clicked();
+        if clicked || (enabled && enter) {
             msgs.push(msg);
         }
         if ui.button("Cancel").clicked() {

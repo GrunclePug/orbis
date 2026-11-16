@@ -24,11 +24,25 @@ pub fn run(ctx: Context, opts: &Options, size: [f32; 2]) -> Result<()> {
     app.load_index_now();
 
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+    let keys: Vec<char> = opts.keys.as_deref().unwrap_or("").chars().collect();
+    let frames = opts.frames.max(1).max(
+        u32::try_from(keys.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(2),
+    );
     let mut outputs = Vec::new();
-    for frame in 0..opts.frames.max(1) {
+    for frame in 0..frames {
+        // Typed keys start on the second frame, after the first layout.
+        let events = usize::try_from(frame)
+            .ok()
+            .and_then(|f| f.checked_sub(1))
+            .and_then(|i| keys.get(i))
+            .map(|c| vec![egui::Event::Text(c.to_string())])
+            .unwrap_or_default();
         let raw = egui::RawInput {
             screen_rect: Some(screen),
             time: Some(f64::from(frame) / 60.0),
+            events,
             ..Default::default()
         };
         let out = egui_ctx.run_ui(raw, |ui| app.frame(ui));
@@ -38,8 +52,14 @@ pub fn run(ctx: Context, opts: &Options, size: [f32; 2]) -> Result<()> {
     if let Some(path) = &opts.dump {
         std::fs::write(path, app.dump()).with_context(|| format!("write {}", path.display()))?;
     }
-    if let Some(path) = &opts.screenshot {
-        render(&egui_ctx, outputs, size, path)?;
+    match &opts.screenshot {
+        Some(path) => render(&egui_ctx, outputs, size, path)?,
+        None => {
+            // Nothing to draw: drop the texture updates deliberately.
+            for mut out in outputs {
+                out.textures_delta.clear();
+            }
+        }
     }
     Ok(())
 }
