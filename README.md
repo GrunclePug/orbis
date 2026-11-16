@@ -27,7 +27,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1. 
 * **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
 * **Reliable downloads**: parallel downloads that drop stalled connections and resume where they left off, falling back to CKAN's archive.org mirror for freely licensed mods.
 * **One copy of each mod**: every mod version is unpacked once into a shared store; on btrfs and XFS instances get reflinked copies that share disk space but keep their own files.
-* **Keyboard friendly, mouse first**: point and click by default, Enter and Esc in dialogs, and optional vim-style keys for those who want them.
+* **Mouse or keyboard**: everything works by point and click, and vim-style keys work alongside it (press `?` to list them).
 * **Safe file handling**: every installed file is tracked per mod, conflicts are refused, and a failed install rolls back.
 * **GUI and CLI**: an egui interface, plus a CLI covering every operation.
 * **Headless rendering**: the GUI renders offscreen to PNG with a text state dump, so it can be checked without a display.
@@ -159,7 +159,7 @@ orbis works out where the files go: if the archive has a `GameData` folder anywh
 
 Everything works with the mouse. Dialogs take Enter for their main button and Esc to cancel. Right-click an instance for Launch, Clone, Rename, Export, Open folder and Delete; double-click it to launch.
 
-Vim-style keys are off by default; turn them on under **Settings > Interface**. They act only when no text box has focus:
+Vim-style keys work alongside the mouse. They act only when no text box has focus, and can be turned off under **Settings > Interface**:
 
 | Key | Action |
 |-----|--------|

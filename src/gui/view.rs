@@ -98,7 +98,14 @@ fn status_bar(app: &App, ui: &mut Ui) {
                 }
             }
             None => {
-                ui.label(RichText::new(app.last_message()).weak());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(app.last_message()).weak());
+                    if app.vim_keys {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("? for keys").small().weak());
+                        });
+                    }
+                });
             }
         }
         ui.add_space(2.0);
@@ -1142,7 +1149,7 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 msgs.push(Msg::SetVimKeys(vim));
             }
             ui.label(
-                RichText::new("Off by default: everything works with the mouse. Enter and Esc always confirm and cancel dialogs.")
+                RichText::new("They only act when no text box has focus, so they don't get in the way of the mouse. Enter and Esc always confirm and cancel dialogs.")
                     .small()
                     .weak(),
             );

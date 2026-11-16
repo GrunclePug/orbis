@@ -165,8 +165,9 @@ pub struct Prefs {
     pub starred_only: bool,
     /// "<column>-asc" or "<column>-desc"; empty for each filter's default.
     pub sort: String,
-    /// Opt-in vim-style keys.
-    pub vim_keys: bool,
+    /// Vim-style keys are on unless this is set. (0.5.0 stored an opt-in
+    /// `vim_keys` flag; it is ignored now that the keys are on by default.)
+    pub vim_keys_off: bool,
     /// Unapplied changes, per instance id.
     pub queues: BTreeMap<String, Queue>,
 }
@@ -514,7 +515,7 @@ impl App {
             log_rows_key: None,
             log_jump: None,
             auto_updated: false,
-            vim_keys: false,
+            vim_keys: true,
             pending_g: None,
             scroll_to_row: None,
             mods_view: (0.0, 0.0),
@@ -533,7 +534,7 @@ impl App {
         app.filter = filter_from(&prefs.filter).unwrap_or(Filter::Installed);
         app.show_deps = prefs.show_deps;
         app.starred_only = prefs.starred_only;
-        app.vim_keys = prefs.vim_keys;
+        app.vim_keys = !prefs.vim_keys_off;
         app.sort = prefs
             .sort
             .split_once('-')
@@ -1959,7 +1960,7 @@ impl App {
             filter: filter_name(self.filter).to_owned(),
             show_deps: self.show_deps,
             starred_only: self.starred_only,
-            vim_keys: self.vim_keys,
+            vim_keys_off: !self.vim_keys,
             sort: self.sort.map_or(String::new(), |(k, d)| {
                 format!("{}-{}", k.name(), if d { "desc" } else { "asc" })
             }),
