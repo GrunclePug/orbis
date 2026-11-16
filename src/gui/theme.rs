@@ -164,6 +164,58 @@ pub fn pill(ui: &mut Ui, text: impl Into<String>, color: Color32) -> egui::Respo
     resp
 }
 
+/// How wide `pill` draws this text.
+pub fn pill_width(ui: &Ui, text: &str) -> f32 {
+    let font = TextStyle::Small.resolve(ui.style());
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font, TEXT)
+        .size()
+        .x
+        + 14.0
+}
+
+/// The semibold face at a size, for painting text directly.
+pub fn semibold_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
+}
+
+/// Each mod category's colour. Built-in ones are fixed, chosen so
+/// neighbours in the list differ; the user's own get one from a spare set,
+/// always the same for the same name.
+pub fn category_color(category: &str) -> Color32 {
+    let rgb = Color32::from_rgb;
+    match category {
+        "Parts" => rgb(74, 222, 128),
+        "Visuals" => rgb(244, 114, 182),
+        "Planets" => rgb(45, 212, 191),
+        "Communications" => rgb(163, 230, 53),
+        "Career & science" => rgb(250, 204, 21),
+        "Tools & info" => rgb(56, 189, 248),
+        "KSC & launch sites" => rgb(251, 146, 60),
+        "Crew & IVA" => rgb(129, 140, 248),
+        "Resources" => rgb(214, 164, 107),
+        "Physics" => rgb(239, 83, 80),
+        "Sound" => rgb(217, 70, 239),
+        "Patches & configs" => rgb(148, 163, 184),
+        "Libraries" => VIOLET,
+        "Other" => rgb(115, 123, 135),
+        custom => {
+            const SPARE: [Color32; 6] = [
+                Color32::from_rgb(96, 165, 250),
+                Color32::from_rgb(52, 211, 153),
+                Color32::from_rgb(251, 191, 36),
+                Color32::from_rgb(248, 113, 113),
+                Color32::from_rgb(192, 132, 252),
+                Color32::from_rgb(253, 186, 116),
+            ];
+            let sum = custom.to_lowercase().bytes().fold(0usize, |a, b| {
+                a.wrapping_mul(31).wrapping_add(usize::from(b))
+            });
+            SPARE[sum % SPARE.len()]
+        }
+    }
+}
+
 /// A section title: small, spaced capitals in a quiet colour.
 pub fn section(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);

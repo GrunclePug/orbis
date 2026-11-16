@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod cancel;
+pub mod categories;
 pub mod ckan_import;
 pub mod config;
 pub mod crafts;

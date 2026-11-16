@@ -12,6 +12,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 
 * **Instances**: as many as you like, each holding only its mods, saves and settings (about 15 MB) and linking the stock game from your Steam install, which is never written to.
 * **CKAN mods**: browse, search, install, upgrade and remove the whole CKAN catalogue, with dependencies, conflicts, recommendations and provider choices handled the way CKAN does.
+* **Categories**: the mod list is grouped by category and colour coded, from CKAN's tags or your own choices (custom categories too), with each group foldable and the DLC listed above it.
 * **Dependencies out of the way**: the Installed list shows the mods you chose; dependencies stay hidden behind a checkbox and say which mods need them.
 * **Starred mods**: star the mods you always use, then show only starred mods in any list and queue them all at once in a new instance.
 * **Shared craft**: every craft you save in any instance lands in one library and is copied into every instance that has the parts for it, with revisions, a trash and an explanation of what's missing where it doesn't fit.
@@ -210,6 +211,10 @@ Vim-style keys work too, unless turned off under **Settings > Interface**:
 | `h` / `l` | Previous / next filter |
 | `J` / `K` | Next / previous instance |
 | `gt` / `gT` | Next / previous tab |
+
+## Categories
+
+The mod list is grouped by category, each with its own colour: a bar on every row and a heading you can click to fold the group. Categories come from the tags CKAN gives each mod (`parts`, `graphics`, `comms` and so on). To put a mod somewhere else, pick a category under **Details** in its panel, or **New category...** for one of your own, such as Rovers or Satellites. Your choices live in `~/.local/share/orbis/categories.toml` and apply to every instance. **Group by category** above the list turns grouping off.
 
 ## Flags
 

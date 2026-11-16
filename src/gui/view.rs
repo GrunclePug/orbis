@@ -4,7 +4,9 @@ use eframe::egui::{self, Color32, RichText, Ui};
 
 use orbis::metadata::Module;
 
-use super::app::{App, Dialog, Filter, Msg, Row, SortKey, Tab, data_paths, instance_paths, when};
+use super::app::{
+    App, Dialog, Filter, Item, Msg, Row, SortKey, Tab, data_paths, instance_paths, when,
+};
 use super::theme::{self, ACCENT, BAD, GOOD, WARN};
 use orbis::logs;
 
@@ -364,6 +366,14 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 msgs.push(Msg::SetShowDeps(deps));
             }
         }
+        let mut grouped = app.grouped;
+        if ui
+            .checkbox(&mut grouped, "Group by category")
+            .on_hover_text("Set a mod's category in its details; click a heading to fold it")
+            .changed()
+        {
+            msgs.push(Msg::SetGrouped(grouped));
+        }
         let installable = app
             .rows
             .iter()
@@ -382,6 +392,9 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         }
     });
     ui.add_space(4.0);
+    if app.filter == Filter::Installed {
+        dlc_strip(app, ui);
+    }
     queue_bar(app, ui, msgs);
     ui.separator();
 
@@ -394,17 +407,28 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         .auto_shrink([false, false]);
     if let Some(i) = app.scroll_to_row.take() {
         let (offset, height) = app.mods_view;
-        let top = i as f32 * step;
+        let line = app.row_item.get(i).copied().unwrap_or(i);
+        let top = line as f32 * step;
         if top < offset {
             area = area.vertical_scroll_offset(top);
         } else if top + step > offset + height {
             area = area.vertical_scroll_offset(top + step - height);
         }
     }
-    let out = area.show_rows(ui, ROW_H, app.rows.len(), |ui, range| {
-        for i in range {
-            let row = &app.rows[i];
-            mod_row(app, ui, i, row, &cols, msgs);
+    let out = area.show_rows(ui, ROW_H, app.items.len(), |ui, range| {
+        for line in range {
+            match &app.items[line] {
+                Item::Header {
+                    category,
+                    count,
+                    collapsed,
+                } => category_header(ui, category, *count, *collapsed, msgs),
+                Item::Row(i) => {
+                    if let Some(row) = app.rows.get(*i) {
+                        mod_row(app, ui, *i, row, &cols, msgs);
+                    }
+                }
+            }
         }
     });
     app.mods_view = (out.state.clamped_offset().y, out.inner_rect.height());
@@ -460,6 +484,8 @@ struct Cols {
     action: f32,
     star: f32,
     name: f32,
+    /// Zero unless the window is wide enough to show summaries.
+    summary: f32,
     installed: f32,
     latest: f32,
     game: f32,
@@ -469,10 +495,17 @@ struct Cols {
 
 fn columns(width: f32) -> Cols {
     let fixed = 30.0 + 22.0 + 92.0 + 92.0 + 104.0 + 84.0 + 90.0 + 8.0 * 8.0 + 12.0;
+    let free = (width - fixed).max(160.0);
+    let (name, summary) = if free > 560.0 + 260.0 {
+        (520.0, free - 520.0 - 8.0)
+    } else {
+        (free, 0.0)
+    };
     Cols {
         action: 30.0,
         star: 22.0,
-        name: (width - fixed).max(160.0),
+        name,
+        summary,
         installed: 92.0,
         latest: 92.0,
         game: 104.0,
@@ -514,6 +547,9 @@ fn header(ui: &mut Ui, c: &Cols, sort: Option<(SortKey, bool)>, msgs: &mut Vec<M
         plain(ui, c.action, "");
         plain(ui, c.star, "");
         sortable(ui, c.name, "Name", SortKey::Name);
+        if c.summary > 0.0 {
+            plain(ui, c.summary, "Summary");
+        }
         sortable(ui, c.installed, "Installed", SortKey::Installed);
         plain(ui, c.latest, "Latest");
         plain(ui, c.game, "KSP");
@@ -576,21 +612,43 @@ fn mod_row(app: &App, ui: &mut Ui, index: usize, row: &Row, c: &Cols, msgs: &mut
             RichText::new(&row.name)
         };
         let name_resp = cell_ui(ui, c.name, |ui| {
-            // Pills take their room from the right; the name truncates into the rest.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                name_pills(ui, row);
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(name)
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text(&row.summary)
-                })
-                .inner
-            })
-            .inner
+            // The name truncates into what the pills after it leave.
+            let pills = name_pills(row);
+            let gap = ui.spacing().item_spacing.x;
+            let pills_w: f32 = pills
+                .iter()
+                .map(|(t, _, _)| theme::pill_width(ui, t) + gap)
+                .sum();
+            let resp = ui
+                .allocate_ui_with_layout(
+                    egui::vec2((c.name - pills_w).max(60.0), ROW_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(name)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(&row.summary)
+                    },
+                )
+                .inner;
+            for (text, color, tip) in pills {
+                let r = theme::pill(ui, text, color);
+                if let Some(tip) = tip {
+                    r.on_hover_text(tip);
+                }
+            }
+            resp
         });
+        if c.summary > 0.0 {
+            cell(
+                ui,
+                c.summary,
+                egui::Label::new(RichText::new(&row.summary).small().color(theme::FAINT))
+                    .truncate(),
+            );
+        }
         let inst = row
             .installed
             .as_ref()
@@ -649,20 +707,109 @@ fn mod_row(app: &App, ui: &mut Ui, index: usize, row: &Row, c: &Cols, msgs: &mut
     };
     ui.painter()
         .set(bg, egui::Shape::rect_filled(rect, 6.0, fill));
-    if selected {
-        ui.painter().rect_filled(
-            egui::Rect::from_min_max(
-                rect.left_top() + egui::vec2(0.0, 5.0),
-                egui::pos2(rect.left() + 3.0, rect.bottom() - 5.0),
-            ),
-            2.0,
-            ACCENT,
-        );
-    }
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(0.0, 5.0),
+            egui::pos2(rect.left() + 3.0, rect.bottom() - 5.0),
+        ),
+        2.0,
+        theme::category_color(&row.category),
+    );
     let resp = outer.inner;
     if resp.clicked() || outer.response.interact(egui::Sense::click()).clicked() {
         msgs.push(Msg::SelectMod(row.id.clone()));
     }
+}
+
+/// A category heading in the grouped mod list; clicking folds it.
+fn category_header(
+    ui: &mut Ui,
+    category: &str,
+    count: usize,
+    collapsed: bool,
+    msgs: &mut Vec<Msg>,
+) {
+    let color = theme::category_color(category);
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::click());
+    let rect = rect.expand2(egui::vec2(6.0, 3.0));
+    let wash = if resp.hovered() { 40 } else { 24 };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, theme::tint(color, wash));
+    let mid = rect.center().y;
+    let mut x = rect.left() + 10.0;
+    // A small triangle: pointing right when folded, down when open.
+    let c = egui::pos2(x + 4.0, mid);
+    let points = if collapsed {
+        vec![
+            c + egui::vec2(-2.5, -4.5),
+            c + egui::vec2(3.5, 0.0),
+            c + egui::vec2(-2.5, 4.5),
+        ]
+    } else {
+        vec![
+            c + egui::vec2(-4.5, -2.5),
+            c + egui::vec2(4.5, -2.5),
+            c + egui::vec2(0.0, 3.5),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        theme::MUTED,
+        egui::Stroke::NONE,
+    ));
+    x += 18.0;
+    painter.circle_filled(egui::pos2(x + 4.0, mid), 4.5, color);
+    x += 16.0;
+    let title = painter.text(
+        egui::pos2(x, mid),
+        egui::Align2::LEFT_CENTER,
+        category,
+        theme::semibold_font(14.0),
+        color,
+    );
+    painter.text(
+        egui::pos2(title.right() + 10.0, mid),
+        egui::Align2::LEFT_CENTER,
+        count.to_string(),
+        egui::FontId::proportional(12.0),
+        theme::FAINT,
+    );
+    if resp
+        .on_hover_text(if collapsed {
+            "Show this category"
+        } else {
+            "Fold this category"
+        })
+        .clicked()
+    {
+        msgs.push(Msg::ToggleCategory(category.to_owned()));
+    }
+}
+
+/// The instance's expansions, above the Installed list.
+fn dlc_strip(app: &App, ui: &mut Ui) {
+    let Some(view) = app.current() else { return };
+    if view.dlc.is_empty() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label(theme::semibold("DLC").small().color(theme::FAINT));
+        for d in &view.dlc {
+            let name = match d.identifier.as_str() {
+                "BreakingGround-DLC" => "Breaking Ground".to_owned(),
+                "MakingHistory-DLC" => "Making History".to_owned(),
+                other => other.trim_end_matches("-DLC").to_owned(),
+            };
+            let version = d
+                .version
+                .as_ref()
+                .map_or(String::new(), |v| format!(" {v}"));
+            theme::pill(ui, format!("{name}{version}"), theme::TEAL)
+                .on_hover_text("Expansion detected in the game folder");
+        }
+    });
+    ui.add_space(4.0);
 }
 
 /// A segment button to pass to `ui.add`, for chains that need a widget.
@@ -671,7 +818,8 @@ fn theme_segment(active: bool, label: &str) -> impl egui::Widget + '_ {
 }
 
 /// The pills after a mod's name, laid out right to left.
-fn name_pills(ui: &mut Ui, row: &Row) {
+fn name_pills(row: &Row) -> Vec<(&'static str, Color32, Option<String>)> {
+    let mut out = Vec::new();
     if row.auto {
         let (label, tip) = if row.required_by.is_empty() {
             (
@@ -684,14 +832,12 @@ fn name_pills(ui: &mut Ui, row: &Row) {
                 format!("Needed by {}", row.required_by.join(", ")),
             )
         };
-        theme::pill(ui, label, theme::VIOLET).on_hover_text(tip);
+        out.push((label, theme::VIOLET, Some(tip)));
     }
     if row.manual {
-        theme::pill(ui, "manual", theme::VIOLET);
+        out.push(("manual", theme::VIOLET, None));
     }
-    if row.dlc {
-        theme::pill(ui, "DLC", theme::TEAL);
-    }
+    out
 }
 
 /// A clickable star, drawn as a shape (egui's default fonts have no star
@@ -817,6 +963,9 @@ fn details_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                             if let Some(d) = &m.release_date {
                                 fact(ui, "Released", d.chars().take(10).collect());
                             }
+                            ui.label(RichText::new("Category").color(theme::MUTED));
+                            category_picker(app, ui, &m, msgs);
+                            ui.end_row();
                         });
                     let links: Vec<(&str, &str)> = [
                         "homepage",
@@ -1006,6 +1155,36 @@ fn actions(app: &App, ui: &mut Ui, m: &Module, msgs: &mut Vec<Msg>) {
             }
         }
     });
+}
+
+/// Picks a mod's category: built-in ones, the user's own, or a new one.
+fn category_picker(app: &App, ui: &mut Ui, m: &Module, msgs: &mut Vec<Msg>) {
+    let current = app.categories.of(&m.identifier, &m.tags);
+    let automatic = orbis::categories::from_tags(&m.tags);
+    let all: Vec<String> = orbis::categories::BUILT_IN
+        .iter()
+        .map(|c| (*c).to_owned())
+        .chain(app.categories.custom())
+        .collect();
+    egui::ComboBox::from_id_salt("category")
+        .selected_text(RichText::new(&current).color(theme::category_color(&current)))
+        .show_ui(ui, |ui| {
+            for c in all {
+                let label = if c == automatic {
+                    format!("{c} (from tags)")
+                } else {
+                    c.clone()
+                };
+                let text = RichText::new(label).color(theme::category_color(&c));
+                if ui.selectable_label(c == current, text).clicked() {
+                    msgs.push(Msg::SetCategory(m.identifier.clone(), Some(c)));
+                }
+            }
+            ui.separator();
+            if ui.button("New category...").clicked() {
+                msgs.push(Msg::OpenNewCategory(m.identifier.clone()));
+            }
+        });
 }
 
 fn relationships(ui: &mut Ui, title: &str, color: Color32, items: &[String]) {
@@ -2230,6 +2409,19 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 ));
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Delete", true, Msg::DeleteCraft);
+            }
+            Dialog::NewCategory { name, .. } => {
+                ui.heading("New category");
+                ui.label("A category of your own, for this mod and any others you put in it. It's listed before Libraries and Other.");
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(name)
+                        .hint_text("Rovers, Satellites, Boats...")
+                        .desired_width(320.0),
+                )
+                .request_focus();
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Create", !name.trim().is_empty(), Msg::NewCategory);
             }
             Dialog::EmptyCraftTrash => {
                 ui.heading("Empty the trash");

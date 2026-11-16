@@ -168,6 +168,57 @@ mod tests {
     }
 
     #[test]
+    fn groups_rows_by_category_and_folds() {
+        let row = |name: &str, category: &str| app::Row {
+            id: name.into(),
+            name: name.into(),
+            summary: String::new(),
+            installed: None,
+            latest: None,
+            game: String::new(),
+            downloads: 0,
+            manual: false,
+            auto: false,
+            dlc: false,
+            starred: false,
+            required_by: vec![],
+            released: String::new(),
+            category: category.into(),
+            tags: vec![],
+        };
+        let rows = vec![
+            row("a", "Libraries"),
+            row("b", "Parts"),
+            row("c", "Rovers"),
+            row("d", "Parts"),
+        ];
+        let open = std::collections::BTreeSet::new();
+        let (rows2, items, row_item) = app::group(rows.clone(), true, &open);
+        let names: Vec<&str> = rows2.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["b", "d", "c", "a"],
+            "Parts, then custom, then Libraries"
+        );
+        assert_eq!(items.len(), 7);
+        assert_eq!(row_item, [1, 2, 4, 6]);
+        let folded: std::collections::BTreeSet<String> = ["Parts".to_owned()].into();
+        let (rows3, items, row_item) = app::group(rows.clone(), true, &folded);
+        assert_eq!(rows3.len(), 2);
+        assert_eq!(
+            items[0],
+            app::Item::Header {
+                category: "Parts".into(),
+                count: 2,
+                collapsed: true
+            }
+        );
+        assert_eq!(row_item, [2, 4]);
+        let (flat, items, _) = app::group(rows, false, &folded);
+        assert_eq!((flat.len(), items.len()), (4, 4));
+    }
+
+    #[test]
     fn default_matches_clap_defaults() {
         let parsed = Wrap::parse_from(["orbis"]).opts;
         let default = Options::default();

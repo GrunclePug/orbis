@@ -13,6 +13,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use orbis::cancel::Cancel;
+use orbis::categories::{self, Categories};
 use orbis::ckan_import;
 use orbis::config::Config;
 use orbis::crafts::{self, Facility, PendingCraft};
@@ -133,6 +134,20 @@ pub struct Row {
     pub required_by: Vec<String>,
     /// Release date of the shown release (YYYY-MM-DD), when known.
     pub released: String,
+    pub category: String,
+    /// CKAN tags, for working out the category again.
+    pub tags: Vec<String>,
+}
+
+/// One line of the mod list: a category heading or a mod.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Item {
+    Header {
+        category: String,
+        count: usize,
+        collapsed: bool,
+    },
+    Row(usize),
 }
 
 impl Row {
@@ -183,6 +198,10 @@ pub struct Prefs {
     pub vim_keys_off: bool,
     /// Unapplied changes, per instance id.
     pub queues: BTreeMap<String, Queue>,
+    /// The mod list is grouped by category unless this is set.
+    pub flat_list: bool,
+    /// Categories folded shut in the grouped list.
+    pub collapsed: BTreeSet<String>,
 }
 
 impl Prefs {
@@ -342,6 +361,10 @@ pub enum Dialog {
         name: String,
     },
     EmptyCraftTrash,
+    NewCategory {
+        id: String,
+        name: String,
+    },
     RenameInstance {
         id: String,
         name: String,
@@ -402,6 +425,11 @@ pub enum Msg {
     SaveInstanceSettings,
     SaveGlobalSettings,
     ToggleStar(String),
+    SetGrouped(bool),
+    ToggleCategory(String),
+    SetCategory(String, Option<String>),
+    OpenNewCategory(String),
+    NewCategory,
     SortBy(SortKey),
     SetVimKeys(bool),
     CancelTask,
@@ -486,6 +514,13 @@ pub struct App {
     pub filter: Filter,
     pub search: String,
     pub rows: Vec<Row>,
+    /// What the mod list shows, in order: headings and rows.
+    pub items: Vec<Item>,
+    /// For each row, its line in `items` (to scroll to it).
+    pub row_item: Vec<usize>,
+    pub grouped: bool,
+    pub collapsed: BTreeSet<String>,
+    pub categories: Categories,
     rows_key: Option<(String, Filter, String, u64, usize, bool, bool)>,
     pub selected_mod: Option<String>,
     pub queue: Queue,
@@ -568,6 +603,11 @@ impl App {
             filter: Filter::Installed,
             search: opts.search.clone().unwrap_or_default(),
             rows: Vec::new(),
+            items: Vec::new(),
+            row_item: Vec::new(),
+            grouped: true,
+            collapsed: BTreeSet::new(),
+            categories: Categories::default(),
             rows_key: None,
             selected_mod: opts.select.clone(),
             queue: Queue::default(),
@@ -630,6 +670,8 @@ impl App {
         app.filter = filter_from(&prefs.filter).unwrap_or(Filter::Installed);
         app.show_deps = prefs.show_deps;
         app.starred_only = prefs.starred_only;
+        app.grouped = !prefs.flat_list;
+        app.collapsed = prefs.collapsed.clone();
         app.vim_keys = !prefs.vim_keys_off;
         app.sort = prefs
             .sort
@@ -694,6 +736,11 @@ impl App {
         }
         self.load_flags();
         self.load_crafts();
+        self.categories = Categories::load(&self.ctx.paths).unwrap_or_else(|e| {
+            log::warn!("categories: {e:#}");
+            Categories::default()
+        });
+        self.invalidate_rows();
         if self
             .selected
             .as_ref()
@@ -705,6 +752,26 @@ impl App {
         self.settings.for_instance = None;
         self.load_side_data();
         self.recount_upgrades();
+    }
+
+    /// Sets (or with `None` resets) a mod's category and saves it.
+    fn set_category(&mut self, id: &str, category: Option<&str>) {
+        let tags = self
+            .selected_module()
+            .filter(|m| m.identifier == id)
+            .map(|m| m.tags)
+            .or_else(|| {
+                self.rows
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.tags.clone())
+            })
+            .unwrap_or_default();
+        self.categories.set(id, &tags, category);
+        if let Err(e) = self.categories.save(&self.ctx.paths) {
+            self.error(format!("{e:#}"));
+        }
+        self.invalidate_rows();
     }
 
     /// Re-reads the craft library, pending craft and thumbnails.
@@ -1476,6 +1543,13 @@ impl App {
         self.rows = rows;
         self.hidden_deps = hidden;
         self.rows_key = Some(key);
+        self.group_rows();
+    }
+
+    /// Lays out the list with category headings (see `group`).
+    fn group_rows(&mut self) {
+        let rows = std::mem::take(&mut self.rows);
+        (self.rows, self.items, self.row_item) = group(rows, self.grouped, &self.collapsed);
     }
 
     /// Rebuilds the rows on the next frame.
@@ -1530,30 +1604,11 @@ impl App {
                     starred: self.starred.contains(id),
                     required_by,
                     released: date(m.module.release_date.as_deref()),
+                    category: self.categories.of(id, &m.module.tags),
+                    tags: m.module.tags.clone(),
                 });
             }
             if self.filter == Filter::Installed {
-                for d in &view.dlc {
-                    if query.is_empty() || d.identifier.to_lowercase().contains(query) {
-                        rows.push(Row {
-                            id: d.identifier.clone(),
-                            name: d.identifier.clone(),
-                            summary: "Expansion (detected)".into(),
-                            installed: Some(
-                                d.version.clone().unwrap_or_else(|| ModVersion::new("?")),
-                            ),
-                            latest: None,
-                            game: String::new(),
-                            downloads: 0,
-                            manual: false,
-                            auto: false,
-                            dlc: true,
-                            starred: false,
-                            required_by: vec![],
-                            released: String::new(),
-                        });
-                    }
-                }
                 if !self.show_deps {
                     let before = rows.len();
                     rows.retain(|r| !r.auto);
@@ -1606,6 +1661,8 @@ impl App {
                     })
                     .unwrap_or_default(),
                 released: date(shown.release_date.as_deref()),
+                category: self.categories.of(id, &shown.tags),
+                tags: shown.tags.clone(),
             });
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.downloads));
@@ -1980,6 +2037,28 @@ impl App {
                         }
                         Err(e) => self.error(format!("{e:#}")),
                     }
+                }
+            }
+            Msg::SetGrouped(on) => {
+                self.grouped = on;
+                self.invalidate_rows();
+            }
+            Msg::ToggleCategory(c) => {
+                if !self.collapsed.remove(&c) {
+                    self.collapsed.insert(c);
+                }
+                self.invalidate_rows();
+            }
+            Msg::SetCategory(id, category) => self.set_category(&id, category.as_deref()),
+            Msg::OpenNewCategory(id) => {
+                self.dialog = Some(Dialog::NewCategory {
+                    id,
+                    name: String::new(),
+                });
+            }
+            Msg::NewCategory => {
+                if let Some(Dialog::NewCategory { id, name }) = self.dialog.take() {
+                    self.set_category(&id, Some(name.trim()));
                 }
             }
             Msg::SyncCrafts => self.want_craft_sync(),
@@ -2593,6 +2672,8 @@ impl App {
                 format!("{}-{}", k.name(), if d { "desc" } else { "asc" })
             }),
             queues,
+            flat_list: !self.grouped,
+            collapsed: self.collapsed.clone(),
         };
         if prefs != self.saved_prefs {
             if let Err(e) = prefs.save(&self.ctx.paths) {
@@ -2882,6 +2963,22 @@ impl App {
             ));
         }
         line(format!("rows: {}", self.rows.len()));
+        let groups: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Header {
+                    category,
+                    count,
+                    collapsed,
+                } => Some(format!(
+                    "{category} {count}{}",
+                    if *collapsed { " (folded)" } else { "" }
+                )),
+                Item::Row(_) => None,
+            })
+            .collect();
+        line(format!("groups: {}", groups.join(", ")));
         for r in self.rows.iter().take(25) {
             line(format!(
                 "  {:40} installed={:12} latest={:12} ksp={}",
@@ -2955,6 +3052,50 @@ impl App {
         line(format!("status: {}", self.last_message()));
         out
     }
+}
+
+/// Orders rows by category (keeping their order within each), drops those
+/// in folded categories, and lays out the list with headings. Returns the
+/// rows, the list, and each row's line in it. Ungrouped, the list is just
+/// the rows.
+pub fn group(
+    mut rows: Vec<Row>,
+    grouped: bool,
+    collapsed: &BTreeSet<String>,
+) -> (Vec<Row>, Vec<Item>, Vec<usize>) {
+    if !grouped {
+        let n = rows.len();
+        return (rows, (0..n).map(Item::Row).collect(), (0..n).collect());
+    }
+    rows.sort_by_cached_key(|r| categories::rank(&r.category));
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for r in &rows {
+        match counts.last_mut() {
+            Some((c, n)) if *c == r.category => *n += 1,
+            _ => counts.push((r.category.clone(), 1)),
+        }
+    }
+    rows.retain(|r| !collapsed.contains(&r.category));
+    let mut items = Vec::new();
+    let mut row_item = Vec::new();
+    let mut next = 0;
+    for (category, count) in counts {
+        let shut = collapsed.contains(&category);
+        items.push(Item::Header {
+            category,
+            count,
+            collapsed: shut,
+        });
+        if shut {
+            continue;
+        }
+        for _ in 0..count {
+            row_item.push(items.len());
+            items.push(Item::Row(next));
+            next += 1;
+        }
+    }
+    (rows, items, row_item)
 }
 
 /// The date part of a CKAN release_date.
