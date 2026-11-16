@@ -27,7 +27,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1. 
 * **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
 * **Reliable downloads**: parallel downloads that drop stalled connections and resume where they left off, falling back to CKAN's archive.org mirror for freely licensed mods.
 * **One copy of each mod**: every mod version is unpacked once into a shared store; on btrfs and XFS instances get reflinked copies that share disk space but keep their own files.
-* **Mouse or keyboard**: everything works by point and click, and vim-style keys work alongside it (press `?` to list them).
+* **Mouse or keyboard**: everything works by point and click, with standard keyboard shortcuts and vim-style keys alongside (press `F1` to list them).
 * **Safe file handling**: every installed file is tracked per mod, conflicts are refused, and a failed install rolls back.
 * **GUI and CLI**: an egui interface, plus a CLI covering every operation.
 * **Headless rendering**: the GUI renders offscreen to PNG with a text state dump, so it can be checked without a display.
@@ -157,24 +157,43 @@ orbis works out where the files go: if the archive has a `GameData` folder anywh
 
 ### Keys
 
-Everything works with the mouse. Dialogs take Enter for their main button and Esc to cancel. Right-click an instance for Launch, Clone, Rename, Export, Open folder and Delete; double-click it to launch.
+Everything works with the mouse; keys are a faster path alongside it, and none of them act while you type in a text box. Right-click an instance for Launch, Clone, Rename, Export, Open folder and Delete; double-click it to launch. Press `F1` (or `?`) in the app to see all keys.
 
-Vim-style keys work alongside the mouse. They act only when no text box has focus, and can be turned off under **Settings > Interface**:
+These always work:
+
+| Key | Action |
+|-----|--------|
+| `Up` / `Down` | Previous / next mod |
+| `Page Up` / `Page Down` | A page up / down |
+| `Home` / `End` | First / last mod |
+| `Left` / `Right` | Previous / next filter |
+| `Space` | Tick the mod: queue an install, or a removal |
+| `Delete` | Queue removal of the selected mod |
+| `Enter` | Apply queued changes; in dialogs, the main button |
+| `Esc` | Cancel a dialog |
+| `Ctrl+F` | Search |
+| `Ctrl+Up` / `Ctrl+Down` | Previous / next instance |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl+1` to `Ctrl+5` | Mods, Manual mods, History, Logs, Settings |
+| `Ctrl+Z` | Undo the last mod change (asks first) |
+| `F2` | Rename the instance |
+| `F5` | Re-read instances from disk |
+| `F1` or `?` | Show the keys |
+
+Vim-style keys work too, unless turned off under **Settings > Interface**:
 
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Next / previous mod |
 | `gg` / `G` | First / last mod |
-| `Ctrl-d` / `Ctrl-u` | Half a page down / up |
-| `Space` or `x` | Tick the mod: queue an install, or a removal |
+| `Ctrl+D` / `Ctrl+U` | Half a page down / up |
+| `x` | Tick the mod |
 | `u` | Queue an upgrade |
 | `s` | Star or unstar |
 | `/` | Search |
 | `h` / `l` | Previous / next filter |
 | `J` / `K` | Next / previous instance |
 | `gt` / `gT` | Next / previous tab |
-| `Enter` | Apply queued changes |
-| `?` | Show these keys |
 
 ## Mod store
 
@@ -219,7 +238,7 @@ make test             # unit and integration tests
 make lint             # clippy with warnings as errors
 make fmt              # rustfmt
 make build            # release build
-make gui-shot         # headless GUI render to target/gui.png and target/gui.txt (add ARGS="--keys jjx" to type keys)
+make gui-shot         # headless GUI render to target/gui.png and target/gui.txt (add ARGS="--keys 'jj<Down><C-f>'" to type keys)
 make clean            # remove build output
 ```
 

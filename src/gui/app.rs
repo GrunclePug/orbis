@@ -728,36 +728,117 @@ impl App {
 
     // ---- keys -----------------------------------------------------------
 
-    /// Vim-style keys, when turned on in Settings. They only act when no
-    /// text field has focus and no dialog is open.
+    /// Keyboard shortcuts. Standard keys (arrows, Page Up/Down, Ctrl
+    /// combinations, F-keys) always work; letter keys work when vim keys are
+    /// on. Nothing fires while a text field has focus or a dialog is open.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if !self.vim_keys || self.dialog.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.dialog.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let (events, now) = ctx.input(|i| (i.events.clone(), i.time));
         for e in events {
             match e {
-                egui::Event::Text(t) => {
-                    for c in t.chars() {
-                        self.vim_char(c, now);
-                    }
-                }
                 egui::Event::Key {
                     key,
                     pressed: true,
                     modifiers,
                     ..
-                } => {
-                    let half = (self.mods_view.1 / (ROW_STEP * 2.0)).max(1.0) as isize;
-                    match key {
-                        egui::Key::D if modifiers.ctrl => self.move_selection(half),
-                        egui::Key::U if modifiers.ctrl => self.move_selection(-half),
-                        egui::Key::Enter if !self.queue.is_empty() => self.update(Msg::ApplyQueue),
-                        _ => {}
+                } => self.standard_key(key, modifiers),
+                egui::Event::Text(t) => {
+                    for c in t.chars() {
+                        if c == '?' {
+                            self.dialog = Some(Dialog::KeyHelp);
+                        } else if self.vim_keys {
+                            self.vim_char(c, now);
+                        }
                     }
                 }
                 _ => {}
             }
+            if self.dialog.is_some() {
+                break;
+            }
+        }
+    }
+
+    fn standard_key(&mut self, key: egui::Key, m: egui::Modifiers) {
+        use egui::Key;
+        let on_mods = self.tab == Tab::Mods;
+        let page = (self.mods_view.1 / ROW_STEP).max(1.0) as isize;
+        let tabs = [
+            Tab::Mods,
+            Tab::Manual,
+            Tab::History,
+            Tab::Logs,
+            Tab::Settings,
+        ];
+        match key {
+            Key::ArrowDown if m.ctrl => self.cycle_instance(1),
+            Key::ArrowUp if m.ctrl => self.cycle_instance(-1),
+            Key::Tab if m.ctrl => self.cycle_tab(if m.shift { -1 } else { 1 }),
+            Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 if m.ctrl => {
+                let i = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5]
+                    .iter()
+                    .position(|k| *k == key)
+                    .unwrap_or(0);
+                self.update(Msg::SetTab(tabs[i]));
+            }
+            Key::F if m.ctrl => {
+                self.tab = Tab::Mods;
+                self.focus_search = true;
+            }
+            Key::Z if m.ctrl => match self.history.first() {
+                Some(e) => {
+                    let id = e.id;
+                    self.update(Msg::AskRestoreHistory(id, true));
+                }
+                None => self.note("Nothing to undo"),
+            },
+            // Vim's half-page moves; Ctrl+D and Ctrl+U mean nothing else here.
+            Key::D if m.ctrl && self.vim_keys && on_mods => self.move_selection(page / 2),
+            Key::U if m.ctrl && self.vim_keys && on_mods => self.move_selection(-(page / 2)),
+            Key::F1 => self.dialog = Some(Dialog::KeyHelp),
+            Key::F2 => self.update(Msg::OpenRename),
+            Key::F5 => {
+                self.update(Msg::Refresh);
+                self.note("Re-read instances from disk");
+            }
+            _ if m.ctrl || m.alt => {}
+            Key::ArrowDown if on_mods => self.move_selection(1),
+            Key::ArrowUp if on_mods => self.move_selection(-1),
+            Key::PageDown if on_mods => self.move_selection(page),
+            Key::PageUp if on_mods => self.move_selection(-page),
+            Key::Home if on_mods => self.select_row(0),
+            Key::End if on_mods => self.select_row(self.rows.len().saturating_sub(1)),
+            Key::ArrowLeft if on_mods => self.cycle_filter(-1),
+            Key::ArrowRight if on_mods => self.cycle_filter(1),
+            Key::Space if on_mods => self.toggle_selected(),
+            Key::Delete if on_mods => {
+                if let Some(row) = self.selected_row().cloned()
+                    && row.installed.is_some()
+                    && !row.dlc
+                    && !self.queue.remove.contains(&row.id)
+                {
+                    self.update(Msg::ToggleRemove(row.id));
+                }
+            }
+            Key::Enter if !self.queue.is_empty() => self.update(Msg::ApplyQueue),
+            _ => {}
+        }
+    }
+
+    /// Ticks or unticks the selected mod, like clicking its checkbox.
+    fn toggle_selected(&mut self) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        if row.dlc {
+            return;
+        }
+        if row.installed.is_some() {
+            self.update(Msg::ToggleRemove(row.id));
+        } else if row.latest.is_some() {
+            self.update(Msg::ToggleInstall(row.id));
         }
     }
 
@@ -775,7 +856,6 @@ impl App {
         let on_mods = self.tab == Tab::Mods;
         match c {
             'g' => self.pending_g = Some(now),
-            '?' => self.dialog = Some(Dialog::KeyHelp),
             'J' => self.cycle_instance(1),
             'K' => self.cycle_instance(-1),
             'j' if on_mods => self.move_selection(1),
@@ -784,18 +864,7 @@ impl App {
             'h' if on_mods => self.cycle_filter(-1),
             'l' if on_mods => self.cycle_filter(1),
             '/' if on_mods => self.focus_search = true,
-            ' ' | 'x' if on_mods => {
-                if let Some(row) = self.selected_row().cloned() {
-                    if row.dlc {
-                        return;
-                    }
-                    if row.installed.is_some() {
-                        self.update(Msg::ToggleRemove(row.id));
-                    } else if row.latest.is_some() {
-                        self.update(Msg::ToggleInstall(row.id));
-                    }
-                }
-            }
+            'x' if on_mods => self.toggle_selected(),
             'u' if on_mods => {
                 if let Some(row) = self.selected_row().filter(|r| r.upgradable()).cloned() {
                     self.update(Msg::ToggleUpgrade(row.id));

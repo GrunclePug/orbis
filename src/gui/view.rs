@@ -100,11 +100,9 @@ fn status_bar(app: &App, ui: &mut Ui) {
             None => {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(app.last_message()).weak());
-                    if app.vim_keys {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new("? for keys").small().weak());
-                        });
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("F1 for keys").small().weak());
+                    });
                 });
             }
         }
@@ -1143,13 +1141,13 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             ui.label(RichText::new("Interface").heading());
             let mut vim = app.vim_keys;
             if ui
-                .checkbox(&mut vim, "Vim-style keys (j/k to move, Space to tick, / to search; ? lists them all)")
+                .checkbox(&mut vim, "Vim-style keys (j/k to move, x to tick, / to search; F1 lists all keys)")
                 .changed()
             {
                 msgs.push(Msg::SetVimKeys(vim));
             }
             ui.label(
-                RichText::new("They only act when no text box has focus, so they don't get in the way of the mouse. Enter and Esc always confirm and cancel dialogs.")
+                RichText::new("Arrow keys, Page Up/Down, Ctrl shortcuts and F-keys always work. No key acts while a text box has focus, so none get in the way of the mouse.")
                     .small()
                     .weak(),
             );
@@ -1520,6 +1518,7 @@ fn logs_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
 
 fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
     let busy = app.busy();
+    let app_vim = app.vim_keys;
     let app_index_ready = app.index.is_some();
     let Some(d) = &mut app.dialog else { return };
     let resp = egui::Modal::new(egui::Id::unique("orbis-dialog")).show(ctx, |ui| {
@@ -1558,28 +1557,57 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 buttons(ui, msgs, "Rename", !name.trim().is_empty(), Msg::RenameInstance);
             }
             Dialog::KeyHelp => {
-                ui.heading("Vim keys");
-                egui::Grid::new("keys").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                    for (k, what) in [
-                        ("j / k", "next / previous mod"),
-                        ("gg / G", "first / last mod"),
-                        ("Ctrl-d / Ctrl-u", "half a page down / up"),
-                        ("Space or x", "tick: queue install, or queue removal"),
-                        ("u", "queue an upgrade"),
-                        ("s", "star or unstar"),
-                        ("/", "search (Esc leaves the search box)"),
-                        ("h / l", "previous / next filter"),
-                        ("J / K", "next / previous instance"),
-                        ("gt / gT", "next / previous tab"),
-                        ("Enter", "apply queued changes; in dialogs, the main button"),
-                        ("Esc", "close a dialog"),
-                        ("?", "this help"),
-                    ] {
-                        ui.label(RichText::new(k).monospace().strong());
-                        ui.label(what);
-                        ui.end_row();
-                    }
+                ui.heading("Keys");
+                let table = |ui: &mut Ui, id: &str, rows: &[(&str, &str)]| {
+                    egui::Grid::new(id).num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
+                        for (k, what) in rows {
+                            ui.label(RichText::new(*k).monospace().strong());
+                            ui.label(*what);
+                            ui.end_row();
+                        }
+                    });
+                };
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Always").strong().color(ACCENT));
+                        table(ui, "keys-std", &[
+                            ("Up / Down", "previous / next mod"),
+                            ("PgUp / PgDn", "a page up / down"),
+                            ("Home / End", "first / last mod"),
+                            ("Left / Right", "previous / next filter"),
+                            ("Space", "tick: queue install or removal"),
+                            ("Delete", "queue removal"),
+                            ("Enter", "apply queued changes"),
+                            ("Ctrl+F", "search"),
+                            ("Ctrl+Up / Down", "previous / next instance"),
+                            ("Ctrl+Tab", "next tab (Shift: previous)"),
+                            ("Ctrl+1 .. 5", "go to a tab"),
+                            ("Ctrl+Z", "undo the last mod change"),
+                            ("F2", "rename instance"),
+                            ("F5", "re-read instances"),
+                            ("F1 or ?", "this help"),
+                            ("Enter / Esc", "in dialogs: confirm / cancel"),
+                        ]);
+                    });
+                    ui.add_space(16.0);
+                    ui.vertical(|ui| {
+                        let title = if app_vim { "Vim keys" } else { "Vim keys (off in Settings)" };
+                        ui.label(RichText::new(title).strong().color(ACCENT));
+                        table(ui, "keys-vim", &[
+                            ("j / k", "next / previous mod"),
+                            ("gg / G", "first / last mod"),
+                            ("Ctrl+D / Ctrl+U", "half a page down / up"),
+                            ("x", "tick"),
+                            ("u", "queue an upgrade"),
+                            ("s", "star or unstar"),
+                            ("/", "search"),
+                            ("h / l", "previous / next filter"),
+                            ("J / K", "next / previous instance"),
+                            ("gt / gT", "next / previous tab"),
+                        ]);
+                    });
                 });
+                ui.label(RichText::new("Keys don't act while you type in a text box.").small().weak());
                 ui.add_space(8.0);
                 if ui.button("Close").clicked() {
                     msgs.push(Msg::CloseDialog);

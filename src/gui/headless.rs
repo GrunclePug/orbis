@@ -24,7 +24,7 @@ pub fn run(ctx: Context, opts: &Options, size: [f32; 2]) -> Result<()> {
     app.load_index_now();
 
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
-    let keys: Vec<char> = opts.keys.as_deref().unwrap_or("").chars().collect();
+    let keys = parse_keys(opts.keys.as_deref().unwrap_or(""))?;
     let frames = opts.frames.max(1).max(
         u32::try_from(keys.len())
             .unwrap_or(u32::MAX)
@@ -37,7 +37,7 @@ pub fn run(ctx: Context, opts: &Options, size: [f32; 2]) -> Result<()> {
             .ok()
             .and_then(|f| f.checked_sub(1))
             .and_then(|i| keys.get(i))
-            .map(|c| vec![egui::Event::Text(c.to_string())])
+            .map(|e| vec![e.clone()])
             .unwrap_or_default();
         let raw = egui::RawInput {
             screen_rect: Some(screen),
@@ -62,6 +62,45 @@ pub fn run(ctx: Context, opts: &Options, size: [f32; 2]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parses `--keys`: plain characters are typed text; `<Name>` presses a
+/// key by egui's name for it, with `C-` (Ctrl) and `S-` (Shift) prefixes,
+/// e.g. `jj<Down><C-f><S-C-Tab>`.
+fn parse_keys(spec: &str) -> Result<Vec<egui::Event>> {
+    let mut out = Vec::new();
+    let mut chars = spec.chars();
+    while let Some(c) = chars.next() {
+        if c != '<' {
+            out.push(egui::Event::Text(c.to_string()));
+            continue;
+        }
+        let name: String = chars.by_ref().take_while(|c| *c != '>').collect();
+        let mut rest = name.as_str();
+        let mut modifiers = egui::Modifiers::default();
+        loop {
+            if let Some(r) = rest.strip_prefix("C-") {
+                modifiers.ctrl = true;
+                modifiers.command = true;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("S-") {
+                modifiers.shift = true;
+                rest = r;
+            } else {
+                break;
+            }
+        }
+        let key =
+            egui::Key::from_name(rest).ok_or_else(|| anyhow!("unknown key <{name}> in --keys"))?;
+        out.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+    }
+    Ok(out)
 }
 
 /// Polls a future to completion on this thread.
