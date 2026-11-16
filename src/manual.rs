@@ -301,6 +301,131 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A folder in an instance's GameData that no installed mod owns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unmanaged {
+    pub folder: String,
+    pub files: usize,
+}
+
+/// ModuleManager's caches and similar files the game writes into GameData.
+fn generated(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.starts_with("modulemanager.") && !n.ends_with(".dll") || n == "physics.cfg"
+}
+
+/// Folders (and loose files) in GameData that no installed mod owns: mods
+/// added by hand. Stock folders and generated caches are left out.
+pub fn unmanaged(
+    game: &Path,
+    owners: &std::collections::HashMap<String, String>,
+) -> Result<(Vec<Unmanaged>, Vec<String>)> {
+    let gamedata = game.join("GameData");
+    let mut folders = Vec::new();
+    let mut loose = Vec::new();
+    let entries = match fs::read_dir(&gamedata) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((folders, loose)),
+        Err(e) => return Err(e).with_context(|| format!("read {}", gamedata.display())),
+    };
+    let owned_prefixes: BTreeSet<String> = owners
+        .keys()
+        .filter_map(|k| k.strip_prefix("gamedata/"))
+        .filter_map(|k| k.split_once('/').map(|(top, _)| top.to_owned()))
+        .collect();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink()
+            || name.eq_ignore_ascii_case("Squad")
+            || name.eq_ignore_ascii_case("SquadExpansion")
+        {
+            continue;
+        }
+        if ft.is_dir() {
+            if owned_prefixes.contains(&name.to_lowercase()) {
+                continue;
+            }
+            let files = Source::Dir(e.path())
+                .entries()?
+                .iter()
+                .filter(|x| !x.is_dir)
+                .count();
+            folders.push(Unmanaged {
+                folder: name,
+                files,
+            });
+        } else if !generated(&name)
+            && !owners.contains_key(&install::fold(&format!("GameData/{name}")))
+        {
+            loose.push(name);
+        }
+    }
+    folders.sort_by_key(|u| u.folder.to_lowercase());
+    loose.sort();
+    Ok((folders, loose))
+}
+
+/// Copies a hand-added GameData folder into the library as a manual mod.
+/// The instance's copy stays where it is; see `ops::adopt`.
+pub fn add_folder(
+    paths: &Paths,
+    gamedata: &Path,
+    folder: &str,
+    opts: &AddOptions,
+) -> Result<ManualMod> {
+    let src = gamedata.join(folder);
+    if !src.is_dir() {
+        bail!("{} is not a folder", src.display());
+    }
+    let name = if opts.name.trim().is_empty() {
+        folder
+    } else {
+        opts.name.trim()
+    };
+    let root = paths.manual();
+    fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+    let base = slug(name);
+    let mut id = base.clone();
+    let mut n = 2;
+    while root.join(&id).exists() {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    let dir = root.join(&id);
+    let result = (|| -> Result<ManualMod> {
+        copy_dir(&src, &dir.join("files").join(folder))?;
+        let m = ManualMod {
+            id: id.clone(),
+            name: name.to_owned(),
+            version: if opts.version.trim().is_empty() {
+                "1.0".into()
+            } else {
+                opts.version.trim().to_owned()
+            },
+            file: "files".into(),
+            is_dir: true,
+            provides: clean_list(&opts.provides),
+            depends: clean_list(&opts.depends),
+            conflicts: clean_list(&opts.conflicts),
+            install: vec![InstallDirective {
+                file: Some(folder.to_owned()),
+                install_to: "GameData".into(),
+                ..InstallDirective::default()
+            }],
+            source_url: opts.source_url.trim().to_owned(),
+            notes: opts.notes.trim().to_owned(),
+            added: paths::now_secs(),
+        };
+        save(paths, &m)?;
+        Ok(m)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    result
+}
+
 /// Guesses install stanzas for an archive:
 ///
 /// 1. It has a `GameData` folder (anywhere): install its contents.

@@ -149,9 +149,14 @@ impl fmt::Display for Change {
                 module,
                 reason,
             } => {
+                let verb = if module.version < *from {
+                    "downgrade"
+                } else {
+                    "upgrade"
+                };
                 write!(
                     f,
-                    "upgrade {} {from} -> {} ({reason})",
+                    "{verb} {} {from} -> {} ({reason})",
                     module.identifier, module.version
                 )
             }

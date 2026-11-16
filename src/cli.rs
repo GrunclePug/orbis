@@ -21,6 +21,7 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::{self, SteamInfo};
 use orbis::version::{GameVersion, ModVersion};
+use orbis::{backup, history, logs};
 
 use crate::gui;
 
@@ -141,6 +142,20 @@ pub enum Command {
     /// Export and import modpacks.
     #[command(subcommand)]
     Pack(PackCmd),
+    /// Save backups.
+    #[command(subcommand)]
+    Backup(BackupCmd),
+    /// Change history and rollback.
+    #[command(subcommand)]
+    History(HistoryCmd),
+    /// Summarise a log: exceptions grouped, with the mods they came from.
+    Logs {
+        #[arg(short, long)]
+        instance: Option<String>,
+        /// ksp, player or launch.
+        #[arg(long, default_value = "ksp")]
+        log: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -299,6 +314,70 @@ pub enum ManualCmd {
     },
     /// Delete a manual mod from the library (instances keep their copy).
     Delete { id: String },
+    /// List GameData folders and files no installed mod owns (added by hand).
+    Unmanaged {
+        #[arg(short, long)]
+        instance: Option<String>,
+    },
+    /// Track a hand-added GameData folder as a manual mod.
+    Adopt {
+        folder: String,
+        #[arg(short, long)]
+        instance: Option<String>,
+        #[arg(long, default_value = "")]
+        name: String,
+        #[arg(long, default_value = "1.0")]
+        version: String,
+        /// CKAN identifiers this mod stands in for (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        provides: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BackupCmd {
+    /// List save backups, newest first.
+    List {
+        #[arg(short, long)]
+        instance: Option<String>,
+    },
+    /// Back up the saves now.
+    Create {
+        #[arg(short, long)]
+        instance: Option<String>,
+    },
+    /// Restore saves from a backup (the current saves are backed up first).
+    Restore {
+        id: String,
+        #[arg(short, long)]
+        instance: Option<String>,
+        /// Restore only this save folder.
+        #[arg(long)]
+        save: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HistoryCmd {
+    /// List applied changes, newest first.
+    List {
+        #[arg(short, long)]
+        instance: Option<String>,
+    },
+    /// Put the mod list back to how it was after a change (or before it,
+    /// with --before). `undo` is `restore <newest id> --before`.
+    Restore {
+        id: u64,
+        #[arg(short, long)]
+        instance: Option<String>,
+        #[arg(long)]
+        before: bool,
+    },
+    /// Undo the newest change.
+    Undo {
+        #[arg(short, long)]
+        instance: Option<String>,
+    },
 }
 
 pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
@@ -404,6 +483,13 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             let mut inst = ctx.instance(instance.as_deref())?;
             instance::sync_links(&mut inst)?;
             let plan = launch::plan(&inst, &ctx.steam(), &ctx.config)?;
+            if !dry_run {
+                match backup::snapshot(&inst, "before launch", ctx.config.backups_keep) {
+                    Ok(Some(b)) => eprintln!("Backed up {} save(s)", b.saves.len()),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("warning: save backup failed: {e:#}"),
+                }
+            }
             if dry_run {
                 println!("{}", plan.display());
                 return Ok(());
@@ -449,6 +535,118 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             Ok(())
         }
         Command::Pack(c) => pack_cmd(ctx, c),
+        Command::Backup(c) => backup_cmd(ctx, c),
+        Command::History(c) => history_cmd(ctx, c),
+        Command::Logs { instance, log } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            let kind = match log.as_str() {
+                "ksp" => logs::LogKind::Ksp,
+                "player" => logs::LogKind::Player,
+                "launch" => logs::LogKind::Launch,
+                other => bail!("unknown log {other:?}: use ksp, player or launch"),
+            };
+            let path = logs::path(&inst, &ctx.steam(), kind).context("can't locate that log")?;
+            let report = logs::read(&path, &logs::assemblies(&inst)?)?;
+            println!(
+                "{}: {} lines, {} exceptions ({} distinct), {} errors, {} warnings",
+                path.display(),
+                report.lines.len(),
+                report.exceptions.iter().map(|e| e.count).sum::<usize>(),
+                report.exceptions.len(),
+                report.errors,
+                report.warnings
+            );
+            for e in report.exceptions.iter().take(20) {
+                let mods = if e.mods.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", e.mods.join(", "))
+                };
+                println!("{:5}x {}{mods}", e.count, e.message);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn backup_cmd(ctx: &Context, cmd: BackupCmd) -> Result<()> {
+    match cmd {
+        BackupCmd::List { instance } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            for b in backup::list(&inst)? {
+                println!(
+                    "{}  {:16} {:8.1} MiB  {}",
+                    b.id,
+                    b.reason,
+                    b.bytes as f64 / 1_048_576.0,
+                    b.saves.join(", ")
+                );
+            }
+            Ok(())
+        }
+        BackupCmd::Create { instance } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            match backup::create(&inst, "manual")? {
+                Some(b) => println!("Backed up {} as {}", b.saves.join(", "), b.id),
+                None => {
+                    println!("Nothing to back up (no saves, or unchanged since the last backup)")
+                }
+            }
+            Ok(())
+        }
+        BackupCmd::Restore { id, instance, save } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            backup::restore(&inst, &id, save.as_deref())?;
+            println!(
+                "Restored {} from {id}",
+                save.as_deref().unwrap_or("all saves")
+            );
+            Ok(())
+        }
+    }
+}
+
+fn history_cmd(ctx: &Context, cmd: HistoryCmd) -> Result<()> {
+    let restore = |inst: &Instance, target: &[history::SnapMod]| -> Result<()> {
+        let index = ctx.index()?;
+        let warnings =
+            with_progress(|tx| ops::restore(&ctx.paths, &ctx.config, inst, &index, target, tx))?;
+        for w in warnings {
+            eprintln!("warning: {w}");
+        }
+        Ok(())
+    };
+    match cmd {
+        HistoryCmd::List { instance } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            for e in history::list(&inst)? {
+                println!("{}  ({} mods after)", e.id, e.after.len());
+                for line in &e.summary {
+                    println!("    {line}");
+                }
+            }
+            Ok(())
+        }
+        HistoryCmd::Restore {
+            id,
+            instance,
+            before,
+        } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            let e = history::list(&inst)?
+                .into_iter()
+                .find(|e| e.id == id)
+                .with_context(|| format!("no history entry {id}"))?;
+            restore(&inst, if before { &e.before } else { &e.after })
+        }
+        HistoryCmd::Undo { instance } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            let e = history::list(&inst)?
+                .into_iter()
+                .next()
+                .context("nothing to undo")?;
+            restore(&inst, &e.before)
+        }
     }
 }
 
@@ -999,6 +1197,38 @@ fn manual_cmd(ctx: &Context, cmd: ManualCmd) -> Result<()> {
             let m = manual::find(&ctx.paths, &id)?;
             manual::delete(&ctx.paths, &m)?;
             println!("Deleted {} from the library", m.name);
+            Ok(())
+        }
+        ManualCmd::Unmanaged { instance } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            let (folders, loose) = manual::unmanaged(&inst.game_dir(), &inst.registry()?.owners())?;
+            for u in &folders {
+                println!("GameData/{:30} {} files", u.folder, u.files);
+            }
+            for f in &loose {
+                println!("GameData/{f}");
+            }
+            if folders.is_empty() && loose.is_empty() {
+                println!("Nothing unmanaged in {}", inst.config.name);
+            }
+            Ok(())
+        }
+        ManualCmd::Adopt {
+            folder,
+            instance,
+            name,
+            version,
+            provides,
+        } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            let opts = AddOptions {
+                name,
+                version,
+                provides,
+                ..AddOptions::default()
+            };
+            let m = ops::adopt(&ctx.paths, &inst, &folder, &opts)?;
+            println!("Adopted GameData/{folder} as {}", m.identifier());
             Ok(())
         }
     }

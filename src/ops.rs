@@ -5,8 +5,10 @@ use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
 
+use crate::backup;
 use crate::config::Config;
 use crate::download::{self, DownloadEvent};
+use crate::history;
 use crate::install::{self, Source};
 use crate::instance::{InstalledMod, Instance, ModSource, Registry};
 use crate::manual::{self, ManualMod};
@@ -70,6 +72,35 @@ pub fn upgradable(inst: &Instance, index: &Index, reg: &Registry) -> Vec<(String
 /// registry is saved after every step, so a failure part-way leaves it
 /// matching the files on disk.
 pub fn apply(
+    paths: &Paths,
+    config: &Config,
+    inst: &Instance,
+    plan: &Plan,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    if let Some(b) = backup::snapshot(inst, "before changes", config.backups_keep)
+        .context("back up saves before changing mods (set backups_keep = 0 to turn backups off)")?
+    {
+        let _ = events.send(Event::Status(format!(
+            "Backed up {} save(s)",
+            b.saves.len()
+        )));
+    }
+    let before = history::snapshot(&inst.registry()?);
+    let result = apply_changes(paths, config, inst, plan, events);
+    let after = history::snapshot(&inst.registry()?);
+    let mut summary: Vec<String> = plan.changes.iter().map(ToString::to_string).collect();
+    if let Err(e) = &result {
+        summary.push(format!("failed: {e:#}"));
+    }
+    history::record(inst, before, after, summary)?;
+    result
+}
+
+fn apply_changes(
     paths: &Paths,
     config: &Config,
     inst: &Instance,
@@ -178,6 +209,79 @@ pub fn apply(
     }
     let _ = events.send(Event::Status("Done".into()));
     Ok(())
+}
+
+/// Brings an instance back to a recorded mod list. Returns warnings for
+/// anything that couldn't be restored.
+pub fn restore(
+    paths: &Paths,
+    config: &Config,
+    inst: &Instance,
+    index: &Index,
+    target: &[history::SnapMod],
+    events: &mpsc::Sender<Event>,
+) -> Result<Vec<String>> {
+    let rp = history::restore_plan(paths, inst, index, target)?;
+    let mut warnings = rp.warnings;
+    if !rp.request.install.is_empty() || !rp.request.remove.is_empty() {
+        let p = plan(inst, index, &rp.request)?.map_err(|e| anyhow::anyhow!("{e}"))?;
+        apply(paths, config, inst, &p, events)?;
+    }
+    for m in &rp.manual {
+        let result = plan_manual(inst, index, m).and_then(|p| {
+            let p = p.map_err(|e| anyhow::anyhow!("{e}"))?;
+            apply(paths, config, inst, &p, events)
+        });
+        if let Err(e) = result {
+            warnings.push(format!("manual mod {}: {e:#}", m.name));
+        }
+    }
+    history::restore_flags(inst, target)?;
+    Ok(warnings)
+}
+
+/// Turns a hand-added GameData folder into a tracked manual mod: copies it
+/// into the library and records the files already in place as installed.
+pub fn adopt(
+    paths: &Paths,
+    inst: &Instance,
+    folder: &str,
+    opts: &manual::AddOptions,
+) -> Result<ManualMod> {
+    let mut reg = inst.registry()?;
+    let (unmanaged, _) = manual::unmanaged(&inst.game_dir(), &reg.owners())?;
+    if !unmanaged.iter().any(|u| u.folder == folder) {
+        bail!(
+            "GameData/{folder} isn't an unmanaged folder in {}",
+            inst.config.name
+        );
+    }
+    let m = manual::add_folder(paths, &inst.game_dir().join("GameData"), folder, opts)?;
+    let planned = m.plan(paths)?;
+    let before = history::snapshot(&reg);
+    reg.mods.insert(
+        m.identifier(),
+        InstalledMod {
+            source: ModSource::Manual,
+            auto_installed: false,
+            installed_at: paths::now_secs(),
+            files: planned
+                .iter()
+                .filter(|p| !p.is_dir)
+                .map(|p| p.dest.clone())
+                .collect(),
+            dirs: install::dirs_of(&planned),
+            module: m.to_module(),
+        },
+    );
+    inst.save_registry(&reg)?;
+    history::record(
+        inst,
+        before,
+        history::snapshot(&reg),
+        vec![format!("adopt GameData/{folder} as {}", m.identifier())],
+    )?;
+    Ok(m)
 }
 
 fn install_source(
@@ -355,5 +459,78 @@ mod tests {
         assert!(!g.join("GameData/App").exists());
         assert!(!g.join("GameData/Lib").exists());
         assert!(inst.registry().expect("registry").mods.is_empty());
+
+        // History: install 1.0, upgrade to 2.0, remove; roll back to 1.0.
+        let entries = history::list(&inst).expect("history");
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].summary[0].starts_with("remove App"));
+        let first = entries.last().expect("first entry").after.clone();
+        let warnings = restore(&paths, &config, &inst, &index, &first, &tx).expect("restore");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(g.join("GameData/App/app.dll").is_file());
+        let reg = inst.registry().expect("registry");
+        assert_eq!(reg.mods["App"].module.version.as_str(), "1.0");
+        assert!(reg.mods["Lib"].auto_installed);
+        assert!(!reg.mods["App"].auto_installed);
+    }
+
+    #[test]
+    fn adopts_hand_added_folders() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ksp = tmp.path().join("ksp");
+        fake_ksp(&ksp);
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let inst = crate::instance::create(
+            &paths,
+            &CreateOptions {
+                name: "t".into(),
+                source: ksp,
+                stock_only: true,
+                with_saves: false,
+                mode: CopyMode::Link,
+            },
+            &mut |_, _| {},
+        )
+        .expect("create");
+        let gd = inst.game_dir().join("GameData");
+        fs::create_dir_all(gd.join("HandMod/Plugins")).expect("mkdir");
+        fs::write(gd.join("HandMod/Plugins/h.dll"), b"h").expect("write");
+        fs::write(gd.join("ModuleManager.ConfigCache"), b"cache").expect("write");
+        fs::write(gd.join("stray.cfg"), b"x").expect("write");
+        let (folders, loose) = manual::unmanaged(&inst.game_dir(), &HashMap::new()).expect("scan");
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].folder, "HandMod");
+        assert_eq!(loose, ["stray.cfg"]);
+
+        let m = adopt(
+            &paths,
+            &inst,
+            "HandMod",
+            &manual::AddOptions {
+                version: "0.9".into(),
+                ..manual::AddOptions::default()
+            },
+        )
+        .expect("adopt");
+        assert_eq!(m.identifier(), "manual:handmod");
+        let reg = inst.registry().expect("registry");
+        assert_eq!(
+            reg.mods["manual:handmod"].files,
+            ["GameData/HandMod/Plugins/h.dll"]
+        );
+        let (folders, _) = manual::unmanaged(&inst.game_dir(), &reg.owners()).expect("scan");
+        assert!(folders.is_empty());
+
+        // Removing it removes the files; the library keeps a copy.
+        let (tx, _rx) = mpsc::channel();
+        let req = Request {
+            remove: vec!["manual:handmod".into()],
+            ..Request::default()
+        };
+        let index = Index::default();
+        let p = plan(&inst, &index, &req).expect("io").expect("plan");
+        apply(&paths, &Config::default(), &inst, &p, &tx).expect("remove");
+        assert!(!gd.join("HandMod").exists());
+        assert!(m.plan(&paths).expect("library copy").len() > 1);
     }
 }

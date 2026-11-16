@@ -27,6 +27,7 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::SteamInfo;
 use orbis::version::{GameVersion, ModVersion};
+use orbis::{backup, history, logs};
 use serde::{Deserialize, Serialize};
 
 use super::Options;
@@ -36,7 +37,40 @@ use crate::cli::{self, Context};
 pub enum Tab {
     Mods,
     Manual,
+    History,
+    Logs,
     Settings,
+}
+
+/// Columns the mod table can sort by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Installed,
+    Released,
+    Downloads,
+}
+
+impl SortKey {
+    fn name(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Installed => "installed",
+            SortKey::Released => "released",
+            SortKey::Downloads => "downloads",
+        }
+    }
+
+    fn from_name(s: &str) -> Option<Self> {
+        [
+            SortKey::Name,
+            SortKey::Installed,
+            SortKey::Released,
+            SortKey::Downloads,
+        ]
+        .into_iter()
+        .find(|k| k.name() == s)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +123,8 @@ pub struct Row {
     pub starred: bool,
     /// Display names of installed mods that depend on this one.
     pub required_by: Vec<String>,
+    /// Release date of the shown release (YYYY-MM-DD), when known.
+    pub released: String,
 }
 
 impl Row {
@@ -124,6 +160,8 @@ pub struct Prefs {
     pub filter: String,
     pub show_deps: bool,
     pub starred_only: bool,
+    /// "<column>-asc" or "<column>-desc"; empty for each filter's default.
+    pub sort: String,
     /// Unapplied changes, per instance id.
     pub queues: BTreeMap<String, Queue>,
 }
@@ -193,6 +231,8 @@ pub struct GlobalForm {
     pub use_runtime: bool,
     pub workers: String,
     pub repos: String,
+    pub backups_keep: String,
+    pub auto_update_hours: String,
 }
 
 /// Fields of the "add manual mod" dialog.
@@ -210,6 +250,9 @@ pub struct AddManualForm {
     /// Destination folders the archive would install into, or an error.
     pub preview: Option<Result<Vec<String>, String>>,
     pub previewed_for: String,
+    /// Set when adopting a hand-added GameData folder of the current
+    /// instance instead of adding an archive.
+    pub adopt_folder: Option<String>,
 }
 
 /// A modal dialog.
@@ -243,6 +286,17 @@ pub enum Dialog {
         manual: Option<ManualMod>,
     },
     AddManual(Box<AddManualForm>),
+    RestoreHistory {
+        id: u64,
+        before: bool,
+        title: String,
+        lines: Vec<String>,
+    },
+    RestoreBackup {
+        id: String,
+        save: Option<String>,
+        title: String,
+    },
     Export(Box<ExportForm>),
     Import(Box<ImportForm>),
     DeleteManual(ManualMod),
@@ -283,6 +337,16 @@ pub enum Msg {
     SaveInstanceSettings,
     SaveGlobalSettings,
     ToggleStar(String),
+    SortBy(SortKey),
+    AskRestoreHistory(u64, bool),
+    RestoreHistory,
+    BackupNow,
+    AskRestoreBackup(String, Option<String>),
+    RestoreBackup,
+    LoadLog(logs::LogKind),
+    SetLogLevel(logs::Level),
+    JumpToLog(usize),
+    OpenAdopt(String),
     SetShowDeps(bool),
     SetStarredOnly(bool),
     QueueShown,
@@ -305,6 +369,7 @@ pub enum Done {
     ManualAdded(Result<ManualMod, String>),
     Exported(Result<(PathBuf, Vec<String>), String>),
     Imported(Result<modpack::ImportReport, String>),
+    Restored(Result<Vec<String>, String>),
 }
 
 /// Messages from background threads.
@@ -359,6 +424,22 @@ pub struct App {
     /// Dependencies hidden from the Installed list.
     pub hidden_deps: usize,
     queues: BTreeMap<String, Queue>,
+    /// `None` uses the filter's default order.
+    pub sort: Option<(SortKey, bool)>,
+    /// Upgrades waiting per instance id.
+    pub upgrade_counts: HashMap<String, usize>,
+    pub history: Vec<history::Entry>,
+    pub backups: Vec<backup::Backup>,
+    pub unmanaged: (Vec<manual::Unmanaged>, Vec<String>),
+    pub log_kind: logs::LogKind,
+    pub log: Option<Result<logs::Report, String>>,
+    pub log_min: logs::Level,
+    pub log_search: String,
+    /// Indexes into the log's lines that pass the level and search filters.
+    pub log_rows: Vec<usize>,
+    log_rows_key: Option<(logs::Level, String, usize)>,
+    pub log_jump: Option<usize>,
+    auto_updated: bool,
     saved_prefs: Prefs,
     /// Write `gui.toml` (off in headless mode).
     persist: bool,
@@ -396,6 +477,19 @@ impl App {
             starred_only: false,
             hidden_deps: 0,
             queues: BTreeMap::new(),
+            sort: None,
+            upgrade_counts: HashMap::new(),
+            history: Vec::new(),
+            backups: Vec::new(),
+            unmanaged: (Vec::new(), Vec::new()),
+            log_kind: logs::LogKind::Ksp,
+            log: None,
+            log_min: logs::Level::Info,
+            log_search: String::new(),
+            log_rows: Vec::new(),
+            log_rows_key: None,
+            log_jump: None,
+            auto_updated: false,
             saved_prefs: Prefs::default(),
             persist: !opts.headless,
             generation: 0,
@@ -409,6 +503,10 @@ impl App {
         app.filter = filter_from(&prefs.filter).unwrap_or(Filter::Installed);
         app.show_deps = prefs.show_deps;
         app.starred_only = prefs.starred_only;
+        app.sort = prefs
+            .sort
+            .split_once('-')
+            .and_then(|(k, d)| SortKey::from_name(k).map(|k| (k, d == "desc")));
         app.queues = prefs.queues.clone();
         app.saved_prefs = prefs;
         app.reload();
@@ -425,9 +523,15 @@ impl App {
         }
         app.tab = match opts.tab.as_deref() {
             Some("manual") => Tab::Manual,
+            Some("history") => Tab::History,
+            Some("logs") => Tab::Logs,
             Some("settings") => Tab::Settings,
             _ => Tab::Mods,
         };
+        app.load_side_data();
+        if app.tab == Tab::Logs {
+            app.update(Msg::LoadLog(logs::LogKind::Ksp));
+        }
         if let Some(f) = opts.filter.as_deref().and_then(filter_from) {
             app.filter = f;
         }
@@ -469,6 +573,66 @@ impl App {
         }
         self.generation += 1;
         self.settings.for_instance = None;
+        self.load_side_data();
+        self.recount_upgrades();
+    }
+
+    /// Reads the current instance's history, backups and unmanaged files.
+    fn load_side_data(&mut self) {
+        let Some(view) = self.current() else {
+            self.history.clear();
+            self.backups.clear();
+            self.unmanaged = (vec![], vec![]);
+            return;
+        };
+        let inst = view.inst.clone();
+        let owners = view.reg.owners();
+        self.history = history::list(&inst).unwrap_or_else(|e| {
+            log::warn!("history: {e:#}");
+            vec![]
+        });
+        self.backups = backup::list(&inst).unwrap_or_else(|e| {
+            log::warn!("backups: {e:#}");
+            vec![]
+        });
+        self.unmanaged = manual::unmanaged(&inst.game_dir(), &owners).unwrap_or_else(|e| {
+            log::warn!("unmanaged: {e:#}");
+            (vec![], vec![])
+        });
+    }
+
+    /// Counts the upgrades waiting in every instance.
+    fn recount_upgrades(&mut self) {
+        let Some(index) = self.index.clone() else {
+            return;
+        };
+        self.upgrade_counts = self
+            .instances
+            .iter()
+            .map(|v| {
+                (
+                    v.inst.id.clone(),
+                    ops::upgradable(&v.inst, &index, &v.reg).len(),
+                )
+            })
+            .collect();
+    }
+
+    /// Starts an index update when the cached one is missing or stale.
+    fn maybe_auto_update(&mut self) {
+        let hours = self.ctx.config.auto_update_hours;
+        if !self.persist || self.auto_updated || hours == 0 {
+            return;
+        }
+        let stale = self
+            .index
+            .as_ref()
+            .is_none_or(|i| orbis::paths::now_secs().saturating_sub(i.updated) > hours * 3600);
+        if stale {
+            self.auto_updated = true;
+            self.note("Mod index is out of date; updating");
+            self.update(Msg::UpdateIndex);
+        }
     }
 
     pub fn current(&self) -> Option<&InstanceView> {
@@ -612,9 +776,12 @@ impl App {
                 self.index_status = index_label(&index);
                 self.index = Some(Arc::new(index));
                 self.generation += 1;
+                self.recount_upgrades();
+                self.maybe_auto_update();
             }
             Done::IndexLoaded(Ok(None)) => {
                 self.index_status = "No mod index yet: press Update".into();
+                self.maybe_auto_update();
             }
             Done::IndexLoaded(Err(e)) => {
                 self.index_status = "Mod index unreadable: press Update".into();
@@ -632,8 +799,17 @@ impl App {
                 self.index_status = index_label(&index);
                 self.index = Some(Arc::new(index));
                 self.generation += 1;
+                self.recount_upgrades();
             }
             Done::IndexUpdated(Err(e)) => self.error(format!("Update failed: {e}")),
+            Done::Restored(r) => {
+                self.reload();
+                match r {
+                    Ok(w) if w.is_empty() => self.note("Mod list restored"),
+                    Ok(w) => self.error(format!("Restored with warnings:\n{}", w.join("\n"))),
+                    Err(e) => self.error(format!("Restore failed: {e}")),
+                }
+            }
             Done::Applied(r) => {
                 self.reload();
                 match r {
@@ -711,6 +887,11 @@ impl App {
         self.rows_key = Some(key);
     }
 
+    /// Rebuilds the rows on the next frame.
+    fn invalidate_rows(&mut self) {
+        self.rows_key = None;
+    }
+
     /// The rows for the current filter, and how many dependencies the
     /// Installed list hid.
     fn build_rows(&self, query: &str) -> (Vec<Row>, usize) {
@@ -757,6 +938,7 @@ impl App {
                     dlc: false,
                     starred: self.starred.contains(id),
                     required_by,
+                    released: date(m.module.release_date.as_deref()),
                 });
             }
             if self.filter == Filter::Installed {
@@ -777,6 +959,7 @@ impl App {
                             dlc: true,
                             starred: false,
                             required_by: vec![],
+                            released: String::new(),
                         });
                     }
                 }
@@ -792,6 +975,7 @@ impl App {
                 rows.retain(|r| r.starred);
             }
             rows.sort_by_key(|r| r.name.to_lowercase());
+            self.apply_sort(&mut rows);
             return (rows, hidden);
         }
         for (id, versions) in index.iter() {
@@ -830,10 +1014,53 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default(),
+                released: date(shown.release_date.as_deref()),
             });
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.downloads));
+        self.apply_sort(&mut rows);
         (rows, 0)
+    }
+
+    fn apply_sort(&self, rows: &mut [Row]) {
+        let Some((key, desc)) = self.sort else { return };
+        match key {
+            SortKey::Name => rows.sort_by_key(|r| r.name.to_lowercase()),
+            SortKey::Installed => {
+                rows.sort_by_key(|r| (r.installed.is_none(), r.name.to_lowercase()))
+            }
+            SortKey::Released => rows.sort_by(|a, b| a.released.cmp(&b.released)),
+            SortKey::Downloads => rows.sort_by_key(|r| r.downloads),
+        }
+        if desc {
+            rows.reverse();
+        }
+    }
+
+    /// Log line indexes that pass the level and search filters.
+    pub fn ensure_log_rows(&mut self) {
+        let Some(Ok(report)) = &self.log else {
+            self.log_rows.clear();
+            return;
+        };
+        let key = (
+            self.log_min,
+            self.log_search.to_lowercase(),
+            report.lines.len(),
+        );
+        if self.log_rows_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.log_rows = report
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                l.level >= key.0 && (key.1.is_empty() || l.text.to_lowercase().contains(&key.1))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        self.log_rows_key = Some(key);
     }
 
     /// The module to show in the details pane.
@@ -872,6 +1099,8 @@ impl App {
                     }
                     self.queue = self.queues.remove(&id).unwrap_or_default();
                     self.selected = Some(id);
+                    self.load_side_data();
+                    self.log = None;
                     self.choices.clear();
                     self.settings.for_instance = None;
                     self.selected_mod = None;
@@ -1071,13 +1300,29 @@ impl App {
                 self.update(Msg::PreviewManual);
             }
             Msg::PreviewManual => {
-                if let Some(Dialog::AddManual(form)) = &mut self.dialog {
+                if let Some(Dialog::AddManual(form)) = &mut self.dialog
+                    && form.adopt_folder.is_none()
+                {
                     form.preview = preview_manual(form);
                     form.previewed_for = format!("{}|{}", form.path, form.find);
                 }
             }
             Msg::AddManual => {
-                if let Some(Dialog::AddManual(form)) = self.dialog.take() {
+                if let Some(Dialog::AddManual(form)) = &self.dialog
+                    && let Some(folder) = form.adopt_folder.clone()
+                {
+                    let opts = add_options(form);
+                    self.dialog = None;
+                    let Some(view) = self.current() else { return };
+                    let inst = view.inst.clone();
+                    match ops::adopt(&self.ctx.paths, &inst, &folder, &opts) {
+                        Ok(m) => {
+                            self.note(format!("Adopted GameData/{folder} as {}", m.name));
+                            self.reload();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                } else if let Some(Dialog::AddManual(form)) = self.dialog.take() {
                     let paths = self.ctx.paths.clone();
                     let opts = add_options(&form);
                     self.spawn("Adding manual mod", move |_| {
@@ -1120,6 +1365,120 @@ impl App {
                 self.generation += 1;
             }
             Msg::SetShowDeps(v) => self.show_deps = v,
+            Msg::SortBy(key) => {
+                self.sort = match self.sort {
+                    Some((k, desc)) if k == key => Some((key, !desc)),
+                    _ => Some((key, matches!(key, SortKey::Released | SortKey::Downloads))),
+                };
+                self.invalidate_rows();
+            }
+            Msg::AskRestoreHistory(id, before) => self.ask_restore_history(id, before),
+            Msg::RestoreHistory => {
+                let Some(Dialog::RestoreHistory { id, before, .. }) = self.dialog.take() else {
+                    return;
+                };
+                let (Some(view), Some(index)) = (self.current(), self.index.clone()) else {
+                    return self
+                        .error("The mod index isn't loaded yet: press Update index.".into());
+                };
+                let Some(entry) = self.history.iter().find(|e| e.id == id) else {
+                    return;
+                };
+                let target = if before {
+                    entry.before.clone()
+                } else {
+                    entry.after.clone()
+                };
+                let inst = view.inst.clone();
+                let paths = self.ctx.paths.clone();
+                let config = self.ctx.config.clone();
+                let egui = self.egui.clone();
+                self.spawn("Restoring mod list", move |tx| {
+                    let r = forward_events(tx, &egui, |etx| {
+                        ops::restore(&paths, &config, &inst, &index, &target, etx)
+                    });
+                    Done::Restored(r.map_err(|e| format!("{e:#}")))
+                });
+            }
+            Msg::BackupNow => {
+                if let Some(view) = self.current() {
+                    let inst = view.inst.clone();
+                    match backup::create(&inst, "manual") {
+                        Ok(Some(b)) => self.note(format!("Backed up {}", b.saves.join(", "))),
+                        Ok(None) => self.note(
+                            "Nothing to back up: no saves, or none changed since the last backup",
+                        ),
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                    self.load_side_data();
+                }
+            }
+            Msg::AskRestoreBackup(id, save) => {
+                if let Some(b) = self.backups.iter().find(|b| b.id == id) {
+                    let what = save.clone().unwrap_or_else(|| b.saves.join(", "));
+                    self.dialog = Some(Dialog::RestoreBackup {
+                        title: format!(
+                            "Restore {what} from the {} backup of {}?",
+                            b.reason,
+                            when(b.created)
+                        ),
+                        id,
+                        save,
+                    });
+                }
+            }
+            Msg::RestoreBackup => {
+                if let Some(Dialog::RestoreBackup { id, save, .. }) = self.dialog.take()
+                    && let Some(view) = self.current()
+                {
+                    let inst = view.inst.clone();
+                    match backup::restore(&inst, &id, save.as_deref()) {
+                        Ok(()) => {
+                            self.note("Saves restored (the previous saves were backed up first)")
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                    self.load_side_data();
+                }
+            }
+            Msg::LoadLog(kind) => {
+                self.log_kind = kind;
+                self.log_rows_key = None;
+                self.log_jump = None;
+                if let Some(view) = self.current() {
+                    let inst = view.inst.clone();
+                    self.log = Some(match logs::path(&inst, &self.steam, kind) {
+                        None => {
+                            Err("This log's location is unknown (no Proton prefix found).".into())
+                        }
+                        Some(p) if !p.is_file() => Err(format!(
+                            "{} doesn't exist yet: launch the game first.",
+                            p.display()
+                        )),
+                        Some(p) => logs::assemblies(&inst)
+                            .and_then(|asm| logs::read(&p, &asm))
+                            .map_err(|e| format!("{e:#}")),
+                    });
+                }
+            }
+            Msg::SetLogLevel(l) => self.log_min = l,
+            Msg::JumpToLog(line) => {
+                self.log_min = logs::Level::Info;
+                self.log_search.clear();
+                self.log_jump = Some(line);
+            }
+            Msg::OpenAdopt(folder) => {
+                let form = AddManualForm {
+                    name: folder.clone(),
+                    version: "1.0".into(),
+                    preview: Some(Ok(vec![format!(
+                        "Tracks GameData/{folder} as it is; nothing is copied into the game."
+                    )])),
+                    adopt_folder: Some(folder),
+                    ..AddManualForm::default()
+                };
+                self.dialog = Some(Dialog::AddManual(Box::new(form)));
+            }
             Msg::SetStarredOnly(v) => self.starred_only = v,
             Msg::QueueShown => {
                 let ids: Vec<String> = self
@@ -1386,6 +1745,9 @@ impl App {
             filter: filter_name(self.filter).to_owned(),
             show_deps: self.show_deps,
             starred_only: self.starred_only,
+            sort: self.sort.map_or(String::new(), |(k, d)| {
+                format!("{}-{}", k.name(), if d { "desc" } else { "asc" })
+            }),
             queues,
         };
         if prefs != self.saved_prefs {
@@ -1396,12 +1758,62 @@ impl App {
         }
     }
 
+    fn ask_restore_history(&mut self, id: u64, before: bool) {
+        let (Some(view), Some(index)) = (self.current(), self.index.clone()) else {
+            return self.error("The mod index isn't loaded yet: press Update index.".into());
+        };
+        let Some(entry) = self.history.iter().find(|e| e.id == id) else {
+            return;
+        };
+        let target = if before { &entry.before } else { &entry.after };
+        match history::restore_plan(&self.ctx.paths, &view.inst, &index, target) {
+            Ok(rp) if rp.is_empty() && rp.warnings.is_empty() => {
+                self.note("The mod list already matches")
+            }
+            Ok(rp) => {
+                let mut lines: Vec<String> = rp
+                    .request
+                    .remove
+                    .iter()
+                    .map(|r| format!("remove {r}"))
+                    .collect();
+                lines.extend(rp.request.install.iter().map(|(id, v)| match v {
+                    Some(v) => format!("install {id} {v}"),
+                    None => format!("install {id} (newest)"),
+                }));
+                lines.extend(
+                    rp.manual
+                        .iter()
+                        .map(|m| format!("install manual mod {} {}", m.name, m.version)),
+                );
+                lines.extend(rp.warnings.iter().map(|w| format!("warning: {w}")));
+                let title = format!(
+                    "Put the mods back to how they were {} the change of {}?",
+                    if before { "before" } else { "after" },
+                    when(entry.time)
+                );
+                self.dialog = Some(Dialog::RestoreHistory {
+                    id,
+                    before,
+                    title,
+                    lines,
+                });
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
     fn launch(&mut self) {
         let Some(view) = self.current() else { return };
         let mut inst = view.inst.clone();
         if self.running.iter().any(|(id, _)| *id == inst.id) {
             self.note(format!("{} is already running", inst.config.name));
             return;
+        }
+        match backup::snapshot(&inst, "before launch", self.ctx.config.backups_keep) {
+            Ok(Some(b)) => self.note(format!("Backed up {} save(s)", b.saves.len())),
+            Ok(None) => {}
+            Err(e) => self.note(format!("Save backup failed: {e:#}")),
         }
         let result = instance::sync_links(&mut inst)
             .and_then(|()| launch::plan(&inst, &self.steam, &self.ctx.config))
@@ -1476,6 +1888,8 @@ impl App {
                 .map(|r| format!("{} {}", r.name, r.url))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            backups_keep: c.backups_keep.to_string(),
+            auto_update_hours: c.auto_update_hours.to_string(),
         };
     }
 
@@ -1538,12 +1952,20 @@ impl App {
         let Ok(workers) = g.workers.trim().parse() else {
             return self.error("Download workers must be a number".into());
         };
+        let Ok(backups_keep) = g.backups_keep.trim().parse() else {
+            return self.error("Backups to keep must be a number".into());
+        };
+        let Ok(auto_update_hours) = g.auto_update_hours.trim().parse() else {
+            return self.error("Auto-update hours must be a number".into());
+        };
         let cfg = Config {
             steam_root: opt_path(&g.steam_root),
             proton: opt_path(&g.proton),
             use_steam_runtime: g.use_runtime,
             repositories: repos,
             download_workers: workers,
+            backups_keep,
+            auto_update_hours,
         };
         match cfg.save(&self.ctx.paths) {
             Ok(()) => {
@@ -1622,6 +2044,32 @@ impl App {
         line(format!("status: {}", self.last_message()));
         out
     }
+}
+
+/// The date part of a CKAN release_date.
+fn date(s: Option<&str>) -> String {
+    s.map(|d| d.chars().take(10).collect()).unwrap_or_default()
+}
+
+/// A Unix time as "YYYY-MM-DD HH:MM UTC".
+pub fn when(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60
+    )
 }
 
 fn filter_from(s: &str) -> Option<Filter> {

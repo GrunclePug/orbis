@@ -363,6 +363,13 @@ pub fn install(
         uninstall(game, &done);
         return Err(e);
     }
+    done.dirs = dirs_of(planned);
+    Ok(done)
+}
+
+/// The directories a set of planned files lives in (parents included),
+/// minus the game's own folders: what an uninstall may remove when empty.
+pub fn dirs_of(planned: &[Planned]) -> Vec<String> {
     let mut dirs = BTreeSet::new();
     for p in planned {
         if p.is_dir {
@@ -374,8 +381,7 @@ pub fn install(
             d = dirname(d);
         }
     }
-    done.dirs = dirs.into_iter().filter(|d| !is_kept_dir(d)).collect();
-    Ok(done)
+    dirs.into_iter().filter(|d| !is_kept_dir(d)).collect()
 }
 
 /// The first component of `rel` (under `game`) that is a symlink, if any.

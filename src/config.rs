@@ -27,6 +27,12 @@ pub struct Config {
     pub repositories: Vec<Repository>,
     /// Parallel mod downloads.
     pub download_workers: usize,
+    /// Save backups kept per instance (taken before mod changes and
+    /// launches); 0 turns backups off.
+    pub backups_keep: usize,
+    /// Refresh the mod index on GUI start when it is older than this many
+    /// hours; 0 turns it off.
+    pub auto_update_hours: u64,
 }
 
 /// One CKAN metadata repository.
@@ -48,6 +54,8 @@ impl Default for Config {
                 url: DEFAULT_REPO.into(),
             }],
             download_workers: 4,
+            backups_keep: 10,
+            auto_update_hours: 24,
         }
     }
 }
@@ -90,6 +98,9 @@ impl Config {
         }
         if !(1..=16).contains(&self.download_workers) {
             bail!("download_workers must be between 1 and 16");
+        }
+        if self.backups_keep > 1000 {
+            bail!("backups_keep must be at most 1000");
         }
         Ok(())
     }

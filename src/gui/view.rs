@@ -4,7 +4,8 @@ use eframe::egui::{self, Color32, RichText, Ui};
 
 use orbis::metadata::Module;
 
-use super::app::{App, Dialog, Filter, Msg, Row, Tab, data_paths, instance_paths};
+use super::app::{App, Dialog, Filter, Msg, Row, SortKey, Tab, data_paths, instance_paths, when};
+use orbis::logs;
 
 const ACCENT: Color32 = Color32::from_rgb(110, 170, 255);
 const GOOD: Color32 = Color32::from_rgb(120, 200, 120);
@@ -22,6 +23,8 @@ pub fn draw(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     egui::CentralPanel::default_margins().show(ui, |ui| match app.tab {
         Tab::Mods => mods_tab(app, ui, msgs),
         Tab::Manual => manual_tab(app, ui, msgs),
+        Tab::History => history_tab(app, ui, msgs),
+        Tab::Logs => logs_tab(app, ui, msgs),
         Tab::Settings => settings_tab(app, ui, msgs),
     });
     dialog(app, ui.ctx(), msgs);
@@ -36,6 +39,8 @@ fn top_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             for (tab, label) in [
                 (Tab::Mods, "Mods"),
                 (Tab::Manual, "Manual mods"),
+                (Tab::History, "History"),
+                (Tab::Logs, "Logs"),
                 (Tab::Settings, "Settings"),
             ] {
                 if ui.selectable_label(app.tab == tab, label).clicked() {
@@ -162,15 +167,29 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                                         ui.label(RichText::new("running").small().color(GOOD));
                                     }
                                 });
-                                ui.label(
-                                    RichText::new(format!(
-                                        "KSP {} · {} mods",
-                                        v.inst.config.game_version.without_build(),
-                                        v.reg.mods.len()
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "KSP {} · {} mods",
+                                            v.inst.config.game_version.without_build(),
+                                            v.reg.mods.len()
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                    let ups =
+                                        app.upgrade_counts.get(&v.inst.id).copied().unwrap_or(0);
+                                    if ups > 0 {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{ups} upgrade{}",
+                                                if ups == 1 { "" } else { "s" }
+                                            ))
+                                            .small()
+                                            .color(WARN),
+                                        );
+                                    }
+                                });
                             })
                             .response
                             .interact(egui::Sense::click());
@@ -294,7 +313,7 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
 
     let width = ui.available_width();
     let cols = columns(width);
-    header(ui, &cols);
+    header(ui, &cols, app.sort, msgs);
     egui::ScrollArea::vertical()
         .id_salt("mods")
         .auto_shrink([false, false])
@@ -360,34 +379,52 @@ struct Cols {
     installed: f32,
     latest: f32,
     game: f32,
+    released: f32,
     downloads: f32,
 }
 
 fn columns(width: f32) -> Cols {
-    let fixed = 34.0 + 22.0 + 110.0 + 110.0 + 110.0 + 90.0 + 8.0 * 7.0;
+    let fixed = 34.0 + 22.0 + 110.0 + 110.0 + 96.0 + 80.0 + 76.0 + 8.0 * 8.0;
     Cols {
         action: 34.0,
         star: 22.0,
         name: (width - fixed).max(160.0),
         installed: 110.0,
         latest: 110.0,
-        game: 110.0,
-        downloads: 90.0,
+        game: 96.0,
+        released: 80.0,
+        downloads: 76.0,
     }
 }
 
-fn header(ui: &mut Ui, c: &Cols) {
+fn header(ui: &mut Ui, c: &Cols, sort: Option<(SortKey, bool)>, msgs: &mut Vec<Msg>) {
     ui.horizontal(|ui| {
-        let h = |ui: &mut Ui, w: f32, t: &str| {
+        let plain = |ui: &mut Ui, w: f32, t: &str| {
             cell(ui, w, egui::Label::new(RichText::new(t).small().strong()));
         };
-        h(ui, c.action, "");
-        h(ui, c.star, "");
-        h(ui, c.name, "Name");
-        h(ui, c.installed, "Installed");
-        h(ui, c.latest, "Latest");
-        h(ui, c.game, "KSP");
-        h(ui, c.downloads, "Downloads");
+        let mut sortable = |ui: &mut Ui, w: f32, t: &str, key: SortKey| {
+            let arrow = match sort {
+                Some((k, true)) if k == key => " v",
+                Some((k, false)) if k == key => " ^",
+                _ => "",
+            };
+            let label = egui::Label::new(RichText::new(format!("{t}{arrow}")).small().strong())
+                .sense(egui::Sense::click());
+            if cell(ui, w, label)
+                .on_hover_text("Sort by this column")
+                .clicked()
+            {
+                msgs.push(Msg::SortBy(key));
+            }
+        };
+        plain(ui, c.action, "");
+        plain(ui, c.star, "");
+        sortable(ui, c.name, "Name", SortKey::Name);
+        sortable(ui, c.installed, "Installed", SortKey::Installed);
+        plain(ui, c.latest, "Latest");
+        plain(ui, c.game, "KSP");
+        sortable(ui, c.released, "Released", SortKey::Released);
+        sortable(ui, c.downloads, "Downloads", SortKey::Downloads);
     });
 }
 
@@ -496,6 +533,11 @@ fn mod_row(app: &App, ui: &mut Ui, row: &Row, c: &Cols, msgs: &mut Vec<Msg>) {
             ui,
             c.game,
             egui::Label::new(RichText::new(&row.game).small().weak()).truncate(),
+        );
+        cell(
+            ui,
+            c.released,
+            egui::Label::new(RichText::new(&row.released).small().weak()),
         );
         let dl = if row.downloads > 0 {
             human(row.downloads)
@@ -850,6 +892,35 @@ fn manual_tab(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             .weak(),
     );
     ui.separator();
+    let (folders, loose) = &app.unmanaged;
+    if app.current().is_some() && (!folders.is_empty() || !loose.is_empty()) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Added by hand to this instance").strong().color(WARN));
+            ui.label(
+                RichText::new("orbis doesn't track these. Adopt a folder to manage it like any manual mod (it stays where it is).")
+                    .small()
+                    .weak(),
+            );
+            for u in folders {
+                ui.horizontal(|ui| {
+                    ui.label(format!("GameData/{}", u.folder));
+                    ui.label(RichText::new(format!("{} files", u.files)).small().weak());
+                    if ui.add_enabled(!app.busy(), egui::Button::new("Adopt...")).clicked() {
+                        msgs.push(Msg::OpenAdopt(u.folder.clone()));
+                    }
+                });
+            }
+            if !loose.is_empty() {
+                ui.label(
+                    RichText::new(format!("Loose files in GameData: {}", loose.join(", ")))
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+        ui.add_space(6.0);
+    }
     if app.manual.is_empty() {
         ui.add_space(20.0);
         ui.label(RichText::new("The library is empty.").weak());
@@ -1065,6 +1136,21 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     ui.label("Parallel downloads");
                     ui.add(egui::TextEdit::singleline(&mut g.workers).desired_width(60.0));
                     ui.end_row();
+                    ui.label("Save backups to keep");
+                    ui.add(egui::TextEdit::singleline(&mut g.backups_keep).desired_width(60.0))
+                        .on_hover_text(
+                            "Per instance, taken before mod changes and launches; 0 turns them off",
+                        );
+                    ui.end_row();
+                    ui.label("Update index after");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut g.auto_update_hours)
+                                .desired_width(60.0),
+                        );
+                        ui.label("hours (0 = never automatically)");
+                    });
+                    ui.end_row();
                     ui.label("Repositories");
                     ui.add(
                         egui::TextEdit::multiline(&mut g.repos)
@@ -1097,6 +1183,241 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     .weak(),
             );
         });
+}
+
+fn history_tab(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
+    if app.current().is_none() {
+        ui.label("Select an instance.");
+        return;
+    }
+    let half = (ui.available_width() / 2.0 - 8.0).max(300.0);
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            ui.label(RichText::new("Mod changes").strong());
+            ui.label(
+                RichText::new("Every applied change, newest first. Restore puts the mod list back exactly; saves are backed up first.")
+                    .small()
+                    .weak(),
+            );
+            ui.separator();
+            if app.history.is_empty() {
+                ui.label(RichText::new("No changes yet.").weak());
+            }
+            egui::ScrollArea::vertical().id_salt("history").auto_shrink([false, false]).show(ui, |ui| {
+                for (i, e) in app.history.iter().enumerate() {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(when(e.time)).strong());
+                            ui.label(RichText::new(format!("{} mods after", e.after.len())).small().weak());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let ready = !app.busy() && app.index.is_some();
+                                if i == 0 {
+                                    if ui.add_enabled(ready, egui::Button::new("Undo")).on_hover_text("Go back to how it was before this change").clicked() {
+                                        msgs.push(Msg::AskRestoreHistory(e.id, true));
+                                    }
+                                } else if ui
+                                    .add_enabled(ready, egui::Button::new("Restore this point"))
+                                    .on_hover_text("Go back to how it was right after this change")
+                                    .clicked()
+                                {
+                                    msgs.push(Msg::AskRestoreHistory(e.id, false));
+                                }
+                            });
+                        });
+                        for line in e.summary.iter().take(12) {
+                            let color = if line.starts_with("remove") || line.starts_with("failed") {
+                                BAD
+                            } else if line.starts_with("upgrade") || line.starts_with("downgrade") {
+                                WARN
+                            } else {
+                                GOOD
+                            };
+                            ui.label(RichText::new(line).small().color(color));
+                        }
+                        if e.summary.len() > 12 {
+                            ui.label(RichText::new(format!("... and {} more", e.summary.len() - 12)).small().weak());
+                        }
+                    });
+                }
+            });
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Save backups").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Back up now").clicked() {
+                        msgs.push(Msg::BackupNow);
+                    }
+                });
+            });
+            let keep = app.ctx.config.backups_keep;
+            let note = if keep == 0 {
+                "Automatic backups are off (Settings).".to_owned()
+            } else {
+                format!("Taken before mod changes and launches when saves changed; the newest {keep} are kept.")
+            };
+            ui.label(RichText::new(note).small().weak());
+            ui.separator();
+            if app.backups.is_empty() {
+                ui.label(RichText::new("No backups yet.").weak());
+            }
+            egui::ScrollArea::vertical().id_salt("backups").auto_shrink([false, false]).show(ui, |ui| {
+                for b in &app.backups {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(when(b.created)).strong());
+                            ui.label(RichText::new(&b.reason).small().weak());
+                            ui.label(RichText::new(format!("{:.1} MiB", b.bytes as f64 / 1_048_576.0)).small().weak());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Restore all").clicked() {
+                                    msgs.push(Msg::AskRestoreBackup(b.id.clone(), None));
+                                }
+                            });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            for s in &b.saves {
+                                if ui.small_button(s).on_hover_text(format!("Restore only {s}")).clicked() {
+                                    msgs.push(Msg::AskRestoreBackup(b.id.clone(), Some(s.clone())));
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+        });
+    });
+}
+
+fn logs_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
+    if app.current().is_none() {
+        ui.label("Select an instance.");
+        return;
+    }
+    ui.horizontal(|ui| {
+        for kind in logs::LogKind::ALL {
+            if ui
+                .selectable_label(app.log_kind == kind && app.log.is_some(), kind.label())
+                .clicked()
+            {
+                msgs.push(Msg::LoadLog(kind));
+            }
+        }
+        ui.separator();
+        if ui.button("Reload").clicked() {
+            msgs.push(Msg::LoadLog(app.log_kind));
+        }
+        if let Some(Ok(r)) = &app.log
+            && let Some(dir) = r.path.parent()
+            && ui.button("Open folder").clicked()
+        {
+            msgs.push(Msg::OpenFolder(dir.to_path_buf()));
+        }
+    });
+    if app.log_kind == logs::LogKind::Player {
+        ui.label(
+            RichText::new("Player.log lives in the Wine prefix: with the shared Steam prefix it belongs to whichever instance ran last.")
+                .small()
+                .weak(),
+        );
+    }
+    ui.separator();
+    let report = match &app.log {
+        None => {
+            ui.label(RichText::new("Pick a log to read.").weak());
+            return;
+        }
+        Some(Err(e)) => {
+            ui.label(RichText::new(e).color(WARN));
+            return;
+        }
+        Some(Ok(r)) => r.clone(),
+    };
+    let total_exc: usize = report.exceptions.iter().map(|e| e.count).sum();
+    ui.label(format!(
+        "{} lines · {total_exc} exceptions ({} distinct) · {} errors · {} warnings",
+        report.lines.len(),
+        report.exceptions.len(),
+        report.errors,
+        report.warnings
+    ));
+    if !report.exceptions.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt("exc")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for e in &report.exceptions {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [44.0, 18.0],
+                            egui::Label::new(RichText::new(format!("{}x", e.count)).color(BAD)),
+                        );
+                        let blame = if e.mods.is_empty() {
+                            "unknown source".to_owned()
+                        } else {
+                            e.mods.join(", ")
+                        };
+                        ui.add_sized(
+                            [200.0, 18.0],
+                            egui::Label::new(RichText::new(blame).color(WARN)).truncate(),
+                        );
+                        let msg = egui::Label::new(RichText::new(&e.message).small().monospace())
+                            .truncate()
+                            .sense(egui::Sense::click());
+                        if ui.add(msg).on_hover_text("Show it in the log").clicked() {
+                            msgs.push(Msg::JumpToLog(e.first_line));
+                        }
+                    });
+                }
+            });
+        ui.separator();
+    }
+    ui.horizontal(|ui| {
+        for (level, label) in [
+            (logs::Level::Info, "All"),
+            (logs::Level::Warning, "Warnings+"),
+            (logs::Level::Error, "Errors+"),
+            (logs::Level::Exception, "Exceptions"),
+        ] {
+            if ui.selectable_label(app.log_min == level, label).clicked() {
+                msgs.push(Msg::SetLogLevel(level));
+            }
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut app.log_search)
+                .hint_text("Search the log")
+                .desired_width(260.0),
+        );
+    });
+    app.ensure_log_rows();
+    let rows = &app.log_rows;
+    let line_h = 16.0;
+    let mut area = egui::ScrollArea::both()
+        .id_salt("logtext")
+        .auto_shrink([false, false]);
+    if let Some(target) = app.log_jump.take()
+        && let Some(pos) = rows.iter().position(|&i| i >= target)
+    {
+        area = area.vertical_scroll_offset(pos as f32 * (line_h + ui.spacing().item_spacing.y));
+    }
+    area.show_rows(ui, line_h, rows.len(), |ui, range| {
+        for &i in &rows[range] {
+            let l = &report.lines[i];
+            let color = match l.level {
+                logs::Level::Exception => BAD,
+                logs::Level::Error => Color32::from_rgb(235, 140, 110),
+                logs::Level::Warning => WARN,
+                logs::Level::Info => ui.visuals().text_color(),
+            };
+            ui.add(
+                egui::Label::new(RichText::new(&l.text).monospace().small().color(color)).extend(),
+            );
+        }
+    });
 }
 
 fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
@@ -1282,7 +1603,8 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 }
                 ui.add_space(8.0);
                 let ok = !busy && matches!(form.preview, Some(Ok(_))) && !form.name.trim().is_empty();
-                buttons(ui, msgs, "Add to library", ok, Msg::AddManual);
+                let label = if form.adopt_folder.is_some() { "Adopt" } else { "Add to library" };
+                buttons(ui, msgs, label, ok, Msg::AddManual);
             }
             Dialog::Export(form) => {
                 ui.heading("Export modpack");
@@ -1354,6 +1676,32 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                     ui.label(RichText::new("Load the mod index first (Update index).").color(WARN));
                 }
                 buttons(ui, msgs, "Import", ok, Msg::Import);
+            }
+            Dialog::RestoreHistory { title, lines, .. } => {
+                ui.heading("Restore mod list");
+                ui.label(title.as_str());
+                egui::ScrollArea::vertical().max_height(300.0).id_salt("restore").show(ui, |ui| {
+                    for l in lines.iter() {
+                        let color = if l.starts_with("warning") {
+                            WARN
+                        } else if l.starts_with("remove") {
+                            BAD
+                        } else {
+                            GOOD
+                        };
+                        ui.label(RichText::new(l).small().color(color));
+                    }
+                });
+                ui.label(RichText::new("Your saves are backed up first.").small().weak());
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Restore", !busy, Msg::RestoreHistory);
+            }
+            Dialog::RestoreBackup { title, .. } => {
+                ui.heading("Restore saves");
+                ui.label(title.as_str());
+                ui.label(RichText::new("The current saves are backed up first, so this can be undone.").small().weak());
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Restore", true, Msg::RestoreBackup);
             }
             Dialog::Error(e) => {
                 ui.heading(RichText::new("Something went wrong").color(BAD));

@@ -15,6 +15,12 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1. 
 * **Dependencies out of the way**: the Installed list shows the mods you chose; dependencies stay hidden behind a checkbox and say which mods need them.
 * **Starred mods**: star the mods you always use, then show only starred mods in any list and queue them all at once in a new instance.
 * **Modpacks**: export an instance's mods (optionally with craft, saves and manual mod files) and import them as a new instance; CKAN's `.ckan` modpacks work both ways.
+* **Save backups**: saves are snapshotted before every mod change and launch (only when they changed), with one-click restore of a single save or all of them.
+* **History and undo**: every change is recorded; undo the last one or put the mod list back to any earlier point, exact versions included.
+* **Log viewer**: read KSP.log, Player.log and the launch log in the app, with exceptions grouped and traced to the mod whose code threw them.
+* **Hand-added mods**: folders dropped into GameData by hand are spotted and can be adopted as tracked manual mods.
+* **Sorting and dates**: sort by name, installed, release date or downloads to find recently updated mods.
+* **Stays current**: the CKAN index refreshes itself when it's a day old, and instances show how many upgrades are waiting.
 * **Remembers where you were**: the selected instance, filters and unapplied changes survive a restart.
 * **Manual mods**: add a `.zip` or folder once, then install it into any instance. A manual mod can replace CKAN mods (for example, a Patreon Volumetric Clouds build standing in for EVE Redux and Scatterer), so mods that depend on them keep working.
 * **Proton launch**: start any instance with the Proton build Steam has mapped to KSP, inside the Steam Linux Runtime when Proton asks for it.
@@ -80,6 +86,10 @@ When only one instance exists, `-i` can be left out.
 | `orbis manual list\|add\|show\|install\|delete` | Manage the manual mod library |
 | `orbis launch [<instance>] [--dry-run]` | Start an instance, or print the command |
 | `orbis steam` | Show the detected Steam, KSP and Proton paths |
+| `orbis history list\|undo\|restore <id> [--before]` | Show changes, undo the last one, or restore an earlier mod list |
+| `orbis backup list\|create\|restore <id> [--save <name>]` | Manage save backups |
+| `orbis logs [--log ksp\|player\|launch]` | Summarise a log: exceptions grouped and blamed on mods |
+| `orbis manual unmanaged\|adopt <folder>` | Find hand-added GameData folders and track them as manual mods |
 | `orbis star\|unstar <mod>...` | Star or unstar mods (shared by all instances) |
 | `orbis starred` | List starred mods |
 | `orbis pack export [-i <instance>] <file>` | Export a modpack (`--craft`, `--saves <names\|all>`, `--manual-files`, `--ckan`) |
@@ -98,6 +108,8 @@ Settings live in `~/.config/orbis/config.toml` and can also be edited on the GUI
 | `use_steam_runtime` | | `true` | Run Proton inside the Steam Linux Runtime when Proton asks for it |
 | `repositories` | | CKAN-meta `master.tar.gz` | CKAN metadata archives, each a `{ name, url }` table |
 | `download_workers` | | `4` | Parallel mod downloads (1 to 16) |
+| `backups_keep` | | `10` | Save backups kept per instance; `0` turns automatic backups off |
+| `auto_update_hours` | | `24` | Refresh the CKAN index on GUI start when it is older than this; `0` turns it off |
 | | `--root <dir>` | XDG directories | Keep config, data and cache under one directory |
 | `RUST_LOG` | | `warn` | Log level, written to stderr |
 
@@ -139,6 +151,16 @@ orbis manual install volumetric-clouds -i "Stock Career"
 orbis works out where the files go: if the archive has a `GameData` folder anywhere, its contents are installed; otherwise each top-level folder goes into `GameData`. Use `--find <folder>` to install a single folder instead. Only `.zip` archives and plain folders are supported; unpack other formats first.
 
 `--provides` lists the CKAN identifiers the mod replaces. Installing it removes the CKAN copies, and CKAN mods that depend on those identifiers are satisfied by the manual mod. `--depends` and `--conflicts` take CKAN identifiers too.
+
+## Safety nets
+
+**Save backups.** Before applying mod changes and before each launch, orbis copies the instance's saves into `backups/` inside the instance, but only when they changed since the last backup. The newest `backups_keep` are kept. On btrfs and XFS the copies are reflinks and take no space until a save changes. Restoring (one save, or all of them) backs up the current saves first, so a restore can itself be undone. Find them on the **History** tab or with `orbis backup`.
+
+**History.** Every applied change is recorded in `history.json` with the mod list before and after it. **Undo** reverses the newest change; **Restore this point** returns to how things were right after any earlier one. orbis reinstalls the exact versions (falling back to the newest compatible release, with a warning, if one has left CKAN) and keeps dependency flags as they were.
+
+**Logs.** The **Logs** tab reads `KSP.log`, Unity's `Player.log` (in the Wine prefix, so with the shared Steam prefix it belongs to whichever instance ran last) and Proton's launch log. Repeated exceptions are grouped, and each is traced to the mod whose code appears in its stack trace, by DLL name or, when the namespace differs (MechJeb's `MuMech`), by the names stored inside the mod DLLs.
+
+**Hand-added mods.** Folders in GameData that no installed mod owns are listed on the **Manual mods** tab. **Adopt** turns one into a manual mod: a copy goes into the library, and the files already in the instance are tracked as installed, so orbis can remove, back up and export it like any other mod.
 
 ## Modpacks
 

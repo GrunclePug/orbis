@@ -1,11 +1,14 @@
 //! orbis: a KSP mod manager with Prism-style instances, built on CKAN metadata.
 
+pub mod backup;
 pub mod config;
 pub mod download;
 pub mod game;
+pub mod history;
 pub mod install;
 pub mod instance;
 pub mod launch;
+pub mod logs;
 pub mod manual;
 pub mod metadata;
 pub mod modpack;
