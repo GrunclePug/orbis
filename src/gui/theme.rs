@@ -30,7 +30,8 @@ pub const BORDER: Color32 = Color32::from_rgb(40, 47, 58);
 
 pub const TEXT: Color32 = Color32::from_rgb(226, 231, 238);
 pub const MUTED: Color32 = Color32::from_rgb(152, 162, 176);
-pub const FAINT: Color32 = Color32::from_rgb(104, 114, 128);
+/// Quiet text that still reads: about 5.4:1 on `BG`, 4.8:1 on `SURFACE`.
+pub const FAINT: Color32 = Color32::from_rgb(128, 138, 152);
 
 pub const ACCENT: Color32 = Color32::from_rgb(92, 157, 255);
 pub const GOOD: Color32 = Color32::from_rgb(70, 190, 125);
@@ -179,34 +180,36 @@ pub fn semibold_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
 }
 
-/// Each mod category's colour. Built-in ones are fixed, chosen so
-/// neighbours in the list differ; the user's own get one from a spare set,
-/// always the same for the same name.
+/// Each mod category's colour, shown only as a dot and a bar beside rows.
+/// The hues are muted and kept off the status colours (green installed,
+/// amber updates, red removal), so a category never reads as a state. The
+/// user's own categories get one from a spare set, always the same for the
+/// same name.
 pub fn category_color(category: &str) -> Color32 {
     let rgb = Color32::from_rgb;
     match category {
-        "Parts" => rgb(74, 222, 128),
-        "Visuals" => rgb(244, 114, 182),
-        "Planets" => rgb(45, 212, 191),
-        "Communications" => rgb(163, 230, 53),
-        "Career & science" => rgb(250, 204, 21),
-        "Tools & info" => rgb(56, 189, 248),
-        "KSC & launch sites" => rgb(251, 146, 60),
-        "Crew & IVA" => rgb(129, 140, 248),
-        "Resources" => rgb(214, 164, 107),
-        "Physics" => rgb(239, 83, 80),
-        "Sound" => rgb(217, 70, 239),
-        "Patches & configs" => rgb(148, 163, 184),
-        "Libraries" => VIOLET,
-        "Other" => rgb(115, 123, 135),
+        "Parts" => rgb(110, 165, 230),
+        "Visuals" => rgb(225, 125, 185),
+        "Planets" => rgb(85, 195, 215),
+        "Communications" => rgb(170, 145, 235),
+        "Career & science" => rgb(220, 205, 110),
+        "Tools & info" => rgb(135, 150, 245),
+        "KSC & launch sites" => rgb(205, 125, 220),
+        "Crew & IVA" => rgb(150, 205, 230),
+        "Resources" => rgb(195, 170, 140),
+        "Physics" => rgb(240, 160, 215),
+        "Sound" => rgb(115, 205, 200),
+        "Patches & configs" => rgb(150, 160, 178),
+        "Libraries" => rgb(150, 140, 190),
+        "Other" => rgb(120, 128, 140),
         custom => {
             const SPARE: [Color32; 6] = [
-                Color32::from_rgb(96, 165, 250),
-                Color32::from_rgb(52, 211, 153),
-                Color32::from_rgb(251, 191, 36),
-                Color32::from_rgb(248, 113, 113),
-                Color32::from_rgb(192, 132, 252),
-                Color32::from_rgb(253, 186, 116),
+                Color32::from_rgb(100, 180, 245),
+                Color32::from_rgb(200, 150, 240),
+                Color32::from_rgb(240, 140, 200),
+                Color32::from_rgb(100, 210, 225),
+                Color32::from_rgb(160, 170, 250),
+                Color32::from_rgb(225, 215, 130),
             ];
             let sum = custom.to_lowercase().bytes().fold(0usize, |a, b| {
                 a.wrapping_mul(31).wrapping_add(usize::from(b))

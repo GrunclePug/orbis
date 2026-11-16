@@ -320,7 +320,7 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         });
         return;
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for f in Filter::ALL {
             if theme::segment(ui, app.filter == f, f.label()).clicked() {
                 msgs.push(Msg::SetFilter(f));
@@ -346,7 +346,7 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         }
         ui.label(RichText::new(format!("{} mods", app.rows.len())).color(theme::FAINT));
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let mut starred = app.starred_only;
         if ui
             .checkbox(&mut starred, "Starred only")
@@ -373,6 +373,23 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             .changed()
         {
             msgs.push(Msg::SetGrouped(grouped));
+        }
+        if app.grouped {
+            let searching = !app.search.trim().is_empty() || app.starred_only;
+            if ui
+                .add_enabled(!searching, egui::Button::new("Expand all").small())
+                .on_hover_text("zR")
+                .clicked()
+            {
+                msgs.push(Msg::ExpandAll);
+            }
+            if ui
+                .add_enabled(!searching, egui::Button::new("Collapse all").small())
+                .on_hover_text("zM")
+                .clicked()
+            {
+                msgs.push(Msg::CollapseAll);
+            }
         }
         let installable = app
             .rows
@@ -407,7 +424,7 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         .auto_shrink([false, false]);
     if let Some(i) = app.scroll_to_row.take() {
         let (offset, height) = app.mods_view;
-        let line = app.row_item.get(i).copied().unwrap_or(i);
+        let line = app.row_item.get(i).copied().flatten().unwrap_or(0);
         let top = line as f32 * step;
         if top < offset {
             area = area.vertical_scroll_offset(top);
@@ -435,49 +452,64 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
 }
 
 fn queue_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
-    ui.horizontal(|ui| {
-        let q = &app.queue;
-        if q.is_empty() {
-            ui.label(
-                RichText::new("Tick mods to install, untick to remove, then apply.")
-                    .color(theme::FAINT),
-            );
-        } else {
-            ui.label(theme::semibold("Pending"));
-            if !q.install.is_empty() {
-                theme::pill(ui, format!("+{} install", q.install.len()), GOOD);
-            }
-            if !q.upgrade.is_empty() {
-                theme::pill(ui, format!("{} upgrade", q.upgrade.len()), WARN);
-            }
-            if !q.remove.is_empty() {
-                theme::pill(ui, format!("−{} remove", q.remove.len()), BAD);
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let ready = !app.queue.is_empty() && !app.busy();
-            if ui
-                .add_enabled(ready, theme::primary("Apply changes", ACCENT))
-                .clicked()
-            {
-                msgs.push(Msg::ApplyQueue);
-            }
-            if ui
-                .add_enabled(!app.queue.is_empty(), egui::Button::new("Clear"))
-                .clicked()
-            {
-                msgs.push(Msg::ClearQueue);
-            }
-            let upgrades = app.rows.iter().filter(|r| r.upgradable()).count();
-            if (app.filter == Filter::Upgradable || upgrades > 0)
-                && ui
-                    .add_enabled(app.index.is_some(), egui::Button::new("Upgrade all"))
-                    .clicked()
-            {
-                msgs.push(Msg::QueueAllUpgrades);
-            }
+    // On a narrow table the buttons get their own line, first, so Apply is
+    // never pushed out of sight.
+    if ui.available_width() < 640.0 {
+        ui.horizontal_wrapped(|ui| queue_buttons(app, ui, msgs));
+        ui.horizontal_wrapped(|ui| queue_status(app, ui));
+    } else {
+        ui.horizontal(|ui| {
+            queue_status(app, ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                queue_buttons(app, ui, msgs);
+            });
         });
-    });
+    }
+}
+
+fn queue_status(app: &App, ui: &mut Ui) {
+    let q = &app.queue;
+    if q.is_empty() {
+        ui.label(
+            RichText::new("Tick mods to install, untick to remove, then apply.")
+                .color(theme::FAINT),
+        );
+        return;
+    }
+    ui.label(theme::semibold("Pending"));
+    if !q.install.is_empty() {
+        theme::pill(ui, format!("+{} install", q.install.len()), GOOD);
+    }
+    if !q.upgrade.is_empty() {
+        theme::pill(ui, format!("{} upgrade", q.upgrade.len()), WARN);
+    }
+    if !q.remove.is_empty() {
+        theme::pill(ui, format!("−{} remove", q.remove.len()), BAD);
+    }
+}
+
+fn queue_buttons(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
+    let ready = !app.queue.is_empty() && !app.busy();
+    if ui
+        .add_enabled(ready, theme::primary("Apply changes", ACCENT))
+        .clicked()
+    {
+        msgs.push(Msg::ApplyQueue);
+    }
+    if ui
+        .add_enabled(!app.queue.is_empty(), egui::Button::new("Clear"))
+        .clicked()
+    {
+        msgs.push(Msg::ClearQueue);
+    }
+    let upgrades = app.rows.iter().filter(|r| r.upgradable()).count();
+    if (app.filter == Filter::Upgradable || upgrades > 0)
+        && ui
+            .add_enabled(app.index.is_some(), egui::Button::new("Upgrade all"))
+            .clicked()
+    {
+        msgs.push(Msg::QueueAllUpgrades);
+    }
 }
 
 struct Cols {
@@ -486,31 +518,46 @@ struct Cols {
     name: f32,
     /// Zero unless the window is wide enough to show summaries.
     summary: f32,
-    installed: f32,
-    latest: f32,
+    /// The installed version, or the newest one, with `old → new` when an
+    /// upgrade is waiting.
+    version: f32,
     game: f32,
     released: f32,
     downloads: f32,
 }
 
+/// Column widths for a table `width` wide. The name gets priority: the
+/// release date and download count go first when space is short, and on
+/// wide windows the summary takes what the name doesn't need.
 fn columns(width: f32) -> Cols {
-    let fixed = 30.0 + 22.0 + 92.0 + 92.0 + 104.0 + 84.0 + 90.0 + 8.0 * 8.0 + 12.0;
-    let free = (width - fixed).max(160.0);
-    let (name, summary) = if free > 560.0 + 260.0 {
-        (520.0, free - 520.0 - 8.0)
+    let gap = 8.0;
+    let (action, star, version) = (30.0, 22.0, 150.0);
+    // Very narrow: the KSP range goes too, so names stay readable.
+    let game = if width < 600.0 { 0.0 } else { 104.0 };
+    let base = action + star + version + game + gap * 6.0 + 12.0;
+    let (mut released, mut downloads) = (84.0, 80.0);
+    if width - base - released - downloads - gap * 2.0 < 260.0 {
+        downloads = 0.0;
+    }
+    if width - base - released - downloads - gap * 2.0 < 220.0 {
+        released = 0.0;
+    }
+    let used = base + released + downloads + gap * 2.0;
+    let free = (width - used).max(160.0);
+    let (name, summary) = if free > 360.0 + 240.0 {
+        (360.0, free - 360.0 - gap)
     } else {
         (free, 0.0)
     };
     Cols {
-        action: 30.0,
-        star: 22.0,
+        action,
+        star,
         name,
         summary,
-        installed: 92.0,
-        latest: 92.0,
-        game: 104.0,
-        released: 84.0,
-        downloads: 90.0,
+        version,
+        game,
+        released,
+        downloads,
     }
 }
 
@@ -550,11 +597,16 @@ fn header(ui: &mut Ui, c: &Cols, sort: Option<(SortKey, bool)>, msgs: &mut Vec<M
         if c.summary > 0.0 {
             plain(ui, c.summary, "Summary");
         }
-        sortable(ui, c.installed, "Installed", SortKey::Installed);
-        plain(ui, c.latest, "Latest");
-        plain(ui, c.game, "KSP");
-        sortable(ui, c.released, "Released", SortKey::Released);
-        sortable(ui, c.downloads, "Downloads", SortKey::Downloads);
+        sortable(ui, c.version, "Version", SortKey::Installed);
+        if c.game > 0.0 {
+            plain(ui, c.game, "KSP");
+        }
+        if c.released > 0.0 {
+            sortable(ui, c.released, "Released", SortKey::Released);
+        }
+        if c.downloads > 0.0 {
+            sortable(ui, c.downloads, "Downloads", SortKey::Downloads);
+        }
     });
 }
 
@@ -649,44 +701,50 @@ fn mod_row(app: &App, ui: &mut Ui, index: usize, row: &Row, c: &Cols, msgs: &mut
                     .truncate(),
             );
         }
-        let inst = row
-            .installed
-            .as_ref()
-            .map_or(String::new(), ToString::to_string);
-        cell(
-            ui,
-            c.installed,
-            egui::Label::new(RichText::new(inst).small().color(theme::TEXT)).truncate(),
-        );
-        cell_ui(ui, c.latest, |ui| {
-            let latest = row.latest.as_ref().map_or("—".into(), ToString::to_string);
-            if row.upgradable() {
-                let mut up = upgrading;
-                if ui
-                    .checkbox(
-                        &mut up,
-                        RichText::new(format!("↑ {latest}")).small().color(WARN),
-                    )
-                    .on_hover_text("Queue an upgrade")
-                    .changed()
-                {
-                    msgs.push(Msg::ToggleUpgrade(row.id.clone()));
+        cell_ui(ui, c.version, |ui| {
+            let latest = row.latest.as_ref().map(ToString::to_string);
+            match (&row.installed, row.upgradable()) {
+                (Some(i), true) => {
+                    let mut up = upgrading;
+                    let text = format!("{i} → {}", latest.unwrap_or_default());
+                    if ui
+                        .checkbox(&mut up, RichText::new(text).small().color(WARN))
+                        .on_hover_text("Tick to queue the upgrade")
+                        .changed()
+                    {
+                        msgs.push(Msg::ToggleUpgrade(row.id.clone()));
+                    }
                 }
-            } else {
-                ui.add(
-                    egui::Label::new(RichText::new(latest).small().color(theme::MUTED)).truncate(),
-                );
+                (Some(i), false) => {
+                    ui.add(
+                        egui::Label::new(RichText::new(i.to_string()).small().color(theme::TEXT))
+                            .truncate(),
+                    );
+                }
+                (None, _) => {
+                    let text = latest.unwrap_or_else(|| "not for this KSP".into());
+                    ui.add(
+                        egui::Label::new(RichText::new(text).small().color(theme::MUTED))
+                            .truncate(),
+                    );
+                }
             }
         });
         let quiet = |t: &str| RichText::new(t).small().color(theme::MUTED);
-        cell(ui, c.game, egui::Label::new(quiet(&row.game)).truncate());
-        cell(ui, c.released, egui::Label::new(quiet(&row.released)));
-        let dl = if row.downloads > 0 {
-            human(row.downloads)
-        } else {
-            String::new()
-        };
-        cell(ui, c.downloads, egui::Label::new(quiet(&dl)));
+        if c.game > 0.0 {
+            cell(ui, c.game, egui::Label::new(quiet(&row.game)).truncate());
+        }
+        if c.released > 0.0 {
+            cell(ui, c.released, egui::Label::new(quiet(&row.released)));
+        }
+        if c.downloads > 0.0 {
+            let dl = if row.downloads > 0 {
+                human(row.downloads)
+            } else {
+                String::new()
+            };
+            cell(ui, c.downloads, egui::Label::new(quiet(&dl)));
+        }
         name_resp
     });
     let rect = outer.response.rect.expand2(egui::vec2(6.0, 3.0));
@@ -733,9 +791,16 @@ fn category_header(
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::click());
     let rect = rect.expand2(egui::vec2(6.0, 3.0));
-    let wash = if resp.hovered() { 40 } else { 24 };
     let painter = ui.painter();
-    painter.rect_filled(rect, 6.0, theme::tint(color, wash));
+    painter.rect_filled(
+        rect,
+        6.0,
+        if resp.hovered() {
+            theme::RAISED
+        } else {
+            theme::SURFACE
+        },
+    );
     let mid = rect.center().y;
     let mut x = rect.left() + 10.0;
     // A small triangle: pointing right when folded, down when open.
@@ -766,7 +831,7 @@ fn category_header(
         egui::Align2::LEFT_CENTER,
         category,
         theme::semibold_font(14.0),
-        color,
+        theme::TEXT,
     );
     painter.text(
         egui::pos2(title.right() + 10.0, mid),
@@ -2344,6 +2409,8 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                             ("h / l", "previous / next filter"),
                             ("J / K", "next / previous instance"),
                             ("gt / gT", "next / previous tab"),
+                            ("za", "fold the selected mod's category"),
+                            ("zR / zM", "expand / collapse all categories"),
                         ]);
                     });
                 });

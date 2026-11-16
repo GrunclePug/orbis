@@ -24,8 +24,12 @@ pub struct Backup {
     /// Save folders it contains.
     pub saves: Vec<String>,
     pub bytes: u64,
-    /// Size and newest modification time of the saves, to skip duplicates.
+    /// Size and newest modification time of the saves.
     pub fingerprint: (u64, u64),
+    /// SHA-256 of every save file's path and contents, to skip duplicates.
+    /// Empty in backups made before it existed.
+    #[serde(default)]
+    pub content: String,
 }
 
 fn root(inst: &Instance) -> PathBuf {
@@ -63,6 +67,23 @@ fn save_files(saves: &Path, names: &[String]) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// A hash of the saves' paths and contents: two backups are the same only
+/// when every byte is.
+fn content_hash(saves: &Path, files: &[String]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&String> = files.iter().collect();
+    sorted.sort();
+    let mut h = Sha256::new();
+    for f in sorted {
+        let bytes = fs::read(saves.join(f)).with_context(|| format!("read {f}"))?;
+        h.update(f.as_bytes());
+        h.update([0]);
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    Ok(crate::download::hex(&h.finalize()))
 }
 
 fn fingerprint(saves: &Path, files: &[String]) -> (u64, u64) {
@@ -115,9 +136,10 @@ pub fn create(inst: &Instance, reason: &str) -> Result<Option<Backup>> {
     }
     let files = save_files(&saves, &names)?;
     let print = fingerprint(&saves, &files);
+    let content = content_hash(&saves, &files)?;
     if list(inst)?
         .first()
-        .is_some_and(|b| b.fingerprint == print && b.saves == names)
+        .is_some_and(|b| b.content == content && b.saves == names)
     {
         return Ok(None);
     }
@@ -149,6 +171,7 @@ pub fn create(inst: &Instance, reason: &str) -> Result<Option<Backup>> {
             saves: names,
             bytes: print.0,
             fingerprint: print,
+            content,
         };
         let text = toml::to_string_pretty(&b).context("serialize backup")?;
         paths::write_atomic(&dir.join("backup.toml"), text.as_bytes())?;
@@ -187,6 +210,7 @@ pub fn snapshot(inst: &Instance, reason: &str, keep: usize) -> Result<Option<Bac
 /// `None`. The current saves are backed up first, so a restore can be
 /// undone. Saves not in the backup are left alone.
 pub fn restore(inst: &Instance, id: &str, save: Option<&str>) -> Result<()> {
+    crate::running::refuse_if_running(inst)?;
     let b = list(inst)?
         .into_iter()
         .find(|b| b.id == id)
@@ -228,6 +252,46 @@ mod tests {
     use super::*;
     use crate::instance::{CopyMode, CreateOptions};
     use crate::paths::Paths;
+
+    #[test]
+    fn a_same_size_same_second_edit_is_backed_up() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ksp = tmp.path().join("ksp");
+        fs::create_dir_all(ksp.join("GameData/Squad")).expect("mkdir");
+        fs::write(ksp.join("KSP_x64.exe"), b"").expect("write");
+        fs::write(ksp.join("readme.txt"), "Version 1.12.5\n").expect("write");
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let inst = crate::instance::create(
+            &paths,
+            &CreateOptions {
+                name: "B".into(),
+                source: ksp,
+                stock_only: true,
+                with_saves: false,
+                mode: CopyMode::Link,
+            },
+            &mut |_, _| {},
+        )
+        .expect("create");
+        let save = inst.game_dir().join("saves/Career");
+        fs::create_dir_all(&save).expect("mkdir");
+        fs::write(save.join("persistent.sfs"), b"day 1").expect("write");
+        create(&inst, "first").expect("backup").expect("made");
+        assert!(create(&inst, "again").expect("backup").is_none());
+        let mtime = fs::metadata(save.join("persistent.sfs"))
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        fs::write(save.join("persistent.sfs"), b"day X").expect("write");
+        fs::File::options()
+            .write(true)
+            .open(save.join("persistent.sfs"))
+            .and_then(|f| f.set_modified(mtime))
+            .expect("set mtime");
+        assert!(
+            create(&inst, "edited").expect("backup").is_some(),
+            "a change in content is noticed"
+        );
+    }
 
     #[test]
     fn backs_up_dedups_prunes_and_restores() {

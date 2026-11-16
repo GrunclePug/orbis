@@ -421,6 +421,7 @@ pub fn clone_instance(
 
 /// Deletes an instance directory and everything in it.
 pub fn delete(inst: &Instance) -> Result<()> {
+    crate::running::refuse_if_running(inst)?;
     if !Instance::config_path(&inst.dir).is_file() {
         bail!("{} does not look like an instance", inst.dir.display());
     }

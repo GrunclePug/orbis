@@ -201,10 +201,10 @@ mod tests {
             "Parts, then custom, then Libraries"
         );
         assert_eq!(items.len(), 7);
-        assert_eq!(row_item, [1, 2, 4, 6]);
+        assert_eq!(row_item, [Some(1), Some(2), Some(4), Some(6)]);
         let folded: std::collections::BTreeSet<String> = ["Parts".to_owned()].into();
         let (rows3, items, row_item) = app::group(rows.clone(), true, &folded);
-        assert_eq!(rows3.len(), 2);
+        assert_eq!(rows3.len(), 4, "folded rows stay in the rows");
         assert_eq!(
             items[0],
             app::Item::Header {
@@ -213,7 +213,7 @@ mod tests {
                 collapsed: true
             }
         );
-        assert_eq!(row_item, [2, 4]);
+        assert_eq!(row_item, [None, None, Some(2), Some(4)]);
         let (flat, items, _) = app::group(rows, false, &folded);
         assert_eq!((flat.len(), items.len()), (4, 4));
     }

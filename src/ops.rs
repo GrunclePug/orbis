@@ -10,7 +10,7 @@ use crate::cancel::Cancel;
 use crate::config::Config;
 use crate::download::{self, DownloadEvent};
 use crate::history;
-use crate::install::{self, Source};
+use crate::install;
 use crate::instance::{InstalledMod, Instance, ModSource, Registry};
 use crate::manual::{self, ManualMod};
 use crate::metadata::{Kind, Module};
@@ -70,9 +70,10 @@ pub fn upgradable(inst: &Instance, index: &Index, reg: &Registry) -> Vec<(String
         .collect()
 }
 
-/// Carries out a plan: downloads, then removals, then installs. The
-/// registry is saved after every step, so a failure part-way leaves it
-/// matching the files on disk.
+/// Carries out a plan, all or nothing: downloads, then a check of every
+/// install against the files that will be there, then removals and
+/// installs. Removed files are set aside until everything succeeded; a
+/// failure or cancel part-way puts the instance back exactly as it was.
 pub fn apply(
     paths: &Paths,
     config: &Config,
@@ -84,6 +85,7 @@ pub fn apply(
     if plan.is_empty() {
         return Ok(());
     }
+    crate::running::refuse_if_running(inst)?;
     if let Some(b) = backup::snapshot(inst, "before changes", config.backups_keep)
         .context("back up saves before changing mods (set backups_keep = 0 to turn backups off)")?
     {
@@ -150,73 +152,231 @@ fn apply_changes(
 
     cancel.check()?;
     let game = inst.game_dir();
-    let mut reg = inst.registry()?;
-    let mut auto_before: HashMap<String, bool> = HashMap::new();
+    let original = inst.registry()?;
+
+    // Work out every install before touching the instance: unpack it, plan
+    // its files, and check them against what will be installed by then.
+    let leaving: Vec<&String> = plan
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Remove { identifier, .. } => Some(identifier),
+            Change::Upgrade { module, .. } => Some(&module.identifier),
+            Change::Install { .. } => None,
+        })
+        .collect();
+    let mut owners: HashMap<String, String> = original
+        .mods
+        .iter()
+        .filter(|(id, _)| !leaving.contains(id))
+        .flat_map(|(id, m)| m.files.iter().map(move |f| (install::fold(f), id.clone())))
+        .collect();
+    let freed: std::collections::HashSet<String> = original
+        .mods
+        .iter()
+        .filter(|(id, _)| leaving.contains(id))
+        .flat_map(|(_, m)| m.files.iter().map(|f| install::fold(f)))
+        .collect();
+    let mut prepared = Vec::new();
+    let mut problems = Vec::new();
     for c in &plan.changes {
-        if let Change::Remove { identifier, .. }
-        | Change::Upgrade {
-            module: Module { identifier, .. },
-            ..
-        } = c
-            && let Some(old) = reg.mods.remove(identifier)
-        {
-            let _ = events.send(Event::Status(format!(
-                "Removing {identifier} {}",
-                old.version()
-            )));
-            install::uninstall(&game, &old.installed_files());
-            auto_before.insert(identifier.clone(), old.auto_installed);
-            inst.save_registry(&reg)?;
-        }
-    }
-    for c in &plan.changes {
-        // Stop between mods, never in the middle of one.
-        cancel.check()?;
         let (module, reason) = match c {
             Change::Install { module, reason } | Change::Upgrade { module, reason, .. } => {
                 (module, reason)
             }
             Change::Remove { .. } => continue,
         };
+        cancel.check()?;
         let id = &module.identifier;
-        let _ = events.send(Event::Status(format!("Installing {id} {}", module.version)));
-        let (files, source) = if let Some(mid) = id.strip_prefix(manual::PREFIX) {
+        let _ = events.send(Event::Status(format!("Preparing {id} {}", module.version)));
+        let (src, directives, source) = if let Some(mid) = id.strip_prefix(manual::PREFIX) {
             let m = manual::find(paths, mid)?;
-            let src = store::manual_source(paths, &m)?;
             (
-                install_source(inst, &reg, &src, &m.install)?,
+                Some(store::manual_source(paths, &m)?),
+                m.install.clone(),
                 ModSource::Manual,
             )
         } else if module.kind == Kind::Metapackage {
-            (install::InstalledFiles::default(), ModSource::Ckan)
+            (None, Vec::new(), ModSource::Ckan)
         } else {
             let archive = archives
                 .get(id)
                 .with_context(|| format!("{id} was not downloaded"))?;
             let src = store::ckan_source(paths, archive)
                 .with_context(|| format!("unpack {id} {}", module.version))?;
-            let files = install_source(inst, &reg, &src, &module.directives())
-                .with_context(|| format!("install {id} {}", module.version))?;
-            (files, ModSource::Ckan)
+            (Some(src), module.directives(), ModSource::Ckan)
         };
-        let auto = auto_before
-            .get(id)
-            .copied()
-            .unwrap_or(matches!(reason, Reason::Dependency(_)));
-        reg.mods.insert(
-            id.clone(),
-            InstalledMod {
-                source,
-                auto_installed: auto,
-                installed_at: paths::now_secs(),
-                files: files.files,
-                dirs: files.dirs,
-                module: module.clone(),
-            },
-        );
-        inst.save_registry(&reg)?;
+        let planned = match &src {
+            Some(src) => install::plan(&directives, &src.entries()?)
+                .with_context(|| format!("plan {id} {}", module.version))?,
+            None => Vec::new(),
+        };
+        for f in planned.iter().filter(|f| !f.is_dir) {
+            let key = install::fold(&f.dest);
+            if let Some(owner) = owners.get(&key) {
+                problems.push(format!("{id}: {} is owned by {owner}", f.dest));
+            } else if !freed.contains(&key) && game.join(&f.dest).exists() {
+                problems.push(format!(
+                    "{id}: {} already exists and is not managed by orbis",
+                    f.dest
+                ));
+            } else if let Some(link) = install::through_link(&game, &f.dest) {
+                problems.push(format!(
+                    "{id}: {} would be written through {link}, which links to the base game install",
+                    f.dest
+                ));
+            }
+            owners.insert(key, id.clone());
+        }
+        prepared.push((module, reason, src, planned, source));
     }
-    let _ = events.send(Event::Status("Done".into()));
+    if !problems.is_empty() {
+        problems.truncate(20);
+        bail!(
+            "nothing was changed; these files are in the way:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+    cancel.check()?;
+
+    // Set the leaving mods' files aside rather than deleting them, so a
+    // failure part-way puts everything back.
+    let stash = inst.dir.join(".apply-stash");
+    if stash.exists() {
+        bail!(
+            "an earlier change was interrupted and its set-aside files are still in {}; \
+             move them back into game/ or delete the folder, then try again",
+            stash.display()
+        );
+    }
+    let mut reg = original.clone();
+    let mut stashed: Vec<(String, Vec<String>)> = Vec::new();
+    let mut added: Vec<install::InstalledFiles> = Vec::new();
+    let mut auto_before: HashMap<String, bool> = HashMap::new();
+    let result = (|| -> Result<()> {
+        for id in &leaving {
+            let Some(old) = reg.mods.remove(*id) else {
+                continue;
+            };
+            let _ = events.send(Event::Status(format!("Removing {id} {}", old.version())));
+            auto_before.insert((*id).clone(), old.auto_installed);
+            let moved = set_aside(&game, &stash, id, &old.files)?;
+            stashed.push(((*id).clone(), moved));
+        }
+        for (module, reason, src, planned, source) in &prepared {
+            cancel.check()?;
+            let id = &module.identifier;
+            let _ = events.send(Event::Status(format!("Installing {id} {}", module.version)));
+            let files = match src {
+                Some(src) => install::install(&game, src, planned, &reg.owners(), false)
+                    .with_context(|| format!("install {id} {}", module.version))?,
+                None => install::InstalledFiles::default(),
+            };
+            added.push(files.clone());
+            let auto = auto_before
+                .get(id)
+                .copied()
+                .unwrap_or(matches!(reason, Reason::Dependency(_)));
+            reg.mods.insert(
+                id.clone(),
+                InstalledMod {
+                    source: *source,
+                    auto_installed: auto,
+                    installed_at: paths::now_secs(),
+                    files: files.files,
+                    dirs: files.dirs,
+                    module: (*module).clone(),
+                },
+            );
+        }
+        inst.save_registry(&reg)
+    })();
+    match result {
+        Ok(()) => {
+            // Committed: the set-aside files can go, then the folders they
+            // leave empty.
+            let _ = std::fs::remove_dir_all(&stash);
+            for (id, _) in &stashed {
+                if let Some(old) = original.mods.get(id) {
+                    // Folders only: a new version may reuse the old paths.
+                    let dirs = install::InstalledFiles {
+                        files: Vec::new(),
+                        dirs: old.dirs.clone(),
+                    };
+                    install::uninstall(&game, &dirs);
+                }
+            }
+            let _ = events.send(Event::Status("Done".into()));
+            Ok(())
+        }
+        Err(e) => {
+            for files in added.iter().rev() {
+                install::uninstall(&game, files);
+            }
+            let mut lost = Vec::new();
+            for (id, moved) in &stashed {
+                if let Err(err) = put_back(&game, &stash, id, moved) {
+                    lost.push(format!("{id}: {err:#}"));
+                }
+            }
+            if lost.is_empty() {
+                let _ = std::fs::remove_dir_all(&stash);
+                Err(e.context("nothing was changed"))
+            } else {
+                Err(e.context(format!(
+                    "couldn't put back every file; the rest are in {}: {}",
+                    stash.display(),
+                    lost.join("; ")
+                )))
+            }
+        }
+    }
+}
+
+/// Moves a mod's files from the game into `stash/<id>/`, keeping their
+/// paths. Returns the files moved (missing ones are skipped).
+fn set_aside(
+    game: &std::path::Path,
+    stash: &std::path::Path,
+    id: &str,
+    files: &[String],
+) -> Result<Vec<String>> {
+    let mut moved = Vec::new();
+    for f in files {
+        if install::through_link(game, f).is_some() {
+            continue;
+        }
+        let from = game.join(f);
+        if !from.exists() {
+            continue;
+        }
+        let to = stash.join(paths::slug(id)).join(f);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::rename(&from, &to).with_context(|| format!("set aside {f}"))?;
+        moved.push(f.clone());
+    }
+    Ok(moved)
+}
+
+/// Moves files set aside by [`set_aside`] back into the game.
+fn put_back(
+    game: &std::path::Path,
+    stash: &std::path::Path,
+    id: &str,
+    files: &[String],
+) -> Result<()> {
+    for f in files {
+        let to = game.join(f);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::rename(stash.join(paths::slug(id)).join(f), &to)
+            .with_context(|| format!("put back {f}"))?;
+    }
     Ok(())
 }
 
@@ -339,6 +499,7 @@ pub fn adopt(
     folder: &str,
     opts: &manual::AddOptions,
 ) -> Result<ManualMod> {
+    crate::running::refuse_if_running(inst)?;
     let mut reg = inst.registry()?;
     let (unmanaged, _) = manual::unmanaged(&inst.game_dir(), &reg.owners())?;
     if !unmanaged.iter().any(|u| u.folder == folder) {
@@ -373,16 +534,6 @@ pub fn adopt(
         vec![format!("adopt GameData/{folder} as {}", m.identifier())],
     )?;
     Ok(m)
-}
-
-fn install_source(
-    inst: &Instance,
-    reg: &Registry,
-    src: &Source,
-    directives: &[crate::metadata::InstallDirective],
-) -> Result<install::InstalledFiles> {
-    let planned = install::plan(directives, &src.entries()?)?;
-    install::install(&inst.game_dir(), src, &planned, &reg.owners(), false)
 }
 
 /// Plans installing a manual mod (resolving its CKAN dependencies).
@@ -620,6 +771,118 @@ mod tests {
         assert_eq!(reg.mods["App"].module.version.as_str(), "1.0");
         assert!(reg.mods["Lib"].auto_installed);
         assert!(!reg.mods["App"].auto_installed);
+    }
+
+    #[test]
+    fn a_failed_change_leaves_the_instance_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ksp = tmp.path().join("ksp");
+        fake_ksp(&ksp);
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let config = Config::default();
+        let inst = crate::instance::create(
+            &paths,
+            &CreateOptions {
+                name: "t".into(),
+                source: ksp,
+                stock_only: true,
+                with_saves: false,
+                mode: CopyMode::Copy,
+            },
+            &mut |_, _| {},
+        )
+        .expect("create");
+        let mk = |id: &str, v: &str, files: &[&str]| -> Module {
+            let url = zip_with(&tmp.path().join(format!("{id}-{v}.zip")), files);
+            serde_json::from_value(serde_json::json!({
+                "identifier": id, "version": v, "ksp_version": "1.12", "download": url,
+            }))
+            .expect("module")
+        };
+        let index = Index::from_modules(
+            vec![
+                mk("App", "1.0", &["GameData/App/app.dll"]),
+                mk(
+                    "App",
+                    "2.0",
+                    &["GameData/App/app.dll", "GameData/App/stray.cfg"],
+                ),
+                mk("Good", "1.0", &["GameData/Good/g.dll"]),
+                mk("Locked", "1.0", &["GameData/Locked/l.dll"]),
+            ],
+            HashMap::new(),
+            0,
+        );
+        let (tx, _rx) = mpsc::channel();
+        let run = |req: Request| {
+            let p = plan(&inst, &index, &req).expect("io").expect("resolves");
+            apply(&paths, &config, &inst, &p, &tx, &Cancel::default())
+        };
+        run(Request {
+            install: vec![("App".into(), Some(crate::version::ModVersion::new("1.0")))],
+            ..Request::default()
+        })
+        .expect("install 1.0");
+        let g = inst.game_dir();
+        let unchanged = |what: &str| {
+            let reg = inst.registry().expect("registry");
+            assert_eq!(reg.mods["App"].module.version.as_str(), "1.0", "{what}");
+            assert!(g.join("GameData/App/app.dll").is_file(), "{what}");
+            assert!(!reg.mods.contains_key("Good"), "{what}");
+            assert!(!g.join("GameData/Good").exists(), "{what}");
+            assert!(!inst.dir.join(".apply-stash").exists(), "{what}");
+        };
+
+        // A stray file in the new version's way: refused before anything moves.
+        fs::write(g.join("GameData/App/stray.cfg"), "mine").expect("write");
+        let err = run(Request {
+            upgrade: vec!["App".into()],
+            install: vec![("Good".into(), None)],
+            ..Request::default()
+        })
+        .expect_err("conflict");
+        assert!(
+            format!("{err:#}").contains("nothing was changed"),
+            "{err:#}"
+        );
+        unchanged("conflict");
+        assert_eq!(
+            fs::read_to_string(g.join("GameData/App/stray.cfg")).expect("kept"),
+            "mine"
+        );
+        fs::remove_file(g.join("GameData/App/stray.cfg")).expect("rm");
+
+        // A failure while installing: the upgrade already done is undone.
+        fs::create_dir_all(g.join("GameData/Locked")).expect("mkdir");
+        fs::set_permissions(g.join("GameData/Locked"), fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let err = run(Request {
+            upgrade: vec!["App".into()],
+            install: vec![("Good".into(), None), ("Locked".into(), None)],
+            ..Request::default()
+        })
+        .expect_err("locked folder");
+        fs::set_permissions(g.join("GameData/Locked"), fs::Permissions::from_mode(0o755))
+            .expect("chmod back");
+        assert!(
+            format!("{err:#}").contains("nothing was changed"),
+            "{err:#}"
+        );
+        unchanged("install failure");
+        assert!(!g.join("GameData/App/stray.cfg").exists());
+
+        // While the game runs, nothing changes.
+        crate::running::mark(&inst.dir, std::process::id(), "direct").expect("mark");
+        let err = run(Request {
+            install: vec![("Good".into(), None)],
+            ..Request::default()
+        })
+        .expect_err("running");
+        assert!(format!("{err:#}").contains("is running"), "{err:#}");
+        assert!(crate::instance::delete(&inst).is_err());
+        crate::running::clear(&inst.dir, std::process::id());
+        unchanged("running");
     }
 
     #[test]

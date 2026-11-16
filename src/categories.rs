@@ -28,12 +28,12 @@ pub const BUILT_IN: [&str; 14] = [
 ];
 
 /// The category CKAN tags point to. The first rule that matches wins, so a
-/// library tagged `parts` stays a library and a parts pack with a sound
-/// config stays parts.
+/// parts pack with a sound config stays parts. `library` comes last among
+/// the meaningful tags: a mod that is also tagged with what it does (such as
+/// Parallax, `graphics` and `library`) goes with what it does.
 pub fn from_tags(tags: &[String]) -> &'static str {
     let has = |names: &[&str]| tags.iter().any(|t| names.contains(&t.as_str()));
     let rules: [(&[&str], &str); 13] = [
-        (&["library"], "Libraries"),
         (&["planet-pack"], "Planets"),
         (&["graphics"], "Visuals"),
         (&["sound"], "Sound"),
@@ -51,6 +51,7 @@ pub fn from_tags(tags: &[String]) -> &'static str {
         (&["physics"], "Physics"),
         (&["resources"], "Resources"),
         (&["crewed", "first-person", "suits"], "Crew & IVA"),
+        (&["library"], "Libraries"),
         (&["config"], "Patches & configs"),
     ];
     rules
@@ -140,8 +141,10 @@ mod tests {
 
     #[test]
     fn tags_pick_a_category() {
-        let cases: [(&[&str], &str); 8] = [
-            (&["plugin", "library", "career"], "Libraries"),
+        let cases: [(&[&str], &str); 10] = [
+            (&["plugin", "library", "career"], "Career & science"),
+            (&["plugin", "library"], "Libraries"),
+            (&["plugin", "graphics", "library"], "Visuals"),
             (&["plugin", "sound", "crewed"], "Sound"),
             (&["parts", "crewed"], "Parts"),
             (&["config", "career", "uncrewed"], "Career & science"),

@@ -18,7 +18,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 * **Shared craft**: every craft you save in any instance lands in one library and is copied into every instance that has the parts for it, with revisions, a trash and an explanation of what's missing where it doesn't fit.
 * **Custom flags**: add your own flag images once, on the Flags tab or with `orbis flag add`, and pick them in every instance.
 * **Modpacks**: export an instance's mods (optionally with craft, saves and manual mod files) and import them as a new instance; CKAN's `.ckan` modpacks work both ways.
-* **Save backups**: saves are snapshotted before every mod change and launch (only when they changed), with one-click restore of a single save or all of them.
+* **Save backups**: saves are snapshotted before every mod change and launch (only when their contents changed), with one-click restore of a single save or all of them.
 * **History and undo**: every change is recorded; undo the last one or put the mod list back to any earlier point, exact versions included.
 * **Log viewer**: read KSP.log, Player.log and the launch log in the app, with exceptions grouped and traced to the mod whose code threw them.
 * **Hand-added mods**: folders dropped into GameData by hand are spotted and can be adopted as tracked manual mods.
@@ -33,7 +33,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 * **Reliable downloads**: parallel downloads that drop stalled connections and resume where they left off, falling back to CKAN's archive.org mirror for freely licensed mods.
 * **One copy of each mod**: every mod version is unpacked once into a shared store; on btrfs and XFS instances get reflinked copies that share disk space but keep their own files.
 * **Mouse or keyboard**: everything works by point and click, with standard keyboard shortcuts and vim-style keys alongside (press `F1` to list them).
-* **Safe file handling**: every installed file is tracked per mod, conflicts are refused, and a failed install rolls back.
+* **Safe file handling**: every installed file is tracked per mod, and applying changes is all or nothing: every install is checked for conflicts before anything is removed, and a failure or cancel part-way puts the instance back exactly as it was. Nothing changes while an instance's game is running.
 * **GUI and CLI**: an egui interface, plus a CLI covering every operation.
 * **Headless rendering**: the GUI renders offscreen to PNG with a text state dump, so it can be checked without a display.
 * **Pure Rust**: a single binary with no C dependencies; downloads go through the system `curl`.
@@ -211,10 +211,12 @@ Vim-style keys work too, unless turned off under **Settings > Interface**:
 | `h` / `l` | Previous / next filter |
 | `J` / `K` | Next / previous instance |
 | `gt` / `gT` | Next / previous tab |
+| `za` | Fold or open the selected mod's category |
+| `zR` / `zM` | Open / fold every category |
 
 ## Categories
 
-The mod list is grouped by category, each with its own colour: a bar on every row and a heading you can click to fold the group. Categories come from the tags CKAN gives each mod (`parts`, `graphics`, `comms` and so on). To put a mod somewhere else, pick a category under **Details** in its panel, or **New category...** for one of your own, such as Rovers or Satellites. Your choices live in `~/.local/share/orbis/categories.toml` and apply to every instance. **Group by category** above the list turns grouping off.
+The mod list is grouped by category, each with its own colour, shown as a dot on its heading and a bar beside every row. Click a heading to fold the group, or use **Expand all** / **Collapse all**; a search or **Starred only** shows every match whatever is folded, and counts and bulk actions always include folded mods. Categories come from the tags CKAN gives each mod (`parts`, `graphics`, `comms` and so on); a mod tagged both as a library and with what it does (Parallax: `graphics` and `library`) goes with what it does. To put a mod somewhere else, pick a category under **Details** in its panel, or **New category...** for one of your own, such as Rovers or Satellites. Your choices live in `~/.local/share/orbis/categories.toml` and apply to every instance. **Group by category** above the list turns grouping off.
 
 ## Flags
 
@@ -246,7 +248,7 @@ Downloaded archives are unpacked once into `~/.local/share/orbis/store/`, one fo
 
 `orbis cache` (or **Settings > Storage**) shows the store and download cache; `orbis cache --clean` removes what no instance uses. Mods installed before the store existed are separate copies; `orbis cache --share` (or **Share space with older installs**) compares their files with the store and replaces every identical one with a shared copy. Files a mod has changed are left alone, and it only runs on btrfs and XFS, where it saves space.
 
-Any running task that downloads or installs (updating the index, applying changes, importing a pack, restoring history, sharing space) has a **Cancel** button. It stops after the current download or mod, never halfway through one; partial downloads resume next time.
+Any running task that downloads or installs (updating the index, applying changes, importing a pack, restoring history, sharing space) has a **Cancel** button. Cancelling while changes are being applied puts the instance back as it was; partial downloads resume next time.
 
 ## Safety nets
 

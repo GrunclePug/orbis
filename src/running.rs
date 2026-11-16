@@ -65,6 +65,19 @@ pub fn current(instance_dir: &Path) -> Option<Running> {
     state(instance_dir).filter(|r| start_time(r.pid) == Some(r.start))
 }
 
+/// Fails when the instance's game is running: mods, saves and the instance
+/// itself must not change under KSP.
+pub fn refuse_if_running(inst: &crate::instance::Instance) -> Result<()> {
+    if let Some(r) = current(&inst.dir) {
+        anyhow::bail!(
+            "{} is running (process {}); close the game first",
+            inst.config.name,
+            r.pid
+        );
+    }
+    Ok(())
+}
+
 /// Whether the instance's game is running.
 pub fn is_running(instance_dir: &Path) -> bool {
     current(instance_dir).is_some()

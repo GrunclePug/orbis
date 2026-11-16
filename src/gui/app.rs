@@ -426,6 +426,8 @@ pub enum Msg {
     SaveGlobalSettings,
     ToggleStar(String),
     SetGrouped(bool),
+    ExpandAll,
+    CollapseAll,
     ToggleCategory(String),
     SetCategory(String, Option<String>),
     OpenNewCategory(String),
@@ -516,8 +518,9 @@ pub struct App {
     pub rows: Vec<Row>,
     /// What the mod list shows, in order: headings and rows.
     pub items: Vec<Item>,
-    /// For each row, its line in `items` (to scroll to it).
-    pub row_item: Vec<usize>,
+    /// For each row, its line in `items`, or `None` while its category is
+    /// folded.
+    pub row_item: Vec<Option<usize>>,
     pub grouped: bool,
     pub collapsed: BTreeSet<String>,
     pub categories: Categories,
@@ -574,6 +577,7 @@ pub struct App {
     pub vim_keys: bool,
     /// A `g` waiting for its second key (gg, gt, gT), with the time it came.
     pending_g: Option<f64>,
+    pending_z: Option<f64>,
     /// Scroll the mod table so this row is visible.
     pub scroll_to_row: Option<usize>,
     /// The mod table's scroll offset and visible height, from the last frame.
@@ -651,6 +655,7 @@ impl App {
             auto_updated: false,
             vim_keys: true,
             pending_g: None,
+            pending_z: None,
             scroll_to_row: None,
             mods_view: (0.0, 0.0),
             focus_search: false,
@@ -749,7 +754,8 @@ impl App {
             self.selected = self.instances.first().map(|v| v.inst.id.clone());
         }
         self.generation += 1;
-        self.settings.for_instance = None;
+        // The settings form keeps its unsaved edits; it refills itself when
+        // another instance is selected, after a save, or on F5.
         self.load_side_data();
         self.recount_upgrades();
     }
@@ -1098,8 +1104,8 @@ impl App {
             Key::ArrowUp if on_mods => self.move_selection(-1),
             Key::PageDown if on_mods => self.move_selection(page),
             Key::PageUp if on_mods => self.move_selection(-page),
-            Key::Home if on_mods => self.select_row(0),
-            Key::End if on_mods => self.select_row(self.rows.len().saturating_sub(1)),
+            Key::Home if on_mods => self.select_edge(true),
+            Key::End if on_mods => self.select_edge(false),
             Key::ArrowLeft if on_mods => self.cycle_filter(-1),
             Key::ArrowRight if on_mods => self.cycle_filter(1),
             Key::Space if on_mods => self.toggle_selected(),
@@ -1133,10 +1139,23 @@ impl App {
     }
 
     fn vim_char(&mut self, c: char, now: f64) {
+        if self.pending_z.take().is_some_and(|t| now - t < 1.0) {
+            match c {
+                'a' => {
+                    if let Some(row) = self.selected_row().cloned() {
+                        self.update(Msg::ToggleCategory(row.category));
+                    }
+                }
+                'R' => self.update(Msg::ExpandAll),
+                'M' => self.update(Msg::CollapseAll),
+                _ => {}
+            }
+            return;
+        }
         let pending = self.pending_g.take().is_some_and(|t| now - t < 1.0);
         if pending {
             match c {
-                'g' => self.select_row(0),
+                'g' => self.select_edge(true),
                 't' => self.cycle_tab(1),
                 'T' => self.cycle_tab(-1),
                 _ => {}
@@ -1150,7 +1169,8 @@ impl App {
             'K' => self.cycle_instance(-1),
             'j' if on_mods => self.move_selection(1),
             'k' if on_mods => self.move_selection(-1),
-            'G' if on_mods => self.select_row(self.rows.len().saturating_sub(1)),
+            'G' if on_mods => self.select_edge(false),
+            'z' if on_mods => self.pending_z = Some(now),
             'h' if on_mods => self.cycle_filter(-1),
             'l' if on_mods => self.cycle_filter(1),
             '/' if on_mods => self.focus_search = true,
@@ -1181,19 +1201,42 @@ impl App {
         }
     }
 
+    /// Rows the list shows (not in a folded category), in order.
+    fn visible_rows(&self) -> Vec<usize> {
+        (0..self.rows.len())
+            .filter(|&i| self.row_item.get(i).copied().flatten().is_some())
+            .collect()
+    }
+
+    /// Selects the first or last row the list shows.
+    fn select_edge(&mut self, first: bool) {
+        let visible = self.visible_rows();
+        let edge = if first {
+            visible.first()
+        } else {
+            visible.last()
+        };
+        if let Some(&i) = edge {
+            self.select_row(i);
+        }
+    }
+
+    /// Moves the selection by `by` rows among those the list shows.
     fn move_selection(&mut self, by: isize) {
-        if self.rows.is_empty() {
+        let visible = self.visible_rows();
+        if visible.is_empty() {
             return;
         }
         let current = self
             .selected_mod
             .as_ref()
-            .and_then(|id| self.rows.iter().position(|r| &r.id == id));
+            .and_then(|id| self.rows.iter().position(|r| &r.id == id))
+            .and_then(|i| visible.iter().position(|&v| v == i));
         let next = match current {
-            Some(i) => i.saturating_add_signed(by).min(self.rows.len() - 1),
+            Some(i) => i.saturating_add_signed(by).min(visible.len() - 1),
             None => 0,
         };
-        self.select_row(next);
+        self.select_row(visible[next]);
     }
 
     fn cycle_filter(&mut self, by: isize) {
@@ -1549,7 +1592,12 @@ impl App {
     /// Lays out the list with category headings (see `group`).
     fn group_rows(&mut self) {
         let rows = std::mem::take(&mut self.rows);
-        (self.rows, self.items, self.row_item) = group(rows, self.grouped, &self.collapsed);
+        // Folds only tidy the full list; a search or Starred only shows
+        // every match.
+        let searching = !self.search.trim().is_empty() || self.starred_only;
+        let none = BTreeSet::new();
+        let collapsed = if searching { &none } else { &self.collapsed };
+        (self.rows, self.items, self.row_item) = group(rows, self.grouped, collapsed);
     }
 
     /// Rebuilds the rows on the next frame.
@@ -2043,6 +2091,16 @@ impl App {
                 self.grouped = on;
                 self.invalidate_rows();
             }
+            Msg::ExpandAll => {
+                self.collapsed.clear();
+                self.invalidate_rows();
+            }
+            Msg::CollapseAll => {
+                for r in &self.rows {
+                    self.collapsed.insert(r.category.clone());
+                }
+                self.invalidate_rows();
+            }
             Msg::ToggleCategory(c) => {
                 if !self.collapsed.remove(&c) {
                     self.collapsed.insert(c);
@@ -2211,6 +2269,7 @@ impl App {
                         Ok(()) => {
                             self.note(format!("Renamed to {}", inst.config.name));
                             self.reload();
+                            self.settings.for_instance = None;
                         }
                         Err(e) => self.error(format!("{e:#}")),
                     }
@@ -2522,6 +2581,7 @@ impl App {
             }
             Msg::CloseDialog => self.dialog = None,
             Msg::Refresh => {
+                self.settings.for_instance = None;
                 self.steam = self.ctx.steam();
                 self.steam_launch_options = launch::current_steam_launch_options(&self.steam);
                 self.reload();
@@ -2887,6 +2947,7 @@ impl App {
             Ok(()) => {
                 self.note(format!("Saved settings for {}", inst.config.name));
                 self.reload();
+                self.settings.for_instance = None;
             }
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -3054,46 +3115,49 @@ impl App {
     }
 }
 
-/// Orders rows by category (keeping their order within each), drops those
-/// in folded categories, and lays out the list with headings. Returns the
-/// rows, the list, and each row's line in it. Ungrouped, the list is just
-/// the rows.
+/// Orders rows by category (keeping their order within each) and lays out
+/// the list with headings, leaving out the rows of folded categories. Every
+/// row stays in the returned rows, so counts, bulk actions and the details
+/// panel see them all. Returns the rows, the list, and each row's line in
+/// it (`None` when folded). Ungrouped, the list is just the rows.
 pub fn group(
     mut rows: Vec<Row>,
     grouped: bool,
     collapsed: &BTreeSet<String>,
-) -> (Vec<Row>, Vec<Item>, Vec<usize>) {
+) -> (Vec<Row>, Vec<Item>, Vec<Option<usize>>) {
     if !grouped {
         let n = rows.len();
-        return (rows, (0..n).map(Item::Row).collect(), (0..n).collect());
+        return (
+            rows,
+            (0..n).map(Item::Row).collect(),
+            (0..n).map(Some).collect(),
+        );
     }
     rows.sort_by_cached_key(|r| categories::rank(&r.category));
-    let mut counts: Vec<(String, usize)> = Vec::new();
-    for r in &rows {
-        match counts.last_mut() {
-            Some((c, n)) if *c == r.category => *n += 1,
-            _ => counts.push((r.category.clone(), 1)),
-        }
-    }
-    rows.retain(|r| !collapsed.contains(&r.category));
     let mut items = Vec::new();
-    let mut row_item = Vec::new();
-    let mut next = 0;
-    for (category, count) in counts {
+    let mut row_item = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < rows.len() {
+        let category = rows[i].category.clone();
+        let count = rows[i..]
+            .iter()
+            .take_while(|r| r.category == category)
+            .count();
         let shut = collapsed.contains(&category);
         items.push(Item::Header {
             category,
             count,
             collapsed: shut,
         });
-        if shut {
-            continue;
+        for j in i..i + count {
+            if shut {
+                row_item.push(None);
+            } else {
+                row_item.push(Some(items.len()));
+                items.push(Item::Row(j));
+            }
         }
-        for _ in 0..count {
-            row_item.push(items.len());
-            items.push(Item::Row(next));
-            next += 1;
-        }
+        i += count;
     }
     (rows, items, row_item)
 }
