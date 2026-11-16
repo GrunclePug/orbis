@@ -17,7 +17,10 @@ use crate::paths::slug;
 
 /// The User-Agent sent with every request.
 pub fn user_agent() -> String {
-    format!("orbis/{}", env!("CARGO_PKG_VERSION"))
+    format!(
+        "orbis/{} (+https://github.com/grunclepug/orbis)",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Result of a conditional fetch.

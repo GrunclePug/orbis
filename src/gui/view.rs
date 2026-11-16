@@ -1273,11 +1273,65 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     }
                 });
             }
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(RichText::new("About").heading());
+            ui.label(format!("orbis {}: a KSP mod manager with instances.", env!("CARGO_PKG_VERSION")));
+            ui.add_space(4.0);
+            ui.label(RichText::new("orbis stands on other people's work:").strong());
+            let credits: [(&str, &str, &str); 6] = [
+                (
+                    "CKAN",
+                    "https://github.com/KSP-CKAN/CKAN",
+                    "every installable mod comes from the metadata the CKAN team and contributors maintain, and orbis follows (and ports parts of) the CKAN client.",
+                ),
+                (
+                    "SpaceDock",
+                    "https://spacedock.info/",
+                    "hosts most of the mods orbis downloads and publishes their download counts.",
+                ),
+                (
+                    "Prism Launcher",
+                    "https://prismlauncher.org/",
+                    "the Minecraft launcher whose instances inspired orbis.",
+                ),
+                (
+                    "The Internet Archive",
+                    "https://archive.org/details/kspckanmods",
+                    "keeps CKAN's mirror of freely licensed mods.",
+                ),
+                (
+                    "Proton and Proton-GE",
+                    "https://github.com/ValveSoftware/Proton",
+                    "run the Windows build of KSP on Linux.",
+                ),
+                (
+                    "Mod authors",
+                    "https://spacedock.info/",
+                    "made every mod listed here; use each mod's links to thank and support them.",
+                ),
+            ];
+            for (name, url, what) in credits {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.link(name).on_hover_text(url).clicked() {
+                        msgs.push(Msg::OpenUrl(url.to_owned()));
+                    }
+                    ui.label(what);
+                });
+            }
+            ui.add_space(4.0);
             ui.label(
-                RichText::new(format!("orbis {}", env!("CARGO_PKG_VERSION")))
-                    .small()
-                    .weak(),
+                RichText::new(
+                    "orbis is independent and isn't affiliated with or endorsed by CKAN, SpaceDock, Prism Launcher, Valve, Squad or Private Division. Portions derived from CKAN are MIT licensed by the CKAN authors (see NOTICE).",
+                )
+                .small()
+                .weak(),
             );
+            ui.horizontal(|ui| {
+                if ui.link("orbis on GitHub").clicked() {
+                    msgs.push(Msg::OpenUrl("https://github.com/grunclepug/orbis".into()));
+                }
+            });
         });
 }
 

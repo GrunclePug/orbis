@@ -6,7 +6,7 @@ A Kerbal Space Program mod manager with Prism-style instances, built on CKAN met
 
 ## Overview
 
-orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1. Every instance has its own mods, saves and settings, like Prism Launcher instances for Minecraft, and links the stock game from your Steam install without ever changing it, so launching KSP from Steam stays vanilla. Mods come from the CKAN index with full dependency resolution, and mods CKAN doesn't carry (Patreon builds, betas, personal patches) live in a manual mod library that any instance can use. It ships as a single binary with a GUI and a scriptable CLI, and it launches the Windows build of KSP through the Proton that Steam uses.
+orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, built on the metadata the CKAN project maintains and inspired by [Prism Launcher](https://prismlauncher.org/). Every instance has its own mods, saves and settings, like Prism Launcher instances for Minecraft, and links the stock game from your Steam install without ever changing it, so launching KSP from Steam stays vanilla. Mods come from the CKAN index with full dependency resolution, and mods CKAN doesn't carry (Patreon builds, betas, personal patches) live in a manual mod library that any instance can use. It ships as a single binary with a GUI and a scriptable CLI, and it launches the Windows build of KSP through the Proton that Steam uses.
 
 ## Features
 
@@ -230,6 +230,19 @@ Manual mod files are left out unless you pass `--manual-files`, since mods like 
 
 orbis runs `KSP_x64.exe` from the instance's `game/` directory with the Proton build Steam has mapped to KSP, passing the same `STEAM_COMPAT_*` environment Steam does (plus `STEAM_COMPAT_MOUNTS`, so the runtime container can see the linked install). When that Proton requires the Steam Linux Runtime, orbis starts it through the runtime's entry point just as Steam does. KSP 1 has no DRM, so Steam doesn't need to start the game, though the Steam overlay and playtime tracking don't apply. Proton's output goes to `orbis-launch.log` in the instance directory. `orbis launch --dry-run` prints the exact command.
 
+## Credits
+
+orbis stands on other people's work.
+
+* **[CKAN](https://github.com/KSP-CKAN/CKAN)**: the Comprehensive Kerbal Archive Network made automatic KSP mod management possible. Every mod orbis can install comes from the metadata the CKAN team and its contributors maintain in [CKAN-meta](https://github.com/KSP-CKAN/CKAN-meta) through NetKAN, and orbis follows the CKAN client's behaviour closely: its version ordering, install stanzas, compatibility rules and DLC detection are ported from CKAN's source, used under its MIT license (see [NOTICE](NOTICE)). If you use orbis, you are using CKAN's work; consider supporting and contributing to the project.
+* **[SpaceDock](https://spacedock.info/)**: hosts most of the mods orbis downloads, free for authors and players alike, and publishes the download counts orbis shows.
+* **[Prism Launcher](https://prismlauncher.org/)**: the Minecraft launcher whose instances inspired orbis's design, from the instance list to cloning, modpacks and per-instance settings.
+* **[The Internet Archive](https://archive.org/details/kspckanmods)**: keeps CKAN's mirror of freely licensed mods, which orbis falls back on when a host is slow or gone.
+* **[Proton](https://github.com/ValveSoftware/Proton)** by Valve and **[Proton-GE](https://github.com/GloriousEggroll/proton-ge-custom)** by GloriousEggroll: what makes the Windows build of KSP run on Linux.
+* **The mod authors**: thousands of people built the mods that make KSP what it is. orbis only fetches their work; follow the homepage and repository links on each mod to thank and support them.
+
+orbis is an independent project and isn't affiliated with or endorsed by CKAN, SpaceDock, Prism Launcher, Valve, Squad or Private Division. Kerbal Space Program is a trademark of Take-Two Interactive.
+
 ## Development
 
 ```sh
@@ -248,7 +261,7 @@ Fork the repository and open a pull request.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). orbis reads metadata from CKAN, which is MIT licensed by the CKAN authors.
+MIT. See [LICENSE](LICENSE). Portions are derived from CKAN, MIT licensed by the CKAN authors; see [NOTICE](NOTICE).
 
 ## Author
 

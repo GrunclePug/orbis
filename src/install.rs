@@ -1,5 +1,6 @@
 //! Turning an archive into files in a game directory, using CKAN install
-//! directives (ported from CKAN's `ModuleInstallDescriptor`).
+//! directives, ported from CKAN's `ModuleInstallDescriptor` (MIT, the CKAN
+//! authors; see NOTICE).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};

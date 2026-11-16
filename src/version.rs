@@ -1,6 +1,7 @@
 //! Version types: CKAN module versions and KSP game versions.
 //!
-//! Module version ordering follows CKAN's `ModuleVersion` exactly (an
+//! Module version ordering is ported from CKAN's `ModuleVersion` (MIT,
+//! the CKAN authors; see NOTICE) and follows it exactly (an
 //! optional `epoch:` prefix, then alternating string and number runs), so
 //! "latest version" means the same thing in orbis as it does in CKAN.
 
