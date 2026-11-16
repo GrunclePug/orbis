@@ -1201,6 +1201,12 @@ impl App {
         }
     }
 
+    /// Whether a search or Starred only is narrowing the list, which shows
+    /// every match whatever is folded.
+    pub fn searching(&self) -> bool {
+        !self.search.trim().is_empty() || self.starred_only
+    }
+
     /// Rows the list shows (not in a folded category), in order.
     fn visible_rows(&self) -> Vec<usize> {
         (0..self.rows.len())
@@ -1594,9 +1600,12 @@ impl App {
         let rows = std::mem::take(&mut self.rows);
         // Folds only tidy the full list; a search or Starred only shows
         // every match.
-        let searching = !self.search.trim().is_empty() || self.starred_only;
         let none = BTreeSet::new();
-        let collapsed = if searching { &none } else { &self.collapsed };
+        let collapsed = if self.searching() {
+            &none
+        } else {
+            &self.collapsed
+        };
         (self.rows, self.items, self.row_item) = group(rows, self.grouped, collapsed);
     }
 
@@ -2091,6 +2100,9 @@ impl App {
                 self.grouped = on;
                 self.invalidate_rows();
             }
+            // While a search shows every match, folds don't apply, so they
+            // don't change either.
+            Msg::ExpandAll | Msg::CollapseAll | Msg::ToggleCategory(_) if self.searching() => {}
             Msg::ExpandAll => {
                 self.collapsed.clear();
                 self.invalidate_rows();
@@ -2789,6 +2801,11 @@ impl App {
     }
 
     fn launch(&mut self) {
+        if let Some(task) = &self.task {
+            let title = task.title.clone();
+            self.note(format!("Wait for \"{title}\" to finish before launching"));
+            return;
+        }
         let Some(view) = self.current() else { return };
         let mut inst = view.inst.clone();
         if self.running.iter().any(|(id, _)| *id == inst.id) || running::is_running(&inst.dir) {

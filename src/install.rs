@@ -416,9 +416,19 @@ pub fn install(
         problems.truncate(20);
         bail!("file conflicts:\n  {}", problems.join("\n  "));
     }
+    // Folders that exist now aren't this install's to remove on failure.
+    let existing: BTreeSet<String> = dirs_of(planned)
+        .into_iter()
+        .filter(|d| game.join(d).is_dir())
+        .collect();
     let mut done = InstalledFiles::default();
     let result = copy_all(game, source, planned, &mut done);
     if let Err(e) = result {
+        // The folders it made go too (only those left empty).
+        done.dirs = dirs_of(planned)
+            .into_iter()
+            .filter(|d| !existing.contains(d))
+            .collect();
         uninstall(game, &done);
         return Err(e);
     }

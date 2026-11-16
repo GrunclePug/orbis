@@ -113,6 +113,8 @@ fn apply_changes(
     events: &mpsc::Sender<Event>,
     cancel: &Cancel,
 ) -> Result<()> {
+    let stash = inst.dir.join(STASH);
+    clear_committed_stash(inst, &stash)?;
     let to_fetch: Vec<&Module> = plan
         .changes
         .iter()
@@ -171,11 +173,13 @@ fn apply_changes(
         .filter(|(id, _)| !leaving.contains(id))
         .flat_map(|(id, m)| m.files.iter().map(move |f| (install::fold(f), id.clone())))
         .collect();
-    let freed: std::collections::HashSet<String> = original
+    // Paths the leaving mods vacate: their files exactly as recorded, and
+    // their folders (emptied and removed during the swap).
+    let freed: std::collections::HashSet<&str> = original
         .mods
         .iter()
         .filter(|(id, _)| leaving.contains(id))
-        .flat_map(|(_, m)| m.files.iter().map(|f| install::fold(f)))
+        .flat_map(|(_, m)| m.files.iter().chain(&m.dirs).map(String::as_str))
         .collect();
     let mut prepared = Vec::new();
     let mut problems = Vec::new();
@@ -213,9 +217,9 @@ fn apply_changes(
         };
         for f in planned.iter().filter(|f| !f.is_dir) {
             let key = install::fold(&f.dest);
-            if let Some(owner) = owners.get(&key) {
+            if let Some(owner) = owners.get(&key).filter(|o| *o != id) {
                 problems.push(format!("{id}: {} is owned by {owner}", f.dest));
-            } else if !freed.contains(&key) && game.join(&f.dest).exists() {
+            } else if !freed.contains(f.dest.as_str()) && game.join(&f.dest).exists() {
                 problems.push(format!(
                     "{id}: {} already exists and is not managed by orbis",
                     f.dest
@@ -238,30 +242,44 @@ fn apply_changes(
         );
     }
     cancel.check()?;
+    // The game may have been started while this downloaded.
+    crate::running::refuse_if_running(inst)?;
 
     // Set the leaving mods' files aside rather than deleting them, so a
-    // failure part-way puts everything back.
-    let stash = inst.dir.join(".apply-stash");
-    if stash.exists() {
-        bail!(
-            "an earlier change was interrupted and its set-aside files are still in {}; \
-             move them back into game/ or delete the folder, then try again",
-            stash.display()
-        );
-    }
+    // failure part-way puts everything back. Every move is recorded as it
+    // happens.
     let mut reg = original.clone();
     let mut stashed: Vec<(String, Vec<String>)> = Vec::new();
+    let mut vacated: Vec<String> = Vec::new();
     let mut added: Vec<install::InstalledFiles> = Vec::new();
     let mut auto_before: HashMap<String, bool> = HashMap::new();
     let result = (|| -> Result<()> {
+        std::fs::create_dir_all(&stash).with_context(|| format!("create {}", stash.display()))?;
         for id in &leaving {
             let Some(old) = reg.mods.remove(*id) else {
                 continue;
             };
             let _ = events.send(Event::Status(format!("Removing {id} {}", old.version())));
             auto_before.insert((*id).clone(), old.auto_installed);
-            let moved = set_aside(&game, &stash, id, &old.files)?;
-            stashed.push(((*id).clone(), moved));
+            stashed.push(((*id).clone(), Vec::new()));
+            let moved = &mut stashed.last_mut().expect("just pushed").1;
+            set_aside(&game, &stash, id, &old.files, moved)?;
+        }
+        // Folders the leaving mods emptied go too, so a new version can put
+        // a file where an old folder was.
+        let mut dirs: Vec<&String> = leaving
+            .iter()
+            .filter_map(|id| original.mods.get(*id))
+            .flat_map(|m| &m.dirs)
+            .collect();
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+        dirs.dedup();
+        for d in dirs {
+            if install::through_link(&game, d).is_none()
+                && std::fs::remove_dir(game.join(d)).is_ok()
+            {
+                vacated.push(d.clone());
+            }
         }
         for (module, reason, src, planned, source) in &prepared {
             cancel.check()?;
@@ -289,13 +307,21 @@ fn apply_changes(
                 },
             );
         }
+        // Record what is about to be committed, so a crash between saving
+        // and clearing the stash can tell a finished change from an
+        // interrupted one.
+        let after = serde_json::to_vec(&reg).context("serialize registry")?;
+        paths::write_atomic(&stash.join(COMMITTED), &after)?;
         inst.save_registry(&reg)
     })();
     match result {
         Ok(()) => {
             // Committed: the set-aside files can go, then the folders they
-            // leave empty.
-            let _ = std::fs::remove_dir_all(&stash);
+            // leave empty. A stash that can't be removed now is cleared on
+            // the next change.
+            if let Err(e) = std::fs::remove_dir_all(&stash) {
+                log::warn!("remove {}: {e}", stash.display());
+            }
             for (id, _) in &stashed {
                 if let Some(old) = original.mods.get(id) {
                     // Folders only: a new version may reuse the old paths.
@@ -313,6 +339,9 @@ fn apply_changes(
             for files in added.iter().rev() {
                 install::uninstall(&game, files);
             }
+            for d in vacated.iter().rev() {
+                let _ = std::fs::create_dir_all(game.join(d));
+            }
             let mut lost = Vec::new();
             for (id, moved) in &stashed {
                 if let Err(err) = put_back(&game, &stash, id, moved) {
@@ -320,7 +349,9 @@ fn apply_changes(
                 }
             }
             if lost.is_empty() {
-                let _ = std::fs::remove_dir_all(&stash);
+                if let Err(err) = std::fs::remove_dir_all(&stash) {
+                    log::warn!("remove {}: {err}", stash.display());
+                }
                 Err(e.context("nothing was changed"))
             } else {
                 Err(e.context(format!(
@@ -334,14 +365,16 @@ fn apply_changes(
 }
 
 /// Moves a mod's files from the game into `stash/<id>/`, keeping their
-/// paths. Returns the files moved (missing ones are skipped).
+/// paths, and records each one in `moved` as soon as it has moved, so a
+/// failure part-way can put back exactly what moved. Missing files are
+/// skipped.
 fn set_aside(
     game: &std::path::Path,
     stash: &std::path::Path,
     id: &str,
     files: &[String],
-) -> Result<Vec<String>> {
-    let mut moved = Vec::new();
+    moved: &mut Vec<String>,
+) -> Result<()> {
     for f in files {
         if install::through_link(game, f).is_some() {
             continue;
@@ -358,7 +391,41 @@ fn set_aside(
         std::fs::rename(&from, &to).with_context(|| format!("set aside {f}"))?;
         moved.push(f.clone());
     }
-    Ok(moved)
+    Ok(())
+}
+
+/// Where an apply sets the leaving mods' files aside, inside the instance.
+const STASH: &str = ".apply-stash";
+/// Inside the stash: the registry about to be committed.
+const COMMITTED: &str = "registry-after.json";
+
+/// Deals with a stash an earlier apply left behind. If the instance's
+/// registry is the one that apply was committing, the change finished and
+/// the stash is only leftover old files: it is deleted. Otherwise the apply
+/// was interrupted before saving, and the user is told how to recover.
+fn clear_committed_stash(inst: &Instance, stash: &std::path::Path) -> Result<()> {
+    if !stash.exists() {
+        return Ok(());
+    }
+    let committed = std::fs::read(stash.join(COMMITTED))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let current = serde_json::to_value(inst.registry()?).context("serialize registry")?;
+    if committed.as_ref() == Some(&current) {
+        std::fs::remove_dir_all(stash)
+            .with_context(|| format!("remove leftover {}", stash.display()))?;
+        return Ok(());
+    }
+    bail!(
+        "an earlier change to {} was interrupted before it was saved. The mod list still \
+         describes the mods it was replacing, whose files are in {} (one folder per mod, \
+         paths kept). Move each folder's contents back into the instance's game/ folder and \
+         delete {}; files the interrupted change had installed may be left in GameData, where \
+         the Manual mods tab lists them",
+        inst.config.name,
+        stash.display(),
+        stash.display()
+    )
 }
 
 /// Moves files set aside by [`set_aside`] back into the game.
@@ -883,6 +950,123 @@ mod tests {
         assert!(crate::instance::delete(&inst).is_err());
         crate::running::clear(&inst.dir, std::process::id());
         unchanged("running");
+    }
+
+    #[test]
+    fn apply_handles_partial_set_aside_folder_swaps_and_leftovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ksp = tmp.path().join("ksp");
+        fake_ksp(&ksp);
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let config = Config::default();
+        let inst = crate::instance::create(
+            &paths,
+            &CreateOptions {
+                name: "t".into(),
+                source: ksp,
+                stock_only: true,
+                with_saves: false,
+                mode: CopyMode::Copy,
+            },
+            &mut |_, _| {},
+        )
+        .expect("create");
+        let mk = |id: &str, v: &str, files: &[&str]| -> Module {
+            let url = zip_with(&tmp.path().join(format!("{id}-{v}.zip")), files);
+            serde_json::from_value(serde_json::json!({
+                "identifier": id, "version": v, "ksp_version": "1.12", "download": url,
+            }))
+            .expect("module")
+        };
+        let index = Index::from_modules(
+            vec![
+                mk(
+                    "Two",
+                    "1.0",
+                    &["GameData/Two/a/one.dll", "GameData/Two/b/two.dll"],
+                ),
+                mk("Dir", "1.0", &["GameData/Dir/cache/item.cfg"]),
+                mk("Dir", "2.0", &["GameData/Dir/cache"]),
+                mk(
+                    "Dup",
+                    "1.0",
+                    &["GameData/Dup/Readme.txt", "GameData/Dup/README.txt"],
+                ),
+            ],
+            HashMap::new(),
+            0,
+        );
+        let (tx, _rx) = mpsc::channel();
+        let run = |req: Request| {
+            let p = plan(&inst, &index, &req).expect("io").expect("resolves");
+            apply(&paths, &config, &inst, &p, &tx, &Cancel::default())
+        };
+        let g = inst.game_dir();
+        let stash = inst.dir.join(STASH);
+
+        // Files differing only in case within one mod install together.
+        run(Request {
+            install: vec![("Dup".into(), None), ("Two".into(), None)],
+            ..Request::default()
+        })
+        .expect("install");
+
+        // Setting aside fails on the second file: the first comes back.
+        fs::set_permissions(g.join("GameData/Two/b"), fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let err = run(Request {
+            remove: vec!["Two".into()],
+            ..Request::default()
+        })
+        .expect_err("can't move two.dll");
+        fs::set_permissions(g.join("GameData/Two/b"), fs::Permissions::from_mode(0o755))
+            .expect("chmod back");
+        assert!(
+            format!("{err:#}").contains("nothing was changed"),
+            "{err:#}"
+        );
+        assert!(
+            g.join("GameData/Two/a/one.dll").is_file(),
+            "the moved file is back"
+        );
+        assert!(g.join("GameData/Two/b/two.dll").is_file());
+        assert!(inst.registry().expect("registry").mods.contains_key("Two"));
+        assert!(!stash.exists());
+
+        // An upgrade may put a file where the old version had a folder.
+        run(Request {
+            install: vec![("Dir".into(), Some(crate::version::ModVersion::new("1.0")))],
+            ..Request::default()
+        })
+        .expect("Dir 1.0");
+        run(Request {
+            upgrade: vec!["Dir".into()],
+            ..Request::default()
+        })
+        .expect("Dir 2.0");
+        assert!(g.join("GameData/Dir/cache").is_file());
+
+        // A stash left by a change that was saved is cleared on the next one.
+        fs::create_dir_all(stash.join("old")).expect("mkdir");
+        let current = serde_json::to_vec(&inst.registry().expect("registry")).expect("json");
+        fs::write(stash.join(COMMITTED), current).expect("write");
+        run(Request {
+            remove: vec!["Dup".into()],
+            ..Request::default()
+        })
+        .expect("leftover from a finished change is cleared");
+        assert!(!stash.exists());
+
+        // One left by an interrupted change stops the next change.
+        fs::create_dir_all(stash.join("two/GameData/Two")).expect("mkdir");
+        let err = run(Request {
+            remove: vec!["Two".into()],
+            ..Request::default()
+        })
+        .expect_err("interrupted change");
+        assert!(format!("{err:#}").contains("interrupted"), "{err:#}");
+        assert!(g.join("GameData/Two/a/one.dll").is_file());
     }
 
     #[test]

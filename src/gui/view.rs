@@ -249,7 +249,7 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                                         }
                                     };
                                 let idle = !app.busy();
-                                item(ui, "Launch", Msg::Launch, true);
+                                item(ui, "Launch", Msg::Launch, idle);
                                 ui.separator();
                                 item(ui, "Clone...", Msg::OpenClone, idle);
                                 item(ui, "Rename...", Msg::OpenRename, true);
@@ -272,7 +272,7 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 .fill(GOOD)
                 .stroke(egui::Stroke::NONE);
                 if ui
-                    .add_enabled(has, launch)
+                    .add_enabled(has && !app.busy(), launch)
                     .on_hover_text("Run this instance through Proton")
                     .clicked()
                 {
@@ -375,7 +375,7 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             msgs.push(Msg::SetGrouped(grouped));
         }
         if app.grouped {
-            let searching = !app.search.trim().is_empty() || app.starred_only;
+            let searching = app.searching();
             if ui
                 .add_enabled(!searching, egui::Button::new("Expand all").small())
                 .on_hover_text("zR")
@@ -418,18 +418,34 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     let width = ui.available_width();
     let cols = columns(width);
     header(ui, &cols, app.sort, msgs);
+    if app.items.is_empty() {
+        let text = if !app.search.trim().is_empty() {
+            "No mods match the search."
+        } else if app.filter == Filter::Upgradable {
+            "Everything is up to date."
+        } else if app.starred_only {
+            "No starred mods here."
+        } else {
+            "No mods here yet."
+        };
+        ui.add_space(16.0);
+        ui.label(RichText::new(text).color(theme::MUTED));
+        return;
+    }
     let step = ROW_H + ui.spacing().item_spacing.y;
     let mut area = egui::ScrollArea::vertical()
         .id_salt("mods")
         .auto_shrink([false, false]);
     if let Some(i) = app.scroll_to_row.take() {
         let (offset, height) = app.mods_view;
-        let line = app.row_item.get(i).copied().flatten().unwrap_or(0);
-        let top = line as f32 * step;
-        if top < offset {
-            area = area.vertical_scroll_offset(top);
-        } else if top + step > offset + height {
-            area = area.vertical_scroll_offset(top + step - height);
+        // A row in a folded category isn't in the list: leave the scroll.
+        if let Some(line) = app.row_item.get(i).copied().flatten() {
+            let top = line as f32 * step;
+            if top < offset {
+                area = area.vertical_scroll_offset(top);
+            } else if top + step > offset + height {
+                area = area.vertical_scroll_offset(top + step - height);
+            }
         }
     }
     let out = area.show_rows(ui, ROW_H, app.items.len(), |ui, range| {
@@ -439,7 +455,7 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     category,
                     count,
                     collapsed,
-                } => category_header(ui, category, *count, *collapsed, msgs),
+                } => category_header(ui, category, *count, *collapsed, app.searching(), msgs),
                 Item::Row(i) => {
                     if let Some(row) = app.rows.get(*i) {
                         mod_row(app, ui, *i, row, &cols, msgs);
@@ -456,7 +472,10 @@ fn queue_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     // never pushed out of sight.
     if ui.available_width() < 640.0 {
         ui.horizontal_wrapped(|ui| queue_buttons(app, ui, msgs));
-        ui.horizontal_wrapped(|ui| queue_status(app, ui));
+        // The hint takes a line a narrow window can't spare.
+        if !app.queue.is_empty() {
+            ui.horizontal_wrapped(|ui| queue_status(app, ui));
+        }
     } else {
         ui.horizontal(|ui| {
             queue_status(app, ui);
@@ -503,7 +522,7 @@ fn queue_buttons(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         msgs.push(Msg::ClearQueue);
     }
     let upgrades = app.rows.iter().filter(|r| r.upgradable()).count();
-    if (app.filter == Filter::Upgradable || upgrades > 0)
+    if upgrades > 0
         && ui
             .add_enabled(app.index.is_some(), egui::Button::new("Upgrade all"))
             .clicked()
@@ -747,7 +766,10 @@ fn mod_row(app: &App, ui: &mut Ui, index: usize, row: &Row, c: &Cols, msgs: &mut
         }
         name_resp
     });
-    let rect = outer.response.rect.expand2(egui::vec2(6.0, 3.0));
+    // As wide as the category headings: the full width of the list.
+    let r = outer.response.rect;
+    let rect = egui::Rect::from_min_max(r.min, egui::pos2(ui.max_rect().right(), r.max.y))
+        .expand2(egui::vec2(6.0, 3.0));
     let fill = if selected {
         theme::tint(ACCENT, 46)
     } else if removing {
@@ -785,6 +807,7 @@ fn category_header(
     category: &str,
     count: usize,
     collapsed: bool,
+    searching: bool,
     msgs: &mut Vec<Msg>,
 ) {
     let color = theme::category_color(category);
@@ -840,14 +863,14 @@ fn category_header(
         egui::FontId::proportional(12.0),
         theme::FAINT,
     );
-    if resp
-        .on_hover_text(if collapsed {
-            "Show this category"
-        } else {
-            "Fold this category"
-        })
-        .clicked()
-    {
+    let tip = if searching {
+        "A search shows every match; clear it to fold categories"
+    } else if collapsed {
+        "Show this category"
+    } else {
+        "Fold this category"
+    };
+    if resp.on_hover_text(tip).clicked() && !searching {
         msgs.push(Msg::ToggleCategory(category.to_owned()));
     }
 }
