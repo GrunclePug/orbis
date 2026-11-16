@@ -427,6 +427,22 @@ impl Resolver<'_> {
             }
         }
 
+        // A later pick can replace a version an earlier pick relied on
+        // (A needs Lib = 1, B needs Lib = 2): every new mod's dependencies
+        // must still hold in the final state.
+        for id in state
+            .iter()
+            .filter(|(_, e)| e.reason.is_some())
+            .map(|(id, _)| id)
+        {
+            if let Some(relationship) = first_missing(&state, id) {
+                return Err(ResolveError::Unsatisfiable {
+                    by: id.clone(),
+                    relationship,
+                });
+            }
+        }
+
         // Conflicts involving anything new.
         for (id, e) in &state {
             for (oid, o) in &state {
@@ -730,6 +746,41 @@ mod tests {
                 "remove P1 1 (no longer needed)",
             ]
         );
+    }
+
+    #[test]
+    fn rejects_incompatible_version_pins() {
+        let pin = |name: &str, v: &str| {
+            Relationship::Direct(Direct {
+                name: name.into(),
+                version: Some(ModVersion::new(v)),
+                min_version: None,
+                max_version: None,
+            })
+        };
+        let mut a = module("A", "1");
+        a.depends = vec![pin("Lib", "1")];
+        let mut b = module("B", "1");
+        b.depends = vec![pin("Lib", "2")];
+        let index = Index::from_modules(
+            vec![a, b, module("Lib", "1"), module("Lib", "2")],
+            HashMap::new(),
+            0,
+        );
+        let compat = [GameVersion::parse("1.12.5").expect("valid")];
+        let r = Resolver {
+            index: &index,
+            compat: &compat,
+            allow_testing: false,
+        };
+        let req = Request {
+            install: vec![("A".into(), None), ("B".into(), None)],
+            ..Request::default()
+        };
+        let err = r
+            .resolve(&[], &req)
+            .expect_err("A and B can't both be satisfied");
+        assert!(matches!(err, ResolveError::Unsatisfiable { .. }), "{err:?}");
     }
 
     #[test]

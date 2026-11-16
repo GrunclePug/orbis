@@ -297,9 +297,6 @@ pub enum CopyMode {
     /// A full, independent copy that keeps its game version. On reflink
     /// filesystems (btrfs, XFS) the copy shares data blocks and is instant.
     Copy,
-    /// Hard links, for filesystems without reflinks. Stock files are shared
-    /// with the source, so never edit them in place.
-    Hardlink,
 }
 
 /// Options for creating an instance.
@@ -337,20 +334,14 @@ pub fn create(paths: &Paths, opts: &CreateOptions, progress: CopyProgress) -> Re
             fs::canonicalize(&opts.source)
                 .with_context(|| format!("resolve {}", opts.source.display()))?,
         ),
-        CopyMode::Copy | CopyMode::Hardlink => None,
+        CopyMode::Copy => None,
     };
     let result = (|| -> Result<Instance> {
         match &base {
             Some(base) => build_linked(base, &partial.join("game"), opts.with_saves, progress)?,
             None => {
                 let files = collect(&opts.source, opts)?;
-                copy_tree(
-                    &opts.source,
-                    &partial.join("game"),
-                    &files,
-                    opts.mode,
-                    progress,
-                )?;
+                copy_tree(&opts.source, &partial.join("game"), &files, progress)?;
             }
         }
         for d in [
@@ -481,7 +472,7 @@ fn build_linked(base: &Path, game: &Path, with_saves: bool, progress: CopyProgre
             is_in(&OWNED, first) && !first.eq_ignore_ascii_case("GameData")
         })
         .collect();
-    copy_tree(base, game, &owned, CopyMode::Copy, progress)?;
+    copy_tree(base, game, &owned, progress)?;
     fs::create_dir_all(game.join("GameData")).context("create GameData")?;
     link_missing(base, game)?;
     Ok(())
@@ -665,7 +656,6 @@ fn copy_tree(
     src: &Path,
     dest: &Path,
     files: &[(String, fs::FileType)],
-    mode: CopyMode,
     progress: CopyProgress,
 ) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
@@ -680,8 +670,6 @@ fn copy_tree(
                 fs::read_link(&from).with_context(|| format!("read link {}", from.display()))?;
             std::os::unix::fs::symlink(&target, &to)
                 .with_context(|| format!("link {}", to.display()))?;
-        } else if mode == CopyMode::Hardlink && fs::hard_link(&from, &to).is_ok() {
-            // Linked.
         } else {
             fs::copy(&from, &to).with_context(|| format!("copy {rel}"))?;
         }

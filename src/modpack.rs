@@ -444,6 +444,15 @@ pub fn import(
             ));
             continue;
         }
+        // The id and file name come from the pack: they must be plain names,
+        // or extraction could land outside the scratch folder.
+        if !plain_name(&info.id) || !plain_name(&info.file) {
+            warnings.push(format!(
+                "manual mod {}: unsafe name in the pack; skipped",
+                info.name
+            ));
+            continue;
+        }
         let dest = scratch.join(&info.id);
         extract_prefix(&opts.path, &format!("manual/{}/", info.id), &dest)?;
         let added = manual::add(
@@ -527,7 +536,7 @@ pub fn import(
     for m in manual_to_install {
         cancel.check()?;
         status(format!("Installing {}", m.name));
-        let result = ops::plan_manual(&inst, index, &m).and_then(|p| {
+        let result = ops::plan_manual(&inst, index, &m, &Default::default()).and_then(|p| {
             let plan = p.map_err(|e| anyhow::anyhow!("{e}"))?;
             ops::apply(paths, config, &inst, &plan, events, cancel)
         });
@@ -540,6 +549,11 @@ pub fn import(
         instance: inst,
         warnings,
     })
+}
+
+/// A single path component that stays where it is joined.
+fn plain_name(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
 }
 
 fn is_zip(path: &Path) -> bool {
@@ -663,7 +677,7 @@ mod tests {
             },
         )
         .expect("add manual");
-        let p = ops::plan_manual(&src, &index, &m)
+        let p = ops::plan_manual(&src, &index, &m, &Default::default())
             .expect("io")
             .expect("plan");
         ops::apply(&paths, &config, &src, &p, &tx, &Cancel::default()).expect("apply manual");
@@ -731,6 +745,44 @@ mod tests {
         assert!(reg.mods["Lib"].auto_installed);
         assert!(!reg.mods["App"].auto_installed);
         assert!(reg.mods.contains_key("manual:clouds"));
+
+        // A pack whose manual mod id climbs out of the scratch folder is
+        // refused instead of extracted.
+        let evil = tmp.path().join("evil.orbispack");
+        {
+            let mut p = read(&tmp.path().join("pack.orbispack")).expect("read");
+            p.manual[0].info.id = "../../escaped".into();
+            let mut w = zip::ZipWriter::new(File::create(&evil).expect("create"));
+            let o = zip::write::SimpleFileOptions::default();
+            w.start_file("pack.toml", o).expect("start");
+            w.write_all(toml::to_string(&p).expect("toml").as_bytes())
+                .expect("write");
+            w.start_file("manual/../../escaped/x.zip", o)
+                .expect("start");
+            w.write_all(b"payload").expect("write");
+            w.finish().expect("finish");
+        }
+        let report = import(
+            &paths,
+            &config,
+            &index,
+            &ImportOptions {
+                path: evil,
+                name: "Evil".into(),
+                base: ksp.clone(),
+                exact: true,
+            },
+            &tx,
+            &Cancel::default(),
+        )
+        .expect("import");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("unsafe name")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(!paths.cache.join("../escaped").exists());
+        assert!(!paths.data.join("../escaped").exists());
 
         // CKAN format lists only what was asked for.
         let ckan = tmp.path().join("pack.ckan");

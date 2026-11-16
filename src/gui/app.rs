@@ -389,7 +389,8 @@ pub enum Msg {
 pub enum Done {
     IndexLoaded(Result<Option<Index>, String>),
     IndexUpdated(Result<(repo::UpdateSummary, Index), String>),
-    Applied(Result<(), String>),
+    /// The instance the changes were applied to, and the outcome.
+    Applied(String, Result<(), String>),
     InstanceCreated(Result<Instance, String>),
     ManualAdded(Result<ManualMod, String>),
     Exported(Result<(PathBuf, Vec<String>), String>),
@@ -560,9 +561,7 @@ impl App {
         app.queues = prefs.queues.clone();
         app.saved_prefs = prefs;
         app.reload();
-        if let Some(sel) = &app.selected {
-            app.queue = app.queues.remove(sel).unwrap_or_default();
-        }
+        // Pick the starting instance before taking its unapplied changes.
         if let Some(key) = &opts.instance
             && let Some(v) = app
                 .instances
@@ -570,6 +569,9 @@ impl App {
                 .find(|v| &v.inst.id == key || v.inst.config.name.eq_ignore_ascii_case(key))
         {
             app.selected = Some(v.inst.id.clone());
+        }
+        if let Some(sel) = &app.selected {
+            app.queue = app.queues.remove(sel).unwrap_or_default();
         }
         app.tab = match opts.tab.as_deref() {
             Some("manual") => Tab::Manual,
@@ -1146,12 +1148,18 @@ impl App {
                     Err(e) => self.error(format!("Restore failed: {e}")),
                 }
             }
-            Done::Applied(r) => {
+            Done::Applied(id, r) => {
                 self.reload();
                 match r {
                     Ok(()) => {
-                        self.queue = Queue::default();
-                        self.choices.clear();
+                        // The user may have switched instances meanwhile:
+                        // clear the queue of the instance that was changed.
+                        if self.selected.as_ref() == Some(&id) {
+                            self.queue = Queue::default();
+                            self.choices.clear();
+                        } else {
+                            self.queues.remove(&id);
+                        }
                         self.note("Changes applied");
                     }
                     Err(e) => self.error(format!("Applying changes failed: {e}")),
@@ -2076,7 +2084,7 @@ impl App {
         let Some(view) = self.current() else { return };
         let empty = Arc::new(Index::default());
         let index = self.index.clone().unwrap_or(empty);
-        let result = ops::plan_manual(&view.inst, &index, &m);
+        let result = ops::plan_manual(&view.inst, &index, &m, &self.choices);
         self.show_plan(result, Some(m));
     }
 
@@ -2148,6 +2156,7 @@ impl App {
     fn start_apply(&mut self, plan: Plan) {
         let Some(view) = self.current() else { return };
         let inst = view.inst.clone();
+        let id = inst.id.clone();
         let paths = self.ctx.paths.clone();
         let config = self.ctx.config.clone();
         let egui = self.egui.clone();
@@ -2155,7 +2164,7 @@ impl App {
             let r = forward_events(tx, &egui, |etx| {
                 ops::apply(&paths, &config, &inst, &plan, etx, cancel)
             });
-            Done::Applied(r.map_err(task_error))
+            Done::Applied(id, r.map_err(task_error))
         });
     }
 

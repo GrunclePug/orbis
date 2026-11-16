@@ -192,9 +192,22 @@ pub fn restore_plan(
 
 /// After a restore, puts the dependency flags back as they were.
 pub fn restore_flags(inst: &Instance, target: &[SnapMod]) -> Result<()> {
+    set_flags(inst, target, false)
+}
+
+/// Before a restore: marks mods the target chose as chosen, so they can't
+/// be removed as orphans part-way. Never demotes (that waits for
+/// [`restore_flags`] at the end, once their dependents are back).
+pub fn promote_chosen(inst: &Instance, target: &[SnapMod]) -> Result<()> {
+    set_flags(inst, target, true)
+}
+
+fn set_flags(inst: &Instance, target: &[SnapMod], promote_only: bool) -> Result<()> {
     let mut reg = inst.registry()?;
     for t in target {
-        if let Some(m) = reg.mods.get_mut(&t.identifier) {
+        if let Some(m) = reg.mods.get_mut(&t.identifier)
+            && !(promote_only && t.auto)
+        {
             m.auto_installed = t.auto;
         }
     }

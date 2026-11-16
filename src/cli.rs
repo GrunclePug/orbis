@@ -262,10 +262,6 @@ pub enum InstanceCmd {
         /// With --copy: copy non-stock GameData too (mods orbis won't know about).
         #[arg(long, requires = "copy")]
         keep_mods: bool,
-        /// With --copy: hard-link files instead of copying (for filesystems
-        /// without reflinks).
-        #[arg(long, requires = "copy")]
-        hardlink: bool,
     },
     /// Choose how an instance starts: "direct" (Proton) or "steam" (through
     /// Steam, for the overlay and playtime).
@@ -1148,7 +1144,6 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             with_saves,
             copy,
             keep_mods,
-            hardlink,
         } => {
             let source = match from {
                 Some(p) => p,
@@ -1162,11 +1157,7 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
                 source,
                 stock_only: !keep_mods,
                 with_saves,
-                mode: match (copy, hardlink) {
-                    (false, _) => CopyMode::Link,
-                    (true, false) => CopyMode::Copy,
-                    (true, true) => CopyMode::Hardlink,
-                },
+                mode: if copy { CopyMode::Copy } else { CopyMode::Link },
             };
             let inst = instance::create(&ctx.paths, &opts, progress)?;
             eprintln!();
@@ -1426,7 +1417,8 @@ fn manual_cmd(ctx: &Context, cmd: ManualCmd) -> Result<()> {
             let inst = ctx.instance(instance.as_deref())?;
             let m = manual::find(&ctx.paths, &id)?;
             let index = Index::load(&ctx.paths)?.unwrap_or_default();
-            let p = match ops::plan_manual(&inst, &index, &m)? {
+            let choices = with_choices(Request::default(), &plan.choose)?.choices;
+            let p = match ops::plan_manual(&inst, &index, &m, &choices)? {
                 Ok(p) => p,
                 Err(e) => return Err(explain(e)),
             };
