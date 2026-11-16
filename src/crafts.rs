@@ -42,9 +42,6 @@ use crate::paths::{self, Paths};
 use crate::running;
 use parts::PartIndex;
 
-/// Revisions kept per craft (the newest is always kept).
-const KEEP_REVISIONS: usize = 20;
-
 /// Missing craft in one save beyond this many wait for confirmation instead
 /// of counting as deletions.
 const MAX_SILENT_DELETES: usize = 3;
@@ -131,11 +128,23 @@ impl Craft {
     }
 }
 
+/// What's left of a craft after the trash is emptied: enough to recognize
+/// leftover copies of it, so they never come back as new craft.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Purged {
+    pub id: String,
+    pub name: String,
+    pub facility: Facility,
+    pub hashes: Vec<String>,
+}
+
 /// Every craft orbis knows.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Library {
     pub next_id: u64,
     pub crafts: Vec<Craft>,
+    #[serde(default)]
+    pub purged: Vec<Purged>,
 }
 
 fn root(paths: &Paths) -> PathBuf {
@@ -216,6 +225,22 @@ impl Library {
             .position(|c| c.live() && c.facility == fac && c.name.eq_ignore_ascii_case(name))
     }
 
+    /// Whether these bytes, under this name, are a copy of a deleted craft
+    /// (in the trash, or purged from it). Returns its name.
+    fn deleted_copy(&self, fac: Facility, name: &str, hash: &str) -> Option<String> {
+        let same = |f: Facility, n: &str| f == fac && n.eq_ignore_ascii_case(name);
+        self.crafts
+            .iter()
+            .find(|c| !c.live() && same(c.facility, &c.name) && c.has(hash))
+            .map(|c| c.name.clone())
+            .or_else(|| {
+                self.purged
+                    .iter()
+                    .find(|p| same(p.facility, &p.name) && p.hashes.iter().any(|h| h == hash))
+                    .map(|p| p.name.clone())
+            })
+    }
+
     /// The craft a user means: an id, or a name (live craft first).
     pub fn find(&self, key: &str) -> Result<&Craft> {
         self.get(key)
@@ -232,9 +257,16 @@ impl Library {
             .with_context(|| format!("no craft {key:?} in the library"))
     }
 
-    /// `base`, or `base (<hint>)`, `base (<hint> 2)`, ... whichever is free.
-    fn unique_name(&self, fac: Facility, base: &str, hint: &str) -> String {
-        if self.live_named(fac, base).is_none() {
+    /// `base`, or `base (<hint>)`, `base (<hint> 2)`, ... whichever no live
+    /// craft has and `free` accepts.
+    fn unique_name(
+        &self,
+        fac: Facility,
+        base: &str,
+        hint: &str,
+        free: &dyn Fn(&str) -> bool,
+    ) -> String {
+        if self.live_named(fac, base).is_none() && free(base) {
             return base.to_owned();
         }
         for n in 1.. {
@@ -243,25 +275,28 @@ impl Library {
                 (false, _) => format!("{base} ({hint} {n})"),
                 (true, _) => format!("{base} ({})", n + 1),
             };
-            if self.live_named(fac, &name).is_none() {
+            if self.live_named(fac, &name).is_none() && free(&name) {
                 return name;
             }
         }
         unreachable!("the loop above always returns")
     }
 
-    /// Adds a new craft named `name` (made unique with `hint`), rewriting
-    /// the file's ship name to match. Returns its index and stored bytes.
+    /// Adds a new craft named `name` (made unique with `hint` and `free`),
+    /// rewriting the file's ship name to match. Returns its index and stored
+    /// bytes.
+    #[expect(clippy::too_many_arguments, reason = "one call shape, all needed")]
     fn add(
         &mut self,
         paths: &Paths,
         fac: Facility,
         name: &str,
         hint: &str,
+        free: &dyn Fn(&str) -> bool,
         bytes: &[u8],
         from: &str,
     ) -> Result<(usize, Vec<u8>)> {
-        let name = self.unique_name(fac, name, hint);
+        let name = self.unique_name(fac, name, hint, free);
         let bytes = if parts::read_craft(&String::from_utf8_lossy(bytes)).ship == name {
             bytes.to_vec()
         } else {
@@ -281,14 +316,8 @@ impl Library {
         Ok((self.crafts.len() - 1, bytes))
     }
 
-    /// Drops old revisions and files nothing refers to any more.
+    /// Deletes stored files no revision refers to any more.
     fn prune(&mut self, paths: &Paths) -> Result<()> {
-        for c in &mut self.crafts {
-            if c.revisions.len() > KEEP_REVISIONS {
-                let extra = c.revisions.len() - KEEP_REVISIONS;
-                c.revisions.drain(..extra);
-            }
-        }
         let used: BTreeSet<&str> = self
             .crafts
             .iter()
@@ -665,6 +694,7 @@ fn collect(paths: &Paths, lib: &mut Library, w: &mut Work, report: &mut Report) 
     w.state.pending.retain(|l| existing.contains(&l.save));
     for save in w.saves.clone() {
         let label = format!("{}/{save}", w.inst.config.name);
+        let mut missing = Vec::new();
         for fac in Facility::ALL {
             let dir = game.join("saves").join(&save).join("Ships").join(fac.dir());
             if !dir.is_dir() {
@@ -679,7 +709,7 @@ fn collect(paths: &Paths, lib: &mut Library, w: &mut Work, report: &mut Report) 
                     continue;
                 }
             };
-            collect_dir(
+            missing.extend(collect_dir(
                 paths,
                 lib,
                 w,
@@ -692,10 +722,54 @@ fn collect(paths: &Paths, lib: &mut Library, w: &mut Work, report: &mut Report) 
                     label: &label,
                     found,
                 },
-            )?;
+            )?);
         }
+        settle_missing(lib, w, report, &label, missing);
     }
     Ok(())
+}
+
+/// Decides what craft that vanished from one save mean: deletions, or, when
+/// many vanished at once, a question for the user.
+fn settle_missing(
+    lib: &mut Library,
+    w: &mut Work,
+    report: &mut Report,
+    label: &str,
+    missing: Vec<Location>,
+) {
+    if missing.len() > MAX_SILENT_DELETES {
+        report.notes.push(format!(
+            "{} craft went missing from {label} at once; confirm or put them back on the Crafts tab",
+            missing.len()
+        ));
+        w.state.pending.extend(missing);
+        return;
+    }
+    for loc in missing {
+        let Some(ci) = lib.index_of(&loc.id) else {
+            continue;
+        };
+        let c = &mut lib.crafts[ci];
+        if !c.live() {
+            continue;
+        }
+        if c.head().hash == loc.hash {
+            c.deleted = Some(Deleted {
+                at: paths::now_secs(),
+                from: label.to_owned(),
+            });
+            report.notes.push(format!(
+                "Deleted {} (in {label}); it's in the trash",
+                c.name
+            ));
+        } else {
+            report.notes.push(format!(
+                "Kept {}: deleted in {label}, but changed elsewhere",
+                c.name
+            ));
+        }
+    }
 }
 
 struct CollectCtx<'a> {
@@ -707,16 +781,26 @@ struct CollectCtx<'a> {
     found: Vec<Found>,
 }
 
+/// Reads one save's VAB or SPH folder into the library. Returns the tracked
+/// craft that are gone from it.
 fn collect_dir(
     paths: &Paths,
     lib: &mut Library,
     w: &mut Work,
     report: &mut Report,
     cx: &CollectCtx<'_>,
-) -> Result<()> {
+) -> Result<Vec<Location>> {
     let (save, fac, label, found) = (cx.save, cx.fac, cx.label, &cx.found);
     let find = |path: &str| found.iter().position(|f| f.path.eq_ignore_ascii_case(path));
     let mut claimed = vec![false; found.len()];
+    // A new name must be free on disk too, so a rename never overwrites.
+    let free_beside = |path: &str| {
+        let path = path.to_owned();
+        move |name: &str| {
+            let to = with_stem(&path, name);
+            to.eq_ignore_ascii_case(&path) || !occupied(cx.dir, &to)
+        }
+    };
     // A pending file that came back is just a file again.
     w.state
         .pending
@@ -792,9 +876,46 @@ fn collect_dir(
             loc.hash.clone_from(&f.hash);
             keep.push(loc);
         } else {
-            // Changed here and elsewhere: keep this version as its own craft.
+            // Changed here and elsewhere: keep this version as its own craft,
+            // or join an earlier copy of the very same change.
             let base = craft.name.clone();
-            let (ni, bytes) = lib.add(paths, fac, &base, save, &f.bytes, label)?;
+            let prefix = format!("{base} (");
+            let earlier = lib.crafts.iter().position(|o| {
+                o.live()
+                    && o.facility == fac
+                    && o.id != loc.id
+                    && o.name.starts_with(&prefix)
+                    && sha(&set_ship_name(&f.bytes, &o.name)) == o.head().hash
+                    && !keep
+                        .iter()
+                        .chain(&add_locations)
+                        .any(|l| l.is_in(save, fac) && l.id == o.id)
+            });
+            if let Some(oi) = earlier {
+                let o = &lib.crafts[oi];
+                let bytes = set_ship_name(&f.bytes, &o.name);
+                let new_path = with_stem(&f.path, &o.name);
+                if free_beside(&f.path)(&o.name) {
+                    rename_in_place(cx.dir, &f.path, &new_path, &bytes)?;
+                    add_locations.push(Location {
+                        save: save.to_owned(),
+                        facility: fac,
+                        path: new_path,
+                        id: o.id.clone(),
+                        hash: o.head().hash.clone(),
+                    });
+                    continue;
+                }
+            }
+            let (ni, bytes) = lib.add(
+                paths,
+                fac,
+                &base,
+                save,
+                &free_beside(&f.path),
+                &f.bytes,
+                label,
+            )?;
             let new_name = lib.crafts[ni].name.clone();
             let new_path = with_stem(&f.path, &new_name);
             rename_in_place(cx.dir, &f.path, &new_path, &bytes)?;
@@ -818,7 +939,11 @@ fn collect_dir(
         let moved = found
             .iter()
             .enumerate()
-            .find(|(i, f)| !claimed[*i] && f.hash == loc.hash)
+            .find(|(i, f)| {
+                !claimed[*i]
+                    && f.hash == loc.hash
+                    && stem(&f.path).eq_ignore_ascii_case(stem(&loc.path))
+            })
             .map(|(i, _)| i);
         match moved {
             Some(i) => {
@@ -827,38 +952,6 @@ fn collect_dir(
                 keep.push(loc);
             }
             None => still_missing.push(loc),
-        }
-    }
-    if still_missing.len() > MAX_SILENT_DELETES {
-        report.notes.push(format!(
-            "{} craft went missing from {label} at once; confirm or put them back on the Crafts tab",
-            still_missing.len()
-        ));
-        w.state.pending.extend(still_missing);
-    } else {
-        for loc in still_missing {
-            let Some(ci) = lib.index_of(&loc.id) else {
-                continue;
-            };
-            let c = &mut lib.crafts[ci];
-            if !c.live() {
-                continue;
-            }
-            if c.head().hash == loc.hash {
-                c.deleted = Some(Deleted {
-                    at: paths::now_secs(),
-                    from: label.to_owned(),
-                });
-                report.notes.push(format!(
-                    "Deleted {} (in {label}); it's in the trash",
-                    c.name
-                ));
-            } else {
-                report.notes.push(format!(
-                    "Kept {}: deleted in {label}, but changed elsewhere",
-                    c.name
-                ));
-            }
         }
     }
 
@@ -874,7 +967,8 @@ fn collect_dir(
             continue;
         }
         let name = stem(&f.path).to_owned();
-        if let Some(ci) = lib.live_named(fac, &name) {
+        let live = lib.live_named(fac, &name);
+        if let Some(ci) = live {
             let c = &lib.crafts[ci];
             if c.has(&f.hash) && !located.contains(&c.id) {
                 located.insert(c.id.clone());
@@ -887,8 +981,26 @@ fn collect_dir(
                 });
                 continue;
             }
+        }
+        if let Some(gone) = lib.deleted_copy(fac, &name, &f.hash) {
+            // A leftover copy of a deleted craft never brings it back.
+            remove_craft_file(cx.dir, &f.path)?;
+            report.notes.push(format!(
+                "Removed a leftover copy of deleted {gone} from {label}"
+            ));
+            continue;
+        }
+        if live.is_some() {
             // A different craft with a taken name: add it under a new one.
-            let (ni, bytes) = lib.add(paths, fac, &name, save, &f.bytes, label)?;
+            let (ni, bytes) = lib.add(
+                paths,
+                fac,
+                &name,
+                save,
+                &free_beside(&f.path),
+                &f.bytes,
+                label,
+            )?;
             let new_name = lib.crafts[ni].name.clone();
             let new_path = with_stem(&f.path, &new_name);
             rename_in_place(cx.dir, &f.path, &new_path, &bytes)?;
@@ -906,19 +1018,7 @@ fn collect_dir(
             });
             continue;
         }
-        let stale = lib.crafts.iter().find(|c| {
-            !c.live() && c.facility == fac && c.name.eq_ignore_ascii_case(&name) && c.has(&f.hash)
-        });
-        if let Some(c) = stale {
-            // A leftover copy of a deleted craft never brings it back.
-            remove_craft_file(cx.dir, &f.path)?;
-            report.notes.push(format!(
-                "Removed a leftover copy of deleted {} from {label}",
-                c.name
-            ));
-            continue;
-        }
-        let (ni, bytes) = lib.add(paths, fac, &name, save, &f.bytes, label)?;
+        let (ni, bytes) = lib.add(paths, fac, &name, save, &|_| true, &f.bytes, label)?;
         if bytes != f.bytes {
             // Its ship name didn't match the file name.
             write_craft(cx.dir, &f.path, &bytes)?;
@@ -942,7 +1042,7 @@ fn collect_dir(
     }
     keep.extend(add_locations);
     w.state.locations = keep;
-    Ok(())
+    Ok(still_missing)
 }
 
 fn write_craft(dir: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
@@ -957,12 +1057,27 @@ fn remove_craft_file(dir: &Path, rel: &str) -> Result<()> {
     Ok(())
 }
 
+/// Moves a craft file to a new name with new bytes; never overwrites
+/// another file.
 fn rename_in_place(dir: &Path, from: &str, to: &str, bytes: &[u8]) -> Result<()> {
+    let same = from.eq_ignore_ascii_case(to);
+    if !same && occupied(dir, to) {
+        bail!("{} already exists", dir.join(to).display());
+    }
     write_craft(dir, to, bytes)?;
-    if !from.eq_ignore_ascii_case(to) {
+    if !same {
         remove_craft_file(dir, from)?;
     }
     Ok(())
+}
+
+/// Whether a file exists at `rel` under `dir`, ignoring case as Windows does.
+fn occupied(dir: &Path, rel: &str) -> bool {
+    let (parent, file) = match rel.rsplit_once('/') {
+        Some((p, f)) => (dir.join(p), f),
+        None => (dir.to_path_buf(), rel),
+    };
+    taken(&parent, file)
 }
 
 /// Whether a revision can be built in an instance with this index.
@@ -982,12 +1097,17 @@ fn deploy(paths: &Paths, lib: &Library, w: &mut Work, report: &mut Report) -> Re
             .join(&loc.save)
             .join("Ships")
             .join(loc.facility.dir());
-        let Some(craft) = lib.get(&loc.id) else {
-            continue;
-        };
         // Only touch a file that is still what orbis last saw.
         let current = fs::read(dir.join(&loc.path)).ok().map(|b| sha(&b));
-        if current.as_deref() != Some(loc.hash.as_str()) {
+        let unchanged = current.as_deref() == Some(loc.hash.as_str());
+        let Some(craft) = lib.get(&loc.id) else {
+            if unchanged && lib.purged.iter().any(|p| p.id == loc.id) {
+                remove_craft_file(&dir, &loc.path)?;
+                report.withdrawn += 1;
+            }
+            continue;
+        };
+        if !unchanged {
             keep.push(loc);
             continue;
         }
@@ -1079,7 +1199,15 @@ pub fn add_file(paths: &Paths, file: &Path) -> Result<String> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| info.ship.clone());
-    let (i, _) = lib.add(paths, fac, &file_safe(&name), "", &bytes, "upload")?;
+    let (i, _) = lib.add(
+        paths,
+        fac,
+        &file_safe(&name),
+        "",
+        &|_| true,
+        &bytes,
+        "upload",
+    )?;
     let name = lib.crafts[i].name.clone();
     lib.save(paths)?;
     Ok(name)
@@ -1135,7 +1263,15 @@ pub fn import(paths: &Paths, dir: &Path) -> Result<Imported> {
             .map(|w| w[0].as_os_str().to_string_lossy().into_owned())
             .unwrap_or_default();
         let name = stem(&f.path).to_owned();
-        let (i, _) = lib.add(paths, fac, &file_safe(&name), &save, &f.bytes, "import")?;
+        let (i, _) = lib.add(
+            paths,
+            fac,
+            &file_safe(&name),
+            &save,
+            &|_| true,
+            &f.bytes,
+            "import",
+        )?;
         let hash = lib.crafts[i].head().hash.clone();
         if let Some(game) = full
             .ancestors()
@@ -1174,7 +1310,7 @@ pub fn restore(paths: &Paths, id: &str) -> Result<String> {
         return Ok(lib.crafts[i].name.clone());
     }
     let (fac, name) = (lib.crafts[i].facility, lib.crafts[i].name.clone());
-    let free = lib.unique_name(fac, &name, "restored");
+    let free = lib.unique_name(fac, &name, "restored", &|_| true);
     if free != name {
         let bytes = set_ship_name(&read_blob(paths, &lib.crafts[i].head().hash)?, &free);
         let hash = store_blob(paths, &bytes)?;
@@ -1198,7 +1334,7 @@ pub fn fork(paths: &Paths, id: &str, hash: &str, name: &str) -> Result<String> {
     let fac = c.facility;
     let from = format!("copy of {}", c.name);
     let bytes = read_blob(paths, hash)?;
-    let (i, _) = lib.add(paths, fac, &file_safe(name), "", &bytes, &from)?;
+    let (i, _) = lib.add(paths, fac, &file_safe(name), "", &|_| true, &bytes, &from)?;
     let thumb = thumb_path(paths, hash);
     if thumb.is_file() {
         let _ = fs::copy(&thumb, thumb_path(paths, &lib.crafts[i].head().hash));
@@ -1212,9 +1348,15 @@ pub fn fork(paths: &Paths, id: &str, hash: &str, name: &str) -> Result<String> {
 pub fn empty_trash(paths: &Paths) -> Result<usize> {
     let _lock = lock(paths)?;
     let mut lib = Library::load(paths)?;
-    let before = lib.crafts.len();
-    lib.crafts.retain(Craft::live);
-    let n = before - lib.crafts.len();
+    let (live, gone): (Vec<Craft>, Vec<Craft>) = lib.crafts.drain(..).partition(Craft::live);
+    let n = gone.len();
+    lib.crafts = live;
+    lib.purged.extend(gone.into_iter().map(|c| Purged {
+        hashes: c.revisions.iter().map(|r| r.hash.clone()).collect(),
+        id: c.id,
+        name: c.name,
+        facility: c.facility,
+    }));
     lib.prune(paths)?;
     lib.save(paths)?;
     Ok(n)
@@ -1779,6 +1921,103 @@ mod tests {
         assert_eq!(l.find("Plane").expect("plane").facility, Facility::Sph);
         let again = import(&w.paths, &old.join("saves")).expect("import again");
         assert_eq!((again.added.len(), again.skipped), (0, 2));
+    }
+
+    #[test]
+    fn a_conflict_rename_never_overwrites_a_file() {
+        let w = world();
+        let a = instance(&w, "A", &[]);
+        let b = instance(&w, "B", &[]);
+        put(&a, "C.craft", &craft("C", &["pod"]));
+        sync(&w.paths).expect("sync");
+        put(&a, "C.craft", &craft("C", &["pod", "tank.1"]));
+        put(&b, "C.craft", &craft("C", &["pod", "pod"]));
+        let mine = craft("C (S)", &["tank.1", "tank.1"]);
+        put(&b, "C (S).craft", &mine);
+        sync(&w.paths).expect("sync");
+        assert_eq!(live_names(&w), ["C", "C (S 2)", "C (S)"]);
+        assert_eq!(get(&b, "C (S).craft").as_deref(), Some(mine.as_str()));
+        assert_eq!(files(&b), ["C (S 2).craft", "C (S).craft", "C.craft"]);
+    }
+
+    #[test]
+    fn the_missing_limit_counts_both_buildings_of_a_save() {
+        let w = world();
+        let a = instance(&w, "A", &[]);
+        let b = instance(&w, "B", &[]);
+        for (dir, n) in [("VAB", 1), ("VAB", 2), ("SPH", 3), ("SPH", 4)] {
+            let p = a.game_dir().join(format!("saves/S/Ships/{dir}/C{n}.craft"));
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, craft(&format!("C{n}"), &["pod"]).replace("VAB", dir)).expect("w");
+        }
+        sync(&w.paths).expect("sync");
+        for (dir, n) in [("VAB", 1), ("VAB", 2), ("SPH", 3), ("SPH", 4)] {
+            fs::remove_file(b.game_dir().join(format!("saves/S/Ships/{dir}/C{n}.craft")))
+                .expect("rm");
+        }
+        sync(&w.paths).expect("sync");
+        assert_eq!(live_names(&w).len(), 4);
+        assert_eq!(pending(&w.paths).expect("pending").len(), 4);
+    }
+
+    #[test]
+    fn copies_of_purged_craft_stay_gone() {
+        let w = world();
+        let a = instance(&w, "A", &[]);
+        let b = instance(&w, "B", &[]);
+        put(&a, "C.craft", &craft("C", &["pod"]));
+        sync(&w.paths).expect("sync");
+        running::mark(&b.dir, std::process::id(), "direct").expect("mark");
+        let id = lib(&w).find("C").expect("craft").id.clone();
+        delete(&w.paths, &id).expect("delete");
+        sync(&w.paths).expect("sync");
+        assert_eq!(empty_trash(&w.paths).expect("empty"), 1);
+        running::clear(&b.dir, std::process::id());
+        sync(&w.paths).expect("sync");
+        sync(&w.paths).expect("sync again");
+        assert!(files(&b).is_empty());
+        assert!(live_names(&w).is_empty());
+        // An untracked leftover is recognized too.
+        let c = instance(&w, "C", &[]);
+        put(&c, "C.craft", &craft("C", &["pod"]));
+        sync(&w.paths).expect("sync");
+        assert!(files(&c).is_empty() && live_names(&w).is_empty());
+    }
+
+    #[test]
+    fn a_leftover_copy_never_takes_a_new_craft_name() {
+        let w = world();
+        let a = instance(&w, "A", &[]);
+        let old = craft("X", &["pod"]);
+        put(&a, "X.craft", &old);
+        sync(&w.paths).expect("sync");
+        let id = lib(&w).find("X").expect("craft").id.clone();
+        delete(&w.paths, &id).expect("delete");
+        sync(&w.paths).expect("sync");
+        let new = craft("X", &["tank.1"]);
+        put(&a, "X.craft", &new);
+        sync(&w.paths).expect("sync");
+        let b = instance(&w, "B", &[]);
+        put(&b, "X.craft", &old);
+        sync(&w.paths).expect("sync");
+        assert_eq!(live_names(&w), ["X"]);
+        assert_eq!(get(&b, "X.craft").as_deref(), Some(new.as_str()));
+    }
+
+    #[test]
+    fn the_same_conflicting_edit_in_two_places_is_one_craft() {
+        let w = world();
+        let a = instance(&w, "A", &[]);
+        let b = instance(&w, "B", &[]);
+        let c = instance(&w, "C", &[]);
+        put(&a, "O.craft", &craft("O", &["pod"]));
+        sync(&w.paths).expect("sync");
+        put(&a, "O.craft", &craft("O", &["pod", "tank.1"]));
+        put(&b, "O.craft", &craft("O", &["pod", "pod"]));
+        put(&c, "O.craft", &craft("O", &["pod", "pod"]));
+        sync(&w.paths).expect("sync");
+        assert_eq!(live_names(&w), ["O", "O (S)"]);
+        assert_eq!(files(&c), ["O (S).craft", "O.craft"]);
     }
 
     #[test]

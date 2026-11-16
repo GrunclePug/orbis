@@ -1352,6 +1352,7 @@ impl App {
             }
             Done::Restored(r) => {
                 self.reload();
+                self.crafts_sync_wanted = true;
                 match r {
                     Ok(w) if w.is_empty() => self.note("Mod list restored"),
                     Ok(w) => self.error(format!("Restored with warnings:\n{}", w.join("\n"))),

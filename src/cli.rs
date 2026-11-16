@@ -852,6 +852,7 @@ fn history_cmd(ctx: &Context, cmd: HistoryCmd) -> Result<()> {
         for w in warnings {
             eprintln!("warning: {w}");
         }
+        sync_crafts(ctx);
         Ok(())
     };
     match cmd {
@@ -1048,7 +1049,10 @@ fn confirm_and_apply(ctx: &Context, inst: &Instance, plan: &Plan, flags: &PlanFl
             return Ok(());
         }
     }
-    with_progress(|tx| ops::apply(&ctx.paths, &ctx.config, inst, plan, tx, &Cancel::default()))
+    with_progress(|tx| ops::apply(&ctx.paths, &ctx.config, inst, plan, tx, &Cancel::default()))?;
+    // Craft that now fit (or no longer fit) follow the new mod list.
+    sync_crafts(ctx);
+    Ok(())
 }
 
 /// Runs `work` while printing its progress events to stderr.

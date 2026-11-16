@@ -4,11 +4,13 @@
 //! KSP turns `_` into `.` in part names when it loads them, and a craft names
 //! each part as `<name>_<craftID>`. The index of an instance's parts comes
 //! from the top-level `PART` nodes in its `.cfg` files, plus every part in
-//! ModuleManager's cache (`GameData/ModuleManager.ConfigCache`, the patched
-//! database from the last launch) when there is one. The raw scan can't see
+//! or ModuleManager's cache (`GameData/ModuleManager.ConfigCache`, the
+//! patched database from the last launch). The raw scan can't see
 //! parts a ModuleManager patch creates or deletes; the cache can, but only as
-//! of the last launch. The index is `confirmed` when the cache is newer than
-//! every `.cfg` file.
+//! of the last launch. So the cache is used, alone, when ModuleManager's
+//! list of the files it read (`ModuleManager.ConfigSHA`) matches the `.cfg`
+//! files there now and none is newer than the cache; the index is then
+//! `confirmed`. Otherwise the raw scan is used.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -163,10 +165,16 @@ pub fn parts_in_cache(text: &str) -> Vec<(String, String)> {
 pub struct PartIndex {
     /// Fingerprint of the files the index was built from.
     pub fingerprint: u64,
-    /// Built with a ModuleManager cache newer than every `.cfg` file.
+    /// Built from a ModuleManager cache that matches today's files.
     pub confirmed: bool,
     /// Part name -> the GameData folder that defines it.
     pub parts: BTreeMap<String, String>,
+    /// The ModuleManager cache's modification time and the DLLs present when
+    /// orbis first saw that cache. ModuleManager doesn't list DLLs, yet they
+    /// decide its `:NEEDS` patches, so a different set means the cache is
+    /// out of date until the next launch rebuilds it.
+    #[serde(default)]
+    pub cache_dlls: Option<(u64, Vec<String>)>,
 }
 
 impl PartIndex {
@@ -181,32 +189,85 @@ impl PartIndex {
 }
 
 const CACHE_FILE: &str = "ModuleManager.ConfigCache";
+/// ModuleManager's list of the `.cfg` files its cache was built from.
+const SHA_FILE: &str = "ModuleManager.ConfigSHA";
+
+/// The `.cfg` files ModuleManager says its cache covers.
+fn cache_files(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    scan(text, |e, depth| {
+        if let Event::Value("filename", v) = e
+            && depth == 2
+        {
+            out.insert(v.trim_start_matches('/').to_owned());
+        }
+    });
+    out
+}
 
 /// Bumped whenever parsing changes, so cached indexes are rebuilt.
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 
 /// The index of `game`'s parts, reusing `cache` (a JSON file) when nothing
 /// changed since it was built.
 pub fn index(game: &Path, cache: &Path) -> Result<PartIndex> {
     let gamedata = game.join("GameData");
     let mut cfgs = Vec::new();
-    walk_cfgs(&gamedata, "", 0, &mut cfgs);
+    let mut dlls = Vec::new();
+    walk_files(&gamedata, "", 0, &mut cfgs, &mut dlls);
     cfgs.sort();
+    dlls.sort();
     let mm = gamedata.join(CACHE_FILE);
     let mm_meta = fs::metadata(&mm).ok().map(|m| (m.len(), mtime(&m)));
+    let sha_file = gamedata.join(SHA_FILE);
+    let sha_meta = fs::metadata(&sha_file).ok().map(|m| (m.len(), mtime(&m)));
     let mut h = DefaultHasher::new();
     INDEX_VERSION.hash(&mut h);
     cfgs.hash(&mut h);
+    dlls.hash(&mut h);
     mm_meta.hash(&mut h);
+    sha_meta.hash(&mut h);
     let fingerprint = h.finish();
-    if let Ok(text) = fs::read_to_string(cache)
-        && let Ok(old) = serde_json::from_str::<PartIndex>(&text)
+    let old = fs::read_to_string(cache)
+        .ok()
+        .and_then(|t| serde_json::from_str::<PartIndex>(&t).ok());
+    if let Some(old) = &old
         && old.fingerprint == fingerprint
     {
-        return Ok(old);
+        return Ok(old.clone());
     }
+    let dll_names: Vec<String> = dlls.iter().map(|(n, _, _)| n.clone()).collect();
+    // The DLL set orbis first saw with this cache stays its baseline.
+    let cache_dlls = mm_meta.map(|(_, t)| match old.and_then(|o| o.cache_dlls) {
+        Some((seen, set)) if seen == t => (seen, set),
+        _ => (t, dll_names.clone()),
+    });
+    // ModuleManager's cache is the patched part list from the last launch.
+    // It is the whole truth when it covers exactly today's files and none
+    // changed since; otherwise read the files themselves.
+    let newest = cfgs
+        .iter()
+        .chain(&dlls)
+        .map(|(_, _, t)| *t)
+        .max()
+        .unwrap_or(0);
+    let fresh = mm_meta.is_some_and(|(_, t)| t >= newest)
+        && cache_dlls
+            .as_ref()
+            .is_some_and(|(_, set)| *set == dll_names)
+        && fs::read(&sha_file).is_ok_and(|b| {
+            let listed = cache_files(&String::from_utf8_lossy(&b));
+            listed.len() == cfgs.len() && cfgs.iter().all(|(rel, _, _)| listed.contains(rel))
+        });
     let mut parts = BTreeMap::new();
-    for (rel, _, _) in &cfgs {
+    if fresh {
+        let bytes = fs::read(&mm).with_context(|| format!("read {}", mm.display()))?;
+        for (p, folder) in parts_in_cache(&String::from_utf8_lossy(&bytes)) {
+            parts.entry(p).or_insert(folder);
+        }
+    }
+    let confirmed = fresh && !parts.is_empty();
+    for (rel, _, _) in cfgs.iter().filter(|_| !confirmed) {
         let bytes = match fs::read(gamedata.join(rel)) {
             Ok(b) => b,
             Err(e) => {
@@ -219,19 +280,11 @@ pub fn index(game: &Path, cache: &Path) -> Result<PartIndex> {
             parts.entry(p).or_insert_with(|| folder.clone());
         }
     }
-    let newest_cfg = cfgs.iter().map(|(_, _, t)| *t).max().unwrap_or(0);
-    let mut confirmed = false;
-    if let Some((_, mm_time)) = mm_meta {
-        let bytes = fs::read(&mm).with_context(|| format!("read {}", mm.display()))?;
-        for (p, folder) in parts_in_cache(&String::from_utf8_lossy(&bytes)) {
-            parts.entry(p).or_insert(folder);
-        }
-        confirmed = mm_time >= newest_cfg;
-    }
     let index = PartIndex {
         fingerprint,
         confirmed,
         parts,
+        cache_dlls,
     };
     let json = serde_json::to_vec(&index).context("serialize part index")?;
     paths::write_atomic(cache, &json)?;
@@ -245,9 +298,17 @@ fn mtime(m: &fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Collects `(relative path, size, mtime)` of every `.cfg` file under `dir`,
-/// following links (stock GameData is linked in).
-fn walk_cfgs(dir: &Path, rel: &str, depth: usize, out: &mut Vec<(String, u64, u64)>) {
+type FileMeta = (String, u64, u64);
+
+/// Collects `(relative path, size, mtime)` of every `.cfg` and `.dll` file
+/// under `dir` that KSP loads, following links (stock GameData is linked in).
+fn walk_files(
+    dir: &Path,
+    rel: &str,
+    depth: usize,
+    cfgs: &mut Vec<FileMeta>,
+    dlls: &mut Vec<FileMeta>,
+) {
     if depth > 24 {
         return;
     }
@@ -265,9 +326,17 @@ fn walk_cfgs(dir: &Path, rel: &str, depth: usize, out: &mut Vec<(String, u64, u6
             continue;
         };
         if meta.is_dir() {
-            walk_cfgs(&e.path(), &child, depth + 1, out);
-        } else if name.to_lowercase().ends_with(".cfg") {
-            out.push((child, meta.len(), mtime(&meta)));
+            // KSP skips PluginData folders, and so does ModuleManager.
+            if !name.eq_ignore_ascii_case("PluginData") {
+                walk_files(&e.path(), &child, depth + 1, cfgs, dlls);
+            }
+        } else {
+            let lower = name.to_lowercase();
+            if lower.ends_with(".cfg") {
+                cfgs.push((child, meta.len(), mtime(&meta)));
+            } else if lower.ends_with(".dll") {
+                dlls.push((child, meta.len(), mtime(&meta)));
+            }
         }
     }
 }
@@ -338,6 +407,46 @@ mod tests {
             parts_in_cache(text),
             [("nfp.ion".to_owned(), "NearFuturePropulsion".to_owned())]
         );
+    }
+
+    #[test]
+    fn trusts_a_matching_modulemanager_cache_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let game = tmp.path().join("game");
+        let gd = game.join("GameData");
+        fs::create_dir_all(gd.join("Mod/PluginData")).expect("mkdir");
+        fs::write(gd.join("Mod/a.cfg"), "PART { name = raw }").expect("w");
+        fs::write(gd.join("Mod/PluginData/x.cfg"), "PART { name = ignored }").expect("w");
+        fs::write(
+            gd.join(CACHE_FILE),
+            "UrlConfig\n{\n\tparentUrl = Mod/a.cfg\n\tPART\n\t{\n\t\tname = patched\n\t}\n}\n",
+        )
+        .expect("w");
+        let sha = |files: &[&str]| {
+            let list: String = files
+                .iter()
+                .map(|f| format!("\tFILE\n\t{{\n\t\tfilename = {f}\n\t}}\n"))
+                .collect();
+            format!("SHA = x\nFilesSHA\n{{\n{list}}}\n")
+        };
+        fs::write(gd.join(SHA_FILE), sha(&["Mod/a.cfg"])).expect("w");
+        fs::write(gd.join("Mod/Mod.dll"), "dll").expect("w");
+        let cache = tmp.path().join("parts.json");
+        let idx = index(&game, &cache).expect("index");
+        assert!(idx.confirmed);
+        assert_eq!(idx.parts.keys().collect::<Vec<_>>(), ["patched"]);
+        // A DLL removed since: ModuleManager's `:NEEDS` may differ now.
+        fs::remove_file(gd.join("Mod/Mod.dll")).expect("rm");
+        let idx = index(&game, &cache).expect("index");
+        assert!(!idx.confirmed);
+        assert_eq!(idx.parts.keys().collect::<Vec<_>>(), ["raw"]);
+        // A mod removed since the last launch: the cache no longer matches.
+        fs::create_dir_all(gd.join("Other")).expect("mkdir");
+        fs::write(gd.join("Other/b.cfg"), "PART { name = other }").expect("w");
+        fs::write(gd.join(SHA_FILE), sha(&["Mod/a.cfg", "Gone/c.cfg"])).expect("w");
+        let idx = index(&game, &cache).expect("index");
+        assert!(!idx.confirmed);
+        assert_eq!(idx.parts.keys().collect::<Vec<_>>(), ["other", "raw"]);
     }
 
     #[test]
