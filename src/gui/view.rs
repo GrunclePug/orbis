@@ -864,7 +864,7 @@ fn category_header(
         theme::FAINT,
     );
     let tip = if searching {
-        "A search shows every match; clear it to fold categories"
+        "A search or Starred only shows every match; clear it to fold categories"
     } else if collapsed {
         "Show this category"
     } else {

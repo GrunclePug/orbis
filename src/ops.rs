@@ -1,6 +1,6 @@
 //! High-level operations on an instance, shared by the CLI and the GUI.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
@@ -255,6 +255,10 @@ fn apply_changes(
     let mut auto_before: HashMap<String, bool> = HashMap::new();
     let result = (|| -> Result<()> {
         std::fs::create_dir_all(&stash).with_context(|| format!("create {}", stash.display()))?;
+        // What the instance held before: if the apply dies before saving, the
+        // registry still matches this, which is how the next apply knows.
+        let before = serde_json::to_vec(&installed_files(&original)).context("serialize")?;
+        paths::write_atomic(&stash.join(BEFORE), &before)?;
         for id in &leaving {
             let Some(old) = reg.mods.remove(*id) else {
                 continue;
@@ -272,7 +276,12 @@ fn apply_changes(
             .filter_map(|id| original.mods.get(*id))
             .flat_map(|m| &m.dirs)
             .collect();
-        dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+        dirs.sort_by(|a, b| {
+            b.matches('/')
+                .count()
+                .cmp(&a.matches('/').count())
+                .then_with(|| a.cmp(b))
+        });
         dirs.dedup();
         for d in dirs {
             if install::through_link(&game, d).is_none()
@@ -307,11 +316,6 @@ fn apply_changes(
                 },
             );
         }
-        // Record what is about to be committed, so a crash between saving
-        // and clearing the stash can tell a finished change from an
-        // interrupted one.
-        let after = serde_json::to_vec(&reg).context("serialize registry")?;
-        paths::write_atomic(&stash.join(COMMITTED), &after)?;
         inst.save_registry(&reg)
     })();
     match result {
@@ -319,8 +323,8 @@ fn apply_changes(
             // Committed: the set-aside files can go, then the folders they
             // leave empty. A stash that can't be removed now is cleared on
             // the next change.
-            if let Err(e) = std::fs::remove_dir_all(&stash) {
-                log::warn!("remove {}: {e}", stash.display());
+            if let Err(e) = remove_stash(&stash) {
+                log::warn!("remove {}: {e:#}", stash.display());
             }
             for (id, _) in &stashed {
                 if let Some(old) = original.mods.get(id) {
@@ -349,8 +353,8 @@ fn apply_changes(
                 }
             }
             if lost.is_empty() {
-                if let Err(err) = std::fs::remove_dir_all(&stash) {
-                    log::warn!("remove {}: {err}", stash.display());
+                if let Err(err) = remove_stash(&stash) {
+                    log::warn!("remove {}: {err:#}", stash.display());
                 }
                 Err(e.context("nothing was changed"))
             } else {
@@ -396,25 +400,76 @@ fn set_aside(
 
 /// Where an apply sets the leaving mods' files aside, inside the instance.
 const STASH: &str = ".apply-stash";
-/// Inside the stash: the registry about to be committed.
-const COMMITTED: &str = "registry-after.json";
+/// Inside the stash: each installed mod's version and files before the
+/// apply moved anything.
+const BEFORE: &str = "installed-before.json";
 
-/// Deals with a stash an earlier apply left behind. If the instance's
-/// registry is the one that apply was committing, the change finished and
-/// the stash is only leftover old files: it is deleted. Otherwise the apply
-/// was interrupted before saving, and the user is told how to recover.
+/// Each installed mod's version and files: what decides whether an apply
+/// was saved. Flags such as "installed as a dependency" are left out, since
+/// they change without any file moving.
+fn installed_files(reg: &Registry) -> BTreeMap<String, (String, Vec<String>)> {
+    reg.mods
+        .iter()
+        .map(|(id, m)| (id.clone(), (m.version().to_string(), m.files.clone())))
+        .collect()
+}
+
+/// Whether a folder holds any file (in subfolders too), apart from the
+/// stash marker at its top.
+fn holds_files(dir: &std::path::Path, top: bool) -> Result<bool> {
+    for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let e = e.with_context(|| format!("read {}", dir.display()))?;
+        let ft = e
+            .file_type()
+            .with_context(|| format!("stat {}", e.path().display()))?;
+        if ft.is_dir() {
+            if holds_files(&e.path(), false)? {
+                return Ok(true);
+            }
+        } else if !(top && e.file_name() == BEFORE) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Removes a stash: the set-aside files first, the marker last, so a
+/// removal that fails part-way still reads correctly next time.
+fn remove_stash(stash: &std::path::Path) -> Result<()> {
+    for e in std::fs::read_dir(stash).with_context(|| format!("read {}", stash.display()))? {
+        let e = e.with_context(|| format!("read {}", stash.display()))?;
+        if e.file_name() != BEFORE {
+            let p = e.path();
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            }
+            .with_context(|| format!("remove {}", p.display()))?;
+        }
+    }
+    std::fs::remove_dir_all(stash).with_context(|| format!("remove {}", stash.display()))
+}
+
+/// Deals with a stash an earlier apply left behind. It holds files only if
+/// that apply set some aside and never finished: when the instance still
+/// has exactly the mods and files it had before, the apply was interrupted
+/// before saving, and the user is told how to recover. Otherwise the change
+/// was saved (anything since, such as marking a dependency, doesn't matter)
+/// and the stash is leftover old files, or empty: it is deleted.
 fn clear_committed_stash(inst: &Instance, stash: &std::path::Path) -> Result<()> {
     if !stash.exists() {
         return Ok(());
     }
-    let committed = std::fs::read(stash.join(COMMITTED))
+    let has_files = holds_files(stash, true)?;
+    let before = std::fs::read(stash.join(BEFORE))
         .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-    let current = serde_json::to_value(inst.registry()?).context("serialize registry")?;
-    if committed.as_ref() == Some(&current) {
-        std::fs::remove_dir_all(stash)
-            .with_context(|| format!("remove leftover {}", stash.display()))?;
-        return Ok(());
+        .and_then(|b| serde_json::from_slice::<BTreeMap<String, (String, Vec<String>)>>(&b).ok());
+    let now = installed_files(&inst.registry()?);
+    let interrupted = has_files && before.is_some_and(|b| b == now);
+    if !interrupted {
+        return remove_stash(stash)
+            .with_context(|| format!("clear the leftover {}", stash.display()));
     }
     bail!(
         "an earlier change to {} was interrupted before it was saved. The mod list still \
@@ -567,6 +622,8 @@ pub fn adopt(
     opts: &manual::AddOptions,
 ) -> Result<ManualMod> {
     crate::running::refuse_if_running(inst)?;
+    // An interrupted apply must be sorted out before the registry changes.
+    clear_committed_stash(inst, &inst.dir.join(STASH))?;
     let mut reg = inst.registry()?;
     let (unmanaged, _) = manual::unmanaged(&inst.game_dir(), &reg.owners())?;
     if !unmanaged.iter().any(|u| u.folder == folder) {
@@ -1047,10 +1104,20 @@ mod tests {
         .expect("Dir 2.0");
         assert!(g.join("GameData/Dir/cache").is_file());
 
-        // A stash left by a change that was saved is cleared on the next one.
-        fs::create_dir_all(stash.join("old")).expect("mkdir");
-        let current = serde_json::to_vec(&inst.registry().expect("registry")).expect("json");
-        fs::write(stash.join(COMMITTED), current).expect("write");
+        // A stash left by a change that was saved is cleared on the next
+        // one, even after the registry changed without files moving.
+        let before_dup = serde_json::to_vec(&{
+            let mut r = inst.registry().expect("registry");
+            r.mods.remove("Dir");
+            installed_files(&r)
+        })
+        .expect("json");
+        fs::create_dir_all(stash.join("old/GameData")).expect("mkdir");
+        fs::write(stash.join("old/GameData/x.dll"), "old").expect("write");
+        fs::write(stash.join(BEFORE), &before_dup).expect("write");
+        let mut reg = inst.registry().expect("registry");
+        reg.mods.get_mut("Dup").expect("Dup").auto_installed = true;
+        inst.save_registry(&reg).expect("mark as dependency");
         run(Request {
             remove: vec!["Dup".into()],
             ..Request::default()
@@ -1058,8 +1125,26 @@ mod tests {
         .expect("leftover from a finished change is cleared");
         assert!(!stash.exists());
 
-        // One left by an interrupted change stops the next change.
+        // An empty stash (a rollback whose cleanup failed) is just cleared.
+        fs::create_dir_all(stash.join("dup/GameData/Dup")).expect("mkdir");
+        let now = serde_json::to_vec(&installed_files(&inst.registry().expect("r"))).expect("json");
+        fs::write(stash.join(BEFORE), &now).expect("write");
+        run(Request {
+            install: vec![("Dup".into(), None)],
+            ..Request::default()
+        })
+        .expect("empty leftover is cleared");
+        assert!(!stash.exists());
+
+        // One left by an interrupted change stops the next change, flag
+        // edits or not.
+        let now = serde_json::to_vec(&installed_files(&inst.registry().expect("r"))).expect("json");
         fs::create_dir_all(stash.join("two/GameData/Two")).expect("mkdir");
+        fs::write(stash.join("two/GameData/Two/old.dll"), "old").expect("write");
+        fs::write(stash.join(BEFORE), &now).expect("write");
+        let mut reg = inst.registry().expect("registry");
+        reg.mods.get_mut("Two").expect("Two").auto_installed = true;
+        inst.save_registry(&reg).expect("flag edit");
         let err = run(Request {
             remove: vec!["Two".into()],
             ..Request::default()
@@ -1067,6 +1152,10 @@ mod tests {
         .expect_err("interrupted change");
         assert!(format!("{err:#}").contains("interrupted"), "{err:#}");
         assert!(g.join("GameData/Two/a/one.dll").is_file());
+        assert!(
+            stash.join("two/GameData/Two/old.dll").is_file(),
+            "kept for recovery"
+        );
     }
 
     #[test]
