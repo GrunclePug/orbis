@@ -155,6 +155,14 @@ impl Queue {
         self.install.is_empty() && self.remove.is_empty() && self.upgrade.is_empty()
     }
 
+    /// Drops changes that already happened, such as the part of a batch that
+    /// went through before a later mod failed.
+    pub fn prune(&mut self, reg: &Registry) {
+        self.install.retain(|id| !reg.mods.contains_key(id));
+        self.remove.retain(|id| reg.mods.contains_key(id));
+        self.upgrade.retain(|id| reg.mods.contains_key(id));
+    }
+
     pub fn len(&self) -> usize {
         self.install.len() + self.remove.len() + self.upgrade.len()
     }
@@ -1374,7 +1382,22 @@ impl App {
                         }
                         self.note("Changes applied");
                     }
-                    Err(e) => self.error(format!("Applying changes failed: {e}")),
+                    Err(e) => {
+                        // Keep only what still needs doing.
+                        if let Some(reg) = self
+                            .instances
+                            .iter()
+                            .find(|v| v.inst.id == id)
+                            .map(|v| v.reg.clone())
+                        {
+                            if self.selected.as_ref() == Some(&id) {
+                                self.queue.prune(&reg);
+                            } else if let Some(q) = self.queues.get_mut(&id) {
+                                q.prune(&reg);
+                            }
+                        }
+                        self.error(format!("Applying changes failed: {e}"))
+                    }
                 }
             }
             Done::InstanceCreated(r) => match r {
@@ -2434,6 +2457,10 @@ impl App {
     }
 
     fn plan_queue(&mut self) {
+        let Some(reg) = self.current().map(|v| v.reg.clone()) else {
+            return;
+        };
+        self.queue.prune(&reg);
         let Some(view) = self.current() else { return };
         let needs_index = !self.queue.install.is_empty() || !self.queue.upgrade.is_empty();
         let index = match self.index.clone() {

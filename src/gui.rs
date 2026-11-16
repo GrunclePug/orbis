@@ -142,6 +142,31 @@ mod tests {
     }
 
     #[test]
+    fn queue_prune_drops_changes_that_already_happened() {
+        let module = |id: &str| {
+            serde_json::json!({
+                "source": "ckan", "auto_installed": false, "installed_at": 0,
+                "files": [], "dirs": [],
+                "module": { "identifier": id, "version": "1.0" }
+            })
+        };
+        let reg: orbis::instance::Registry = serde_json::from_value(serde_json::json!({
+            "mods": { "Kept": module("Kept"), "Installed": module("Installed") }
+        }))
+        .expect("registry");
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        let mut q = app::Queue {
+            install: set(&["Installed", "New"]),
+            remove: set(&["Kept", "Gone"]),
+            upgrade: set(&["Gone", "Kept"]),
+        };
+        q.prune(&reg);
+        assert_eq!(q.install, set(&["New"]));
+        assert_eq!(q.remove, set(&["Kept"]));
+        assert_eq!(q.upgrade, set(&["Kept"]));
+    }
+
+    #[test]
     fn default_matches_clap_defaults() {
         let parsed = Wrap::parse_from(["orbis"]).opts;
         let default = Options::default();
