@@ -7,6 +7,8 @@ use std::sync::mpsc;
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 
+use orbis::cancel::Cancel;
+use orbis::ckan_import;
 use orbis::config::Config;
 use orbis::download::DownloadEvent;
 use orbis::instance::{self, CopyMode, CreateOptions, Instance};
@@ -29,13 +31,20 @@ use crate::gui;
 pub struct Context {
     pub paths: Paths,
     pub config: Config,
+    /// `--root`, when given (Steam's launch options must pass it on).
+    pub root: Option<PathBuf>,
 }
 
 impl Context {
     pub fn new(root: Option<&Path>) -> Result<Self> {
         let paths = Paths::new(root)?;
         let config = Config::load(&paths)?;
-        Ok(Self { paths, config })
+        Ok(Self {
+            paths,
+            config,
+            // Absolute, since Steam runs the launch options from elsewhere.
+            root: root.map(std::path::absolute).transpose()?,
+        })
     }
 
     pub fn steam(&self) -> SteamInfo {
@@ -125,8 +134,16 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show what orbis detected of Steam, KSP and Proton.
+    /// Show what orbis detected of Steam, KSP and Proton, and the launch
+    /// options KSP needs for launching instances through Steam.
     Steam,
+    /// Steam's launch wrapper: set KSP's launch options to
+    /// `orbis steam-run %command%`. Not meant to be run by hand.
+    #[command(hide = true)]
+    SteamRun {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_parser = clap::value_parser!(std::ffi::OsString))]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Star mods so they're easy to find again (shared by all instances).
     Star {
         #[arg(required = true)]
@@ -153,6 +170,10 @@ pub enum Command {
         /// Remove stored mods and downloads that no instance uses.
         #[arg(long)]
         clean: bool,
+        /// Make mods installed before the store existed share disk space
+        /// with it (btrfs and XFS).
+        #[arg(long)]
+        share: bool,
     },
     /// Summarise a log: exceptions grouped, with the mods they came from.
     Logs {
@@ -246,8 +267,26 @@ pub enum InstanceCmd {
         #[arg(long, requires = "copy")]
         hardlink: bool,
     },
+    /// Choose how an instance starts: "direct" (Proton) or "steam" (through
+    /// Steam, for the overlay and playtime).
+    Launcher {
+        instance: Option<String>,
+        #[arg(long, value_parser = ["direct", "steam"])]
+        via: String,
+    },
     /// Re-link a linked instance to its base install (done before every launch).
     Sync { instance: Option<String> },
+    /// Create an instance from a KSP install CKAN manages, tracking the mods
+    /// CKAN installed.
+    ImportCkan {
+        /// The KSP directory (the one holding CKAN/registry.json).
+        dir: PathBuf,
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Make a full, independent copy instead of linking the stock files.
+        #[arg(long)]
+        copy: bool,
+    },
     /// Copy an instance with its mods.
     Clone {
         source: String,
@@ -280,7 +319,7 @@ pub enum InstanceCmd {
 pub enum ManualCmd {
     /// List the manual mod library.
     List,
-    /// Add a .zip or folder to the library.
+    /// Add a .zip, .7z or .rar archive, or a folder, to the library.
     Add {
         path: PathBuf,
         #[arg(long)]
@@ -390,15 +429,23 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
     match cmd {
         Command::Gui(_) => unreachable!("main handles the GUI"),
         Command::Update => {
-            let s = repo::update(&ctx.paths, &ctx.config, &mut |msg| eprint!("\r\x1b[K{msg}"))?;
+            let s = repo::update(
+                &ctx.paths,
+                &ctx.config,
+                &mut |msg| eprint!("\r\x1b[K{msg}"),
+                &Cancel::default(),
+            )?;
             eprintln!();
             if s.unchanged {
-                println!("Index unchanged: {} mods", s.modules);
+                writeln!(io::stdout(), "Index unchanged: {} mods", s.modules)?;
             } else {
-                println!(
+                writeln!(
+                    io::stdout(),
                     "Index updated: {} mods, {} releases ({} unreadable skipped)",
-                    s.modules, s.releases, s.skipped
-                );
+                    s.modules,
+                    s.releases,
+                    s.skipped
+                )?;
             }
             Ok(())
         }
@@ -475,7 +522,7 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                 mods
             };
             if mods.is_empty() {
-                println!("Everything is up to date.");
+                writeln!(io::stdout(), "Everything is up to date.")?;
                 return Ok(());
             }
             let req = Request {
@@ -488,6 +535,32 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
         Command::Launch { instance, dry_run } => {
             let mut inst = ctx.instance(instance.as_deref())?;
             instance::sync_links(&mut inst)?;
+            if inst.config.launch.via_steam {
+                let steam = ctx.steam();
+                if dry_run {
+                    writeln!(
+                        io::stdout(),
+                        "steam steam://rungameid/{}",
+                        orbis::steam::KSP_APP_ID
+                    )?;
+                    writeln!(
+                        io::stdout(),
+                        "(Steam then runs: {})",
+                        launch::steam_launch_options(ctx.root.as_deref())
+                    )?;
+                    return Ok(());
+                }
+                match backup::snapshot(&inst, "before launch", ctx.config.backups_keep) {
+                    Ok(Some(b)) => eprintln!("Backed up {} save(s)", b.saves.len()),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("warning: save backup failed: {e:#}"),
+                }
+                launch::launch_via_steam(&ctx.paths, &inst, &steam)?;
+                inst.config.last_played = Some(orbis::paths::now_secs());
+                inst.save()?;
+                writeln!(io::stdout(), "Asked Steam to start {}", inst.config.name)?;
+                return Ok(());
+            }
             let plan = launch::plan(&inst, &ctx.steam(), &ctx.config)?;
             if !dry_run {
                 match backup::snapshot(&inst, "before launch", ctx.config.backups_keep) {
@@ -497,23 +570,46 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                 }
             }
             if dry_run {
-                println!("{}", plan.display());
+                writeln!(io::stdout(), "{}", plan.display())?;
                 return Ok(());
             }
             let child = launch::spawn(&plan)?;
             inst.config.last_played = Some(orbis::paths::now_secs());
             inst.save()?;
-            println!(
+            writeln!(
+                io::stdout(),
                 "Started {} (pid {}); log: {}",
                 inst.config.name,
                 child.id(),
                 plan.log.display()
-            );
+            )?;
             Ok(())
         }
+        Command::SteamRun { command } => {
+            let code = launch::steam_run(&ctx.paths, &command)?;
+            std::process::exit(code);
+        }
         Command::Steam => {
-            for (k, v) in ctx.steam().report() {
-                println!("{k:14} {v}");
+            let steam = ctx.steam();
+            let current = launch::current_steam_launch_options(&steam);
+            let ready = current.as_deref().is_some_and(|o| o.contains("steam-run"));
+            writeln!(
+                io::stdout(),
+                "{:14} {}",
+                "Launch options",
+                current.as_deref().unwrap_or("(none)")
+            )?;
+            if !ready {
+                writeln!(
+                    io::stdout(),
+                    "{:14} to launch instances through Steam, set KSP's launch options to:\n{:14} {}",
+                    "",
+                    "",
+                    launch::steam_launch_options(ctx.root.as_deref())
+                )?;
+            }
+            for (k, v) in steam.report() {
+                writeln!(io::stdout(), "{k:14} {v}")?;
             }
             Ok(())
         }
@@ -536,35 +632,55 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                     .versions(&id)
                     .first()
                     .map_or("", |m| m.summary.as_str());
-                println!("{id:36} {summary}");
+                writeln!(io::stdout(), "{id:36} {summary}")?;
             }
             Ok(())
         }
         Command::Pack(c) => pack_cmd(ctx, c),
         Command::Backup(c) => backup_cmd(ctx, c),
-        Command::Cache { clean } => {
+        Command::Cache { clean, share } => {
             let mib = |b: u64| b as f64 / 1_048_576.0;
+            if share {
+                let r = store::share(&ctx.paths, &Cancel::default(), &mut |m| eprintln!("{m}"))?;
+                for s in &r.skipped {
+                    eprintln!("skipped {s}");
+                }
+                writeln!(
+                    io::stdout(),
+                    "{} files ({:.1} MiB) now share disk space with the store",
+                    r.files,
+                    mib(r.bytes)
+                )?;
+                return Ok(());
+            }
             if clean {
                 let (n, bytes) = store::clean(&ctx.paths)?;
-                println!("Removed {n} unused entries ({:.1} MiB)", mib(bytes));
+                writeln!(
+                    io::stdout(),
+                    "Removed {n} unused entries ({:.1} MiB)",
+                    mib(bytes)
+                )?;
                 return Ok(());
             }
             let u = store::usage(&ctx.paths)?;
-            println!(
+            writeln!(
+                io::stdout(),
                 "store:     {} mods, {:.1} MiB unpacked (shared with instances by reflink where possible)",
                 u.store_entries,
                 mib(u.store_bytes)
-            );
-            println!(
+            )?;
+            writeln!(
+                io::stdout(),
                 "downloads: {} archives, {:.1} MiB",
                 u.download_files,
                 mib(u.download_bytes)
-            );
-            println!(
+            )?;
+            writeln!(
+                io::stdout(),
                 "unused:    {} entries, {:.1} MiB (orbis cache --clean)",
                 u.unused_entries,
                 mib(u.unused_bytes)
-            );
+            )?;
             Ok(())
         }
         Command::History(c) => history_cmd(ctx, c),
@@ -578,7 +694,8 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             };
             let path = logs::path(&inst, &ctx.steam(), kind).context("can't locate that log")?;
             let report = logs::read(&path, &logs::assemblies(&inst)?)?;
-            println!(
+            writeln!(
+                io::stdout(),
                 "{}: {} lines, {} exceptions ({} distinct), {} errors, {} warnings",
                 path.display(),
                 report.lines.len(),
@@ -586,14 +703,14 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                 report.exceptions.len(),
                 report.errors,
                 report.warnings
-            );
+            )?;
             for e in report.exceptions.iter().take(20) {
                 let mods = if e.mods.is_empty() {
                     String::new()
                 } else {
                     format!("  [{}]", e.mods.join(", "))
                 };
-                println!("{:5}x {}{mods}", e.count, e.message);
+                writeln!(io::stdout(), "{:5}x {}{mods}", e.count, e.message)?;
             }
             Ok(())
         }
@@ -605,33 +722,36 @@ fn backup_cmd(ctx: &Context, cmd: BackupCmd) -> Result<()> {
         BackupCmd::List { instance } => {
             let inst = ctx.instance(instance.as_deref())?;
             for b in backup::list(&inst)? {
-                println!(
+                writeln!(
+                    io::stdout(),
                     "{}  {:16} {:8.1} MiB  {}",
                     b.id,
                     b.reason,
                     b.bytes as f64 / 1_048_576.0,
                     b.saves.join(", ")
-                );
+                )?;
             }
             Ok(())
         }
         BackupCmd::Create { instance } => {
             let inst = ctx.instance(instance.as_deref())?;
             match backup::create(&inst, "manual")? {
-                Some(b) => println!("Backed up {} as {}", b.saves.join(", "), b.id),
-                None => {
-                    println!("Nothing to back up (no saves, or unchanged since the last backup)")
-                }
+                Some(b) => writeln!(io::stdout(), "Backed up {} as {}", b.saves.join(", "), b.id)?,
+                None => writeln!(
+                    io::stdout(),
+                    "Nothing to back up (no saves, or unchanged since the last backup)"
+                )?,
             }
             Ok(())
         }
         BackupCmd::Restore { id, instance, save } => {
             let inst = ctx.instance(instance.as_deref())?;
             backup::restore(&inst, &id, save.as_deref())?;
-            println!(
+            writeln!(
+                io::stdout(),
                 "Restored {} from {id}",
                 save.as_deref().unwrap_or("all saves")
-            );
+            )?;
             Ok(())
         }
     }
@@ -640,8 +760,17 @@ fn backup_cmd(ctx: &Context, cmd: BackupCmd) -> Result<()> {
 fn history_cmd(ctx: &Context, cmd: HistoryCmd) -> Result<()> {
     let restore = |inst: &Instance, target: &[history::SnapMod]| -> Result<()> {
         let index = ctx.index()?;
-        let warnings =
-            with_progress(|tx| ops::restore(&ctx.paths, &ctx.config, inst, &index, target, tx))?;
+        let warnings = with_progress(|tx| {
+            ops::restore(
+                &ctx.paths,
+                &ctx.config,
+                inst,
+                &index,
+                target,
+                tx,
+                &Cancel::default(),
+            )
+        })?;
         for w in warnings {
             eprintln!("warning: {w}");
         }
@@ -651,9 +780,9 @@ fn history_cmd(ctx: &Context, cmd: HistoryCmd) -> Result<()> {
         HistoryCmd::List { instance } => {
             let inst = ctx.instance(instance.as_deref())?;
             for e in history::list(&inst)? {
-                println!("{}  ({} mods after)", e.id, e.after.len());
+                writeln!(io::stdout(), "{}  ({} mods after)", e.id, e.after.len())?;
                 for line in &e.summary {
-                    println!("    {line}");
+                    writeln!(io::stdout(), "    {line}")?;
                 }
             }
             Ok(())
@@ -696,7 +825,7 @@ fn pack_cmd(ctx: &Context, cmd: PackCmd) -> Result<()> {
             let inst = ctx.instance(instance.as_deref())?;
             if ckan {
                 modpack::export_ckan(&inst, &out, &name)?;
-                println!("Wrote CKAN modpack {}", out.display());
+                writeln!(io::stdout(), "Wrote CKAN modpack {}", out.display())?;
                 return Ok(());
             }
             let saves = if saves.iter().any(|s| s == "all") {
@@ -715,7 +844,7 @@ fn pack_cmd(ctx: &Context, cmd: PackCmd) -> Result<()> {
             for w in modpack::export(&ctx.paths, &inst, &opts)? {
                 eprintln!("warning: {w}");
             }
-            println!("Wrote {}", out.display());
+            writeln!(io::stdout(), "Wrote {}", out.display())?;
             Ok(())
         }
         PackCmd::Import {
@@ -738,16 +867,25 @@ fn pack_cmd(ctx: &Context, cmd: PackCmd) -> Result<()> {
                 base,
                 exact: !latest,
             };
-            let report =
-                with_progress(|tx| modpack::import(&ctx.paths, &ctx.config, &index, &opts, tx))?;
+            let report = with_progress(|tx| {
+                modpack::import(
+                    &ctx.paths,
+                    &ctx.config,
+                    &index,
+                    &opts,
+                    tx,
+                    &Cancel::default(),
+                )
+            })?;
             for w in &report.warnings {
                 eprintln!("warning: {w}");
             }
-            println!(
+            writeln!(
+                io::stdout(),
                 "Imported into {} at {}",
                 report.instance.config.name,
                 report.instance.dir.display()
-            );
+            )?;
             Ok(())
         }
     }
@@ -795,12 +933,12 @@ fn explain(e: ResolveError) -> anyhow::Error {
 
 fn confirm_and_apply(ctx: &Context, inst: &Instance, plan: &Plan, flags: &PlanFlags) -> Result<()> {
     if plan.is_empty() {
-        println!("Nothing to do.");
+        writeln!(io::stdout(), "Nothing to do.")?;
         return Ok(());
     }
-    println!("Changes to {}:", inst.config.name);
+    writeln!(io::stdout(), "Changes to {}:", inst.config.name)?;
     for c in &plan.changes {
-        println!("  {c}");
+        writeln!(io::stdout(), "  {c}")?;
     }
     for s in &plan.suggestions {
         let kind = if s.recommended {
@@ -808,12 +946,13 @@ fn confirm_and_apply(ctx: &Context, inst: &Instance, plan: &Plan, flags: &PlanFl
         } else {
             "suggests"
         };
-        println!(
+        writeln!(
+            io::stdout(),
             "  ({} {kind} {}: {})",
             s.by,
             s.relationship,
             s.candidates.join(", ")
-        );
+        )?;
     }
     if flags.dry_run {
         return Ok(());
@@ -827,11 +966,11 @@ fn confirm_and_apply(ctx: &Context, inst: &Instance, plan: &Plan, flags: &PlanFl
             .read_line(&mut line)
             .context("read answer")?;
         if !matches!(line.trim(), "y" | "Y" | "yes") {
-            println!("Cancelled.");
+            writeln!(io::stdout(), "Cancelled.")?;
             return Ok(());
         }
     }
-    with_progress(|tx| ops::apply(&ctx.paths, &ctx.config, inst, plan, tx))
+    with_progress(|tx| ops::apply(&ctx.paths, &ctx.config, inst, plan, tx, &Cancel::default()))
 }
 
 /// Runs `work` while printing its progress events to stderr.
@@ -886,15 +1025,16 @@ fn search(ctx: &Context, query: &str, instance: Option<&str>) -> Result<()> {
         .collect();
     hits.sort_by_key(|(id, _)| std::cmp::Reverse(index.download_count(id)));
     for (id, m) in hits.iter().take(50) {
-        println!(
+        writeln!(
+            io::stdout(),
             "{id:32} {:12} {:10} {}",
             m.version.to_string(),
             m.game_range_label(),
             m.summary
-        );
+        )?;
     }
     if hits.len() > 50 {
-        println!("... {} more", hits.len() - 50);
+        writeln!(io::stdout(), "... {} more", hits.len() - 50)?;
     }
     Ok(())
 }
@@ -913,17 +1053,17 @@ fn show(ctx: &Context, id: &str) -> Result<()> {
     let index = ctx.index()?;
     let versions = index.versions(id);
     let m = versions.first().with_context(|| format!("no mod {id:?}"))?;
-    println!("{} ({})", m.display_name(), m.identifier);
-    println!("  {}", m.summary);
+    writeln!(io::stdout(), "{} ({})", m.display_name(), m.identifier)?;
+    writeln!(io::stdout(), "  {}", m.summary)?;
     if let Some(d) = &m.description {
-        println!("\n{d}\n");
+        writeln!(io::stdout(), "\n{d}\n")?;
     }
-    println!("  authors:   {}", m.author.join(", "));
-    println!("  license:   {}", m.license.join(", "));
-    println!("  downloads: {}", index.download_count(id));
+    writeln!(io::stdout(), "  authors:   {}", m.author.join(", "))?;
+    writeln!(io::stdout(), "  license:   {}", m.license.join(", "))?;
+    writeln!(io::stdout(), "  downloads: {}", index.download_count(id))?;
     for key in ["homepage", "repository", "spacedock", "bugtracker"] {
         if let Some(r) = m.resource(key) {
-            println!("  {key:10} {r}");
+            writeln!(io::stdout(), "  {key:10} {r}")?;
         }
     }
     for (label, rels) in [
@@ -934,16 +1074,17 @@ fn show(ctx: &Context, id: &str) -> Result<()> {
     ] {
         if !rels.is_empty() {
             let list: Vec<String> = rels.iter().map(ToString::to_string).collect();
-            println!("  {label:10} {}", list.join(", "));
+            writeln!(io::stdout(), "  {label:10} {}", list.join(", "))?;
         }
     }
-    println!("  releases:");
+    writeln!(io::stdout(), "  releases:")?;
     for v in versions.iter().take(15) {
-        println!(
+        writeln!(
+            io::stdout(),
             "    {:16} KSP {}",
             v.version.to_string(),
             v.game_range_label()
-        );
+        )?;
     }
     Ok(())
 }
@@ -971,14 +1112,15 @@ fn list(ctx: &Context, instance: Option<&str>) -> Result<()> {
             .iter()
             .find(|(u, _)| u == id)
             .map_or(String::new(), |(_, n)| format!("  -> {}", n.version));
-        println!("{id:36} {}{auto}{up}", m.version());
+        writeln!(io::stdout(), "{id:36} {}{auto}{up}", m.version())?;
     }
     for dlc in inst.dlc() {
-        println!(
+        writeln!(
+            io::stdout(),
             "{:36} {} (DLC)",
             dlc.identifier,
             dlc.version.map_or("?".into(), |v| v.to_string())
-        );
+        )?;
     }
     Ok(())
 }
@@ -990,12 +1132,13 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
         InstanceCmd::List => {
             for i in instance::list(&ctx.paths)? {
                 let n = i.registry().map(|r| r.mods.len()).unwrap_or(0);
-                println!(
+                writeln!(
+                    io::stdout(),
                     "{:20} {:24} KSP {:14} {n} mods",
                     i.id,
                     i.config.name,
                     i.config.game_version.to_string()
-                );
+                )?;
             }
             Ok(())
         }
@@ -1028,14 +1171,15 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             let inst = instance::create(&ctx.paths, &opts, progress)?;
             eprintln!();
             if let Some(base) = &inst.config.base {
-                println!("Linked to {}", base.display());
+                writeln!(io::stdout(), "Linked to {}", base.display())?;
             }
-            println!(
+            writeln!(
+                io::stdout(),
                 "Created {} ({}) at {}",
                 inst.config.name,
                 inst.config.game_version,
                 inst.dir.display()
-            );
+            )?;
             Ok(())
         }
         InstanceCmd::Clone {
@@ -1046,25 +1190,76 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             let src = instance::find(&ctx.paths, &source)?;
             let inst = instance::clone_instance(&ctx.paths, &src, &name, !no_saves, progress)?;
             eprintln!();
-            println!(
+            writeln!(
+                io::stdout(),
                 "Cloned {} into {} at {}",
                 src.config.name,
                 inst.config.name,
                 inst.dir.display()
-            );
+            )?;
+            Ok(())
+        }
+        InstanceCmd::Launcher { instance, via } => {
+            let mut inst = ctx.instance(instance.as_deref())?;
+            inst.config.launch.via_steam = via == "steam";
+            inst.save()?;
+            writeln!(
+                io::stdout(),
+                "{} now launches {}",
+                inst.config.name,
+                if inst.config.launch.via_steam {
+                    "through Steam"
+                } else {
+                    "directly through Proton"
+                }
+            )?;
+            Ok(())
+        }
+        InstanceCmd::ImportCkan { dir, name, copy } => {
+            let name = if name.trim().is_empty() {
+                dir.file_name()
+                    .map_or("CKAN install".into(), |n| n.to_string_lossy().into_owned())
+            } else {
+                name
+            };
+            let mode = if copy { CopyMode::Copy } else { CopyMode::Link };
+            let report = ckan_import::import(&ctx.paths, &dir, &name, mode, progress)?;
+            eprintln!();
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
+            writeln!(
+                io::stdout(),
+                "Imported {} mods into {} at {}",
+                report.imported,
+                report.instance.config.name,
+                report.instance.dir.display()
+            )?;
+            if !report.unmanaged.is_empty() {
+                writeln!(
+                    io::stdout(),
+                    "Not tracked by CKAN (adopt with `orbis manual adopt <folder>`): {}",
+                    report.unmanaged.join(", ")
+                )?;
+            }
             Ok(())
         }
         InstanceCmd::Sync { instance } => {
             let mut inst = ctx.instance(instance.as_deref())?;
             instance::sync_links(&mut inst)?;
             match &inst.config.base {
-                Some(b) => println!(
+                Some(b) => writeln!(
+                    io::stdout(),
                     "{} is linked to {} (KSP {})",
                     inst.config.name,
                     b.display(),
                     inst.config.game_version
-                ),
-                None => println!("{} is a full copy; nothing to sync", inst.config.name),
+                )?,
+                None => writeln!(
+                    io::stdout(),
+                    "{} is a full copy; nothing to sync",
+                    inst.config.name
+                )?,
             }
             Ok(())
         }
@@ -1088,32 +1283,32 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
                     .read_line(&mut line)
                     .context("read answer")?;
                 if !matches!(line.trim(), "y" | "Y" | "yes") {
-                    println!("Cancelled.");
+                    writeln!(io::stdout(), "Cancelled.")?;
                     return Ok(());
                 }
             }
             instance::delete(&inst)?;
-            println!("Deleted {}", inst.config.name);
+            writeln!(io::stdout(), "Deleted {}", inst.config.name)?;
             Ok(())
         }
         InstanceCmd::Info { instance } => {
             let inst = ctx.instance(instance.as_deref())?;
             let c = &inst.config;
-            println!("name:         {}", c.name);
-            println!("id:           {}", inst.id);
-            println!("directory:    {}", inst.dir.display());
-            println!("game version: {}", c.game_version);
+            writeln!(io::stdout(), "name:         {}", c.name)?;
+            writeln!(io::stdout(), "id:           {}", inst.id)?;
+            writeln!(io::stdout(), "directory:    {}", inst.dir.display())?;
+            writeln!(io::stdout(), "game version: {}", c.game_version)?;
             let compat: Vec<String> = c.compat.iter().map(ToString::to_string).collect();
-            println!("compatible:   {}", compat.join(", "));
-            println!("testing:      {}", c.allow_testing);
-            println!("prefix:       {:?}", c.launch.prefix);
-            println!("source:       {}", c.source);
+            writeln!(io::stdout(), "compatible:   {}", compat.join(", "))?;
+            writeln!(io::stdout(), "testing:      {}", c.allow_testing)?;
+            writeln!(io::stdout(), "prefix:       {:?}", c.launch.prefix)?;
+            writeln!(io::stdout(), "source:       {}", c.source)?;
             match &c.base {
-                Some(b) => println!("layout:       linked to {}", b.display()),
-                None => println!("layout:       full copy"),
+                Some(b) => writeln!(io::stdout(), "layout:       linked to {}", b.display())?,
+                None => writeln!(io::stdout(), "layout:       full copy")?,
             }
             let dlc: Vec<String> = inst.dlc().into_iter().map(|d| d.identifier).collect();
-            println!("dlc:          {}", dlc.join(", "));
+            writeln!(io::stdout(), "dlc:          {}", dlc.join(", "))?;
             Ok(())
         }
         InstanceCmd::Compat {
@@ -1135,12 +1330,13 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             inst.config.compat.sort_by(|a, b| b.cmp(a));
             inst.save()?;
             let compat: Vec<String> = inst.config.compat.iter().map(ToString::to_string).collect();
-            println!(
+            writeln!(
+                io::stdout(),
                 "{}: {} + {}",
                 inst.config.name,
                 inst.config.game_version,
                 compat.join(", ")
-            );
+            )?;
             Ok(())
         }
     }
@@ -1155,7 +1351,13 @@ fn manual_cmd(ctx: &Context, cmd: ManualCmd) -> Result<()> {
                 } else {
                     format!("  provides {}", m.provides.join(", "))
                 };
-                println!("{:24} {:24} {}{provides}", m.id, m.name, m.version);
+                writeln!(
+                    io::stdout(),
+                    "{:24} {:24} {}{provides}",
+                    m.id,
+                    m.name,
+                    m.version
+                )?;
             }
             Ok(())
         }
@@ -1194,23 +1396,29 @@ fn manual_cmd(ctx: &Context, cmd: ManualCmd) -> Result<()> {
                     notes,
                 },
             )?;
-            println!("Added {} as {}", m.name, m.identifier());
+            writeln!(io::stdout(), "Added {} as {}", m.name, m.identifier())?;
             print_manual_plan(ctx, &m)
         }
         ManualCmd::Show { id } => {
             let m = manual::find(&ctx.paths, &id)?;
-            println!("{} {} ({})", m.name, m.version, m.identifier());
+            writeln!(
+                io::stdout(),
+                "{} {} ({})",
+                m.name,
+                m.version,
+                m.identifier()
+            )?;
             if !m.provides.is_empty() {
-                println!("  provides:  {}", m.provides.join(", "));
+                writeln!(io::stdout(), "  provides:  {}", m.provides.join(", "))?;
             }
             if !m.depends.is_empty() {
-                println!("  depends:   {}", m.depends.join(", "));
+                writeln!(io::stdout(), "  depends:   {}", m.depends.join(", "))?;
             }
             if !m.conflicts.is_empty() {
-                println!("  conflicts: {}", m.conflicts.join(", "));
+                writeln!(io::stdout(), "  conflicts: {}", m.conflicts.join(", "))?;
             }
             for d in &m.install {
-                println!("  install:   {}", orbis::install::describe(d));
+                writeln!(io::stdout(), "  install:   {}", orbis::install::describe(d))?;
             }
             print_manual_plan(ctx, &m)
         }
@@ -1227,20 +1435,20 @@ fn manual_cmd(ctx: &Context, cmd: ManualCmd) -> Result<()> {
         ManualCmd::Delete { id } => {
             let m = manual::find(&ctx.paths, &id)?;
             manual::delete(&ctx.paths, &m)?;
-            println!("Deleted {} from the library", m.name);
+            writeln!(io::stdout(), "Deleted {} from the library", m.name)?;
             Ok(())
         }
         ManualCmd::Unmanaged { instance } => {
             let inst = ctx.instance(instance.as_deref())?;
             let (folders, loose) = manual::unmanaged(&inst.game_dir(), &inst.registry()?.owners())?;
             for u in &folders {
-                println!("GameData/{:30} {} files", u.folder, u.files);
+                writeln!(io::stdout(), "GameData/{:30} {} files", u.folder, u.files)?;
             }
             for f in &loose {
-                println!("GameData/{f}");
+                writeln!(io::stdout(), "GameData/{f}")?;
             }
             if folders.is_empty() && loose.is_empty() {
-                println!("Nothing unmanaged in {}", inst.config.name);
+                writeln!(io::stdout(), "Nothing unmanaged in {}", inst.config.name)?;
             }
             Ok(())
         }
@@ -1259,7 +1467,11 @@ fn manual_cmd(ctx: &Context, cmd: ManualCmd) -> Result<()> {
                 ..AddOptions::default()
             };
             let m = ops::adopt(&ctx.paths, &inst, &folder, &opts)?;
-            println!("Adopted GameData/{folder} as {}", m.identifier());
+            writeln!(
+                io::stdout(),
+                "Adopted GameData/{folder} as {}",
+                m.identifier()
+            )?;
             Ok(())
         }
     }
@@ -1277,6 +1489,11 @@ fn print_manual_plan(ctx: &Context, m: &manual::ManualMod) -> Result<()> {
         .map(|f| f.splitn(3, '/').take(2).collect::<Vec<_>>().join("/"))
         .collect();
     tops.dedup();
-    println!("  {} files into: {}", files.len(), tops.join(", "));
+    writeln!(
+        io::stdout(),
+        "  {} files into: {}",
+        files.len(),
+        tops.join(", ")
+    )?;
     Ok(())
 }

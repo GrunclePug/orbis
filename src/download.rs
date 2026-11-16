@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use crate::cancel::{Cancel, Cancelled};
 use crate::metadata::{DownloadHash, Module};
 use crate::paths::slug;
 
@@ -53,10 +54,12 @@ pub fn fetch(
     dest: &Path,
     etag: Option<&Path>,
     progress: &mut dyn FnMut(u64),
+    cancel: &Cancel,
 ) -> Result<Fetched> {
     if urls.is_empty() {
         bail!("no download URL");
     }
+    cancel.check()?;
     let dir = dest.parent().context("destination has no parent")?;
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let part = dest.with_extension("part");
@@ -77,7 +80,7 @@ pub fn fetch(
     if let Some(etag) = etag {
         for url in urls {
             let _ = fs::remove_file(&part);
-            match run_curl(url, &part, Some(etag), false, progress)? {
+            match run_curl(url, &part, Some(etag), false, progress, cancel)? {
                 Ok(f) => return finish(f),
                 Err(Failure::Refused(e) | Failure::Transient(e)) => {
                     errors.push(format!("{url}: {e}"))
@@ -95,7 +98,7 @@ pub fn fetch(
         let idx = turn % live.len();
         let url = live[idx];
         let before = file_len(&part);
-        match run_curl(url, &part, None, before > 0, progress)? {
+        match run_curl(url, &part, None, before > 0, progress, cancel)? {
             Ok(f) => return finish(f),
             Err(Failure::Refused(e)) if before > 0 => {
                 // Maybe the server can't resume: start this source over.
@@ -144,6 +147,7 @@ fn run_curl(
     etag: Option<&Path>,
     resume: bool,
     progress: &mut dyn FnMut(u64),
+    cancel: &Cancel,
 ) -> Result<Result<Fetched, Failure>> {
     let mut cmd = Command::new("curl");
     cmd.args(["--fail", "--location", "--silent", "--show-error"])
@@ -201,6 +205,12 @@ fn run_curl(
                 _ => Err(Failure::Transient(err)),
             });
         }
+        if cancel.is_set() {
+            let _ = child.kill();
+            let _ = child.wait();
+            // The partial file stays, so a later attempt resumes it.
+            return Err(Cancelled.into());
+        }
         progress(file_len(part));
         std::thread::sleep(Duration::from_millis(150));
     }
@@ -251,25 +261,47 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Where a module's archive is cached. Named after its download URL, so
-/// modules that share one archive (Scatterer and its configs) share the file.
+/// Where a module's archive is cached: named after its download URL and
+/// version only, so modules that share one archive (Scatterer, its config
+/// and its sunflare) share one file, whichever of them was fetched first.
 pub fn cache_path(dir: &Path, m: &Module) -> PathBuf {
+    dir.join(format!("{}-{}.zip", url_key(m), slug(m.version.as_str())))
+}
+
+fn url_key(m: &Module) -> String {
     let url = m.download.first().map_or("", String::as_str);
-    let key = hex(&Sha1::digest(url.as_bytes()));
-    dir.join(format!(
-        "{}-{}-{}.zip",
-        &key[..10],
-        slug(&m.identifier),
-        slug(m.version.as_str())
-    ))
+    hex(&Sha1::digest(url.as_bytes()))[..10].to_owned()
+}
+
+/// The cached archive for a module, if there is one. Archives cached by
+/// orbis 0.5 to 0.7 (named `<url>-<identifier>-<version>.zip`) are renamed
+/// to the current name on the way.
+pub fn cached(dir: &Path, m: &Module) -> Option<PathBuf> {
+    let path = cache_path(dir, m);
+    if path.is_file() {
+        return Some(path);
+    }
+    let prefix = format!("{}-", url_key(m));
+    let suffix = format!("-{}.zip", slug(m.version.as_str()));
+    let legacy = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix))
+        })?;
+    fs::rename(&legacy, &path).ok()?;
+    Some(path)
 }
 
 /// Whether a module's archive is already cached and valid.
 pub fn is_cached(dir: &Path, m: &Module) -> bool {
-    let p = cache_path(dir, m);
-    p.is_file()
-        && m.download_size
+    cached(dir, m).is_some_and(|p| {
+        m.download_size
             .is_none_or(|s| fs::metadata(&p).map(|md| md.len()).ok() == Some(s))
+    })
 }
 
 /// Progress from [`download_modules`].
@@ -293,6 +325,7 @@ pub fn download_modules(
     all: &[&Module],
     workers: usize,
     events: &mpsc::Sender<DownloadEvent>,
+    cancel: &Cancel,
 ) -> Result<Vec<PathBuf>> {
     // Fetch each archive once, even when several modules share it.
     let mut unique: Vec<&Module> = Vec::new();
@@ -315,7 +348,10 @@ pub fn download_modules(
                 loop {
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     let Some(m) = mods.get(i) else { break };
-                    if let Err(e) = download_one(dir, m, events) {
+                    if cancel.is_set() {
+                        break;
+                    }
+                    if let Err(e) = download_one(dir, m, events, cancel) {
                         let _ = err_tx.send(format!("{} {}: {e:#}", m.identifier, m.version));
                     }
                 }
@@ -323,6 +359,7 @@ pub fn download_modules(
         }
     });
     drop(err_tx);
+    cancel.check()?;
     let errors: Vec<String> = err_rx.iter().collect();
     if !errors.is_empty() {
         bail!("{}", errors.join("\n"));
@@ -339,8 +376,13 @@ pub fn download_modules(
         .collect())
 }
 
-fn download_one(dir: &Path, m: &Module, events: &mpsc::Sender<DownloadEvent>) -> Result<()> {
-    let dest = cache_path(dir, m);
+fn download_one(
+    dir: &Path,
+    m: &Module,
+    events: &mpsc::Sender<DownloadEvent>,
+    cancel: &Cancel,
+) -> Result<()> {
+    let dest = cached(dir, m).unwrap_or_else(|| cache_path(dir, m));
     if dest.is_file() && verify(&dest, m.download_hash.as_ref()).is_ok() {
         let _ = events.send(DownloadEvent::Done {
             identifier: m.identifier.clone(),
@@ -362,7 +404,7 @@ fn download_one(dir: &Path, m: &Module, events: &mpsc::Sender<DownloadEvent>) ->
     {
         urls.push(mirror);
     }
-    fetch(&urls, &dest, None, &mut report)?;
+    fetch(&urls, &dest, None, &mut report, cancel)?;
     if let Err(e) = verify(&dest, m.download_hash.as_ref()) {
         let _ = fs::remove_file(&dest);
         return Err(e);
@@ -411,9 +453,28 @@ mod tests {
             format!("file://{}", tmp.path().join("missing.bin").display()),
             format!("file://{}", src.display()),
         ];
-        fetch(&urls, &dest, None, &mut |_| {}).expect("fetch");
+        fetch(&urls, &dest, None, &mut |_| {}, &Cancel::default()).expect("fetch");
         assert_eq!(fs::read(&dest).expect("read"), body);
         assert!(!dest.with_extension("part").exists());
+    }
+
+    #[test]
+    fn stops_when_cancelled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src.bin");
+        fs::write(&src, b"payload").expect("write");
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let err = fetch(
+            &[format!("file://{}", src.display())],
+            &tmp.path().join("out.bin"),
+            None,
+            &mut |_| {},
+            &cancel,
+        )
+        .expect_err("cancelled");
+        assert!(crate::cancel::is_cancelled(&err));
+        assert!(!tmp.path().join("out.bin").exists());
     }
 
     #[test]
@@ -424,7 +485,7 @@ mod tests {
         let dest = tmp.path().join("out/dest.bin");
         let url = format!("file://{}", src.display());
         let mut last = 0;
-        let got = fetch(&[url], &dest, None, &mut |b| last = b).expect("fetch");
+        let got = fetch(&[url], &dest, None, &mut |b| last = b, &Cancel::default()).expect("fetch");
         assert_eq!(got, Fetched::Downloaded);
         assert_eq!(fs::read(&dest).expect("read"), b"payload");
         assert_eq!(last, 7);

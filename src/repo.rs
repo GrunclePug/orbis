@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::Cancel;
 use crate::config::Config;
 use crate::download::{self, Fetched};
 use crate::metadata::{Kind, Module, ReleaseStatus};
@@ -179,6 +180,7 @@ pub fn update(
     paths: &Paths,
     config: &Config,
     progress: &mut dyn FnMut(String),
+    cancel: &Cancel,
 ) -> Result<UpdateSummary> {
     let dir = paths.repo();
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -207,6 +209,7 @@ pub fn update(
             &archive,
             Some(&etag),
             &mut report,
+            cancel,
         )
         .with_context(|| format!("fetch repository {}", repo.name))?
         {

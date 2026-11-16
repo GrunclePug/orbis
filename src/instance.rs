@@ -63,6 +63,11 @@ pub struct LaunchConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub prefix: PrefixMode,
+    /// Start through Steam (overlay, playtime) instead of running Proton
+    /// directly. Needs KSP's Steam launch options set to
+    /// `orbis steam-run %command%`.
+    #[serde(default)]
+    pub via_steam: bool,
 }
 
 /// Which Wine prefix the instance runs in.

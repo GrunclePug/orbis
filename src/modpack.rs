@@ -23,6 +23,7 @@ use std::sync::mpsc;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::Cancel;
 use crate::config::Config;
 use crate::install::Source;
 use crate::instance::{self, CopyMode, CreateOptions, Instance, LaunchConfig, ModSource};
@@ -373,6 +374,7 @@ pub fn import(
     index: &Index,
     opts: &ImportOptions,
     events: &mpsc::Sender<Event>,
+    cancel: &Cancel,
 ) -> Result<ImportReport> {
     let status = |s: String| {
         let _ = events.send(Event::Status(s));
@@ -510,7 +512,7 @@ pub fn import(
                 inst.config.name
             )
         })?;
-        ops::apply(paths, config, &inst, &plan, events)?;
+        ops::apply(paths, config, &inst, &plan, events, cancel)?;
     }
 
     // Dependencies stay marked as dependencies.
@@ -523,10 +525,11 @@ pub fn import(
     inst.save_registry(&reg)?;
 
     for m in manual_to_install {
+        cancel.check()?;
         status(format!("Installing {}", m.name));
         let result = ops::plan_manual(&inst, index, &m).and_then(|p| {
             let plan = p.map_err(|e| anyhow::anyhow!("{e}"))?;
-            ops::apply(paths, config, &inst, &plan, events)
+            ops::apply(paths, config, &inst, &plan, events, cancel)
         });
         if let Err(e) = result {
             warnings.push(format!("manual mod {}: {e:#}", m.name));
@@ -645,7 +648,7 @@ mod tests {
             ..Request::default()
         };
         let plan = ops::plan(&src, &index, &req).expect("io").expect("plan");
-        ops::apply(&paths, &config, &src, &plan, &tx).expect("apply");
+        ops::apply(&paths, &config, &src, &plan, &tx, &Cancel::default()).expect("apply");
 
         // A manual mod, a save and some craft.
         let clouds = tmp.path().join("clouds.zip");
@@ -663,7 +666,7 @@ mod tests {
         let p = ops::plan_manual(&src, &index, &m)
             .expect("io")
             .expect("plan");
-        ops::apply(&paths, &config, &src, &p, &tx).expect("apply manual");
+        ops::apply(&paths, &config, &src, &p, &tx, &Cancel::default()).expect("apply manual");
         let g = src.game_dir();
         fs::create_dir_all(g.join("saves/Career")).expect("mkdir");
         fs::write(g.join("saves/Career/persistent.sfs"), b"save").expect("write");
@@ -707,6 +710,7 @@ mod tests {
                 exact: true,
             },
             &tx,
+            &Cancel::default(),
         )
         .expect("import");
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);

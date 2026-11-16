@@ -35,11 +35,46 @@ const KEEP_DIRS: [&str; 15] = [
     "Internals",
 ];
 
-/// Where mod content comes from: a zip archive or an unpacked folder.
+/// Where mod content comes from: a zip archive, an unpacked folder, or a
+/// .7z/.rar archive read through `bsdtar` (listing only; unpack it with
+/// [`unpack_with_bsdtar`] before installing).
 #[derive(Clone, Debug)]
 pub enum Source {
     Zip(PathBuf),
     Dir(PathBuf),
+    Packed(PathBuf),
+}
+
+/// Archive extensions read through `bsdtar` (libarchive, always present on
+/// Arch since pacman depends on it).
+pub const PACKED_EXTENSIONS: [&str; 2] = ["7z", "rar"];
+
+/// Whether a path's extension is one `bsdtar` handles for us.
+pub fn is_packed(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .is_some_and(|e| PACKED_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Unpacks a .7z or .rar archive into `dest` with `bsdtar`, which refuses
+/// absolute paths and `..` by default.
+pub fn unpack_with_bsdtar(archive: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    let out = std::process::Command::new("bsdtar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .output()
+        .context("run bsdtar (install libarchive)")?;
+    if !out.status.success() {
+        bail!(
+            "unpack {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// One archive entry: a `/`-separated relative path.
@@ -95,6 +130,29 @@ impl Source {
                 let mut out = Vec::new();
                 walk(root, root, &mut out)?;
                 Ok(out)
+            }
+            Source::Packed(path) => {
+                let out = std::process::Command::new("bsdtar")
+                    .arg("-tf")
+                    .arg(path)
+                    .output()
+                    .context("run bsdtar (install libarchive)")?;
+                if !out.status.success() {
+                    bail!(
+                        "read {}: {}",
+                        path.display(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                Ok(String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(|l| l.trim_start_matches("./").replace('\\', "/"))
+                    .filter(|l| !l.is_empty())
+                    .map(|l| Entry {
+                        is_dir: l.ends_with('/'),
+                        name: l.trim_end_matches('/').to_owned(),
+                    })
+                    .collect())
             }
         }
     }
@@ -424,6 +482,7 @@ fn copy_all(
             )
         }
         Source::Dir(_) => None,
+        Source::Packed(p) => bail!("{} must be unpacked before installing", p.display()),
     };
     let mut by_name = HashMap::new();
     if let Some(zip) = &mut zip {
@@ -465,6 +524,7 @@ fn copy_all(
                     .with_context(|| format!("copy {}", p.source))?;
             }
             (Source::Zip(_), None) => unreachable!("zip source always opens an archive"),
+            (Source::Packed(_), _) => unreachable!("packed sources are refused above"),
         }
     }
     Ok(())

@@ -22,6 +22,8 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 * **Sorting and dates**: sort by name, installed, release date or downloads to find recently updated mods.
 * **Stays current**: the CKAN index refreshes itself when it's a day old, and instances show how many upgrades are waiting.
 * **Remembers where you were**: the selected instance, filters and unapplied changes survive a restart.
+* **Migrate from CKAN**: point orbis at a KSP folder CKAN manages and get an instance with the same mods, tracked at the same versions, plus its saves and settings.
+* **Launch through Steam (optional)**: start an instance through Steam for the overlay and playtime tracking, while Steam's own Play button stays vanilla.
 * **Manual mods**: add a `.zip` or folder once, then install it into any instance. A manual mod can replace CKAN mods (for example, a Patreon Volumetric Clouds build standing in for EVE Redux and Scatterer), so mods that depend on them keep working.
 * **Proton launch**: start any instance with the Proton build Steam has mapped to KSP, inside the Steam Linux Runtime when Proton asks for it.
 * **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
@@ -38,7 +40,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 ### Requirements
 
 * Rust 1.100 or newer and Make
-* `curl` at runtime
+* `curl` and `bsdtar` (libarchive) at runtime; both come with any Arch install
 * A Vulkan driver (any GPU driver, or lavapipe for software rendering)
 * Steam with KSP installed, set to run under Proton (Proton-GE or Valve Proton)
 
@@ -85,6 +87,8 @@ When only one instance exists, `-i` can be left out.
 | `orbis remove [-i <instance>] <mod>...` | Remove mods and anything that depends on them |
 | `orbis upgrade [-i <instance>] [<mod>...]` | Upgrade the named mods, or every upgradable one |
 | `orbis instance list\|create\|clone\|sync\|rename\|delete\|info\|compat` | Manage instances |
+| `orbis instance import-ckan <dir> [--copy]` | Create an instance from a KSP install CKAN manages |
+| `orbis instance launcher [<instance>] --via direct\|steam` | Start the instance directly through Proton or through Steam |
 | `orbis manual list\|add\|show\|install\|delete` | Manage the manual mod library |
 | `orbis launch [<instance>] [--dry-run]` | Start an instance, or print the command |
 | `orbis steam` | Show the detected Steam, KSP and Proton paths |
@@ -92,7 +96,7 @@ When only one instance exists, `-i` can be left out.
 | `orbis backup list\|create\|restore <id> [--save <name>]` | Manage save backups |
 | `orbis logs [--log ksp\|player\|launch]` | Summarise a log: exceptions grouped and blamed on mods |
 | `orbis manual unmanaged\|adopt <folder>` | Find hand-added GameData folders and track them as manual mods |
-| `orbis cache [--clean]` | Show the mod store and download cache, or remove what no instance uses |
+| `orbis cache [--clean\|--share]` | Show the mod store and download cache, remove what no instance uses, or make older installs share disk space |
 | `orbis star\|unstar <mod>...` | Star or unstar mods (shared by all instances) |
 | `orbis starred` | List starred mods |
 | `orbis pack export [-i <instance>] <file>` | Export a modpack (`--craft`, `--saves <names\|all>`, `--manual-files`, `--ckan`) |
@@ -151,7 +155,7 @@ orbis manual add ~/Downloads/VolumetricClouds.zip --name "Volumetric Clouds" --v
 orbis manual install volumetric-clouds -i "Stock Career"
 ```
 
-orbis works out where the files go: if the archive has a `GameData` folder anywhere, its contents are installed; otherwise each top-level folder goes into `GameData`. Use `--find <folder>` to install a single folder instead. Only `.zip` archives and plain folders are supported; unpack other formats first.
+orbis works out where the files go: if the archive has a `GameData` folder anywhere, its contents are installed; otherwise each top-level folder goes into `GameData`. Use `--find <folder>` to install a single folder instead. `.zip`, `.7z` and `.rar` archives and plain folders all work; `.7z` and `.rar` are unpacked once into the library with `bsdtar`.
 
 `--provides` lists the CKAN identifiers the mod replaces. Installing it removes the CKAN copies, and CKAN mods that depend on those identifiers are satisfied by the manual mod. `--depends` and `--conflicts` take CKAN identifiers too.
 
@@ -199,7 +203,9 @@ Vim-style keys work too, unless turned off under **Settings > Interface**:
 
 Downloaded archives are unpacked once into `~/.local/share/orbis/store/`, one folder per mod version, and installs copy from there. On btrfs and XFS the copy is a reflink: ten instances with the same mod use the disk space of one, yet each instance has its own files, so a mod that writes settings or caches into its folder while the game runs never affects another instance. Instances can still use different versions of a mod (a pinned modpack, say); each version is stored once. On other filesystems the copies are ordinary copies.
 
-`orbis cache` (or **Settings > Storage**) shows the store and download cache; `orbis cache --clean` removes what no instance uses.
+`orbis cache` (or **Settings > Storage**) shows the store and download cache; `orbis cache --clean` removes what no instance uses. Mods installed before the store existed are separate copies; `orbis cache --share` (or **Share space with older installs**) compares their files with the store and replaces every identical one with a shared copy. Files a mod has changed are left alone, and it only runs on btrfs and XFS, where it saves space.
+
+Any running task that downloads or installs (updating the index, applying changes, importing a pack, restoring history, sharing space) has a **Cancel** button. It stops after the current download or mod, never halfway through one; partial downloads resume next time.
 
 ## Safety nets
 
@@ -226,9 +232,23 @@ Manual mod files are left out unless you pass `--manual-files`, since mods like 
 
 `--ckan` writes CKAN's modpack format instead (mods only), and `.ckan` modpacks from CKAN import like any other pack. In the GUI, use **Export** under the instance list and **Import** beside **+ New**, or drop a pack file on the window.
 
+## Migrating from CKAN
+
+**Import** (beside **+ New**) accepts a KSP folder that CKAN manages, or use `orbis instance import-ckan <dir>`. orbis reads CKAN's `CKAN/registry.json` and creates an instance where every mod CKAN installed is tracked at the same version, with the same files and the same dependency flags, along with the install's saves, craft and compatible game versions. Folders in GameData that CKAN didn't track show up under **Manual mods** to adopt. The instance links the stock files from that folder (keep it), or with **Full copy** / `--copy` becomes fully independent. The CKAN install itself is left untouched.
+
 ## Launching
 
 orbis runs `KSP_x64.exe` from the instance's `game/` directory with the Proton build Steam has mapped to KSP, passing the same `STEAM_COMPAT_*` environment Steam does (plus `STEAM_COMPAT_MOUNTS`, so the runtime container can see the linked install). When that Proton requires the Steam Linux Runtime, orbis starts it through the runtime's entry point just as Steam does. KSP 1 has no DRM, so Steam doesn't need to start the game, though the Steam overlay and playtime tracking don't apply. Proton's output goes to `orbis-launch.log` in the instance directory. `orbis launch --dry-run` prints the exact command.
+
+### Through Steam
+
+For the Steam overlay and playtime tracking, tick **Launch: Through Steam** in an instance's settings (or `orbis instance launcher --via steam`). It needs a one-time setup: in Steam, open KSP's **Properties > Launch Options** and enter the line orbis shows (also printed by `orbis steam`), which looks like:
+
+```
+/usr/local/bin/orbis steam-run %command%
+```
+
+When you press **Launch**, orbis leaves a short-lived note naming the instance and asks Steam to start KSP. Steam runs its usual Proton command through `orbis steam-run`, which consumes the note and points the command at the instance's game directory. Without a fresh note (pressing Play in Steam, or a note older than two minutes) the command runs unchanged, so KSP from the Steam library stays vanilla. If you move the orbis binary, update the launch options. The wrapper logs its last decision to `~/.cache/orbis/steam-run.log`.
 
 ## Credits
 

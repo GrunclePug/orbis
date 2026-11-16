@@ -188,13 +188,14 @@ pub fn add(paths: &Paths, opts: &AddOptions) -> Result<ManualMod> {
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if !is_dir && ext != "zip" {
-        bail!(
-            "only .zip archives and folders are supported (got .{ext}); unpack it and add the folder"
-        );
+    let packed = !is_dir && install::is_packed(&opts.path);
+    if !is_dir && ext != "zip" && !packed {
+        bail!("supported: .zip, .7z and .rar archives, and folders (got .{ext})");
     }
     let probe = if is_dir {
         Source::Dir(opts.path.clone())
+    } else if packed {
+        Source::Packed(opts.path.clone())
     } else {
         Source::Zip(opts.path.clone())
     };
@@ -219,7 +220,9 @@ pub fn add(paths: &Paths, opts: &AddOptions) -> Result<ManualMod> {
         n += 1;
     }
     let dir = root.join(&id);
-    let file = if is_dir {
+    // .7z and .rar are unpacked into the library once and kept as a folder.
+    let stored_as_dir = is_dir || packed;
+    let file = if stored_as_dir {
         "files".to_owned()
     } else {
         opts.path
@@ -232,6 +235,8 @@ pub fn add(paths: &Paths, opts: &AddOptions) -> Result<ManualMod> {
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         if is_dir {
             copy_dir(&opts.path, &dir.join("files"))?;
+        } else if packed {
+            install::unpack_with_bsdtar(&opts.path, &dir.join("files"))?;
         } else {
             fs::copy(&opts.path, dir.join(&file))
                 .with_context(|| format!("copy {}", opts.path.display()))?;
@@ -245,7 +250,7 @@ pub fn add(paths: &Paths, opts: &AddOptions) -> Result<ManualMod> {
                 opts.version.trim().to_owned()
             },
             file,
-            is_dir,
+            is_dir: stored_as_dir,
             provides: clean_list(&opts.provides),
             depends: clean_list(&opts.depends),
             conflicts: clean_list(&opts.conflicts),
@@ -539,6 +544,51 @@ mod tests {
                 "GameData/MyPatch/patch.cfg"
             ]
         );
+    }
+
+    #[test]
+    fn adds_7z_archives_through_bsdtar() {
+        if std::process::Command::new("bsdtar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("bsdtar missing; skipped");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let src = tmp.path().join("src/Clouds-5/GameData/EVE");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(src.join("eve.dll"), b"x").expect("write");
+        let archive = tmp.path().join("clouds.7z");
+        let ok = std::process::Command::new("bsdtar")
+            .args(["--format", "7zip", "-cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(tmp.path().join("src"))
+            .arg("Clouds-5")
+            .status()
+            .expect("bsdtar");
+        assert!(ok.success());
+        let m = add(
+            &paths,
+            &AddOptions {
+                path: archive,
+                name: "Clouds".into(),
+                ..AddOptions::default()
+            },
+        )
+        .expect("add 7z");
+        assert!(m.is_dir);
+        let dests: Vec<String> = m
+            .plan(&paths)
+            .expect("plan")
+            .into_iter()
+            .filter(|p| !p.is_dir)
+            .map(|p| p.dest)
+            .collect();
+        assert_eq!(dests, ["GameData/EVE/eve.dll"]);
     }
 
     #[test]

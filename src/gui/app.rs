@@ -12,6 +12,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use anyhow::Result;
 use eframe::egui;
 
+use orbis::cancel::Cancel;
+use orbis::ckan_import;
 use orbis::config::Config;
 use orbis::download::DownloadEvent;
 use orbis::game::Dlc;
@@ -210,6 +212,10 @@ pub struct ImportForm {
     pub name: String,
     pub base: String,
     pub exact: bool,
+    /// For a CKAN install: copy everything instead of linking stock files.
+    pub full_copy: bool,
+    /// The path is a CKAN-managed KSP install rather than a pack file.
+    pub ckan_install: bool,
     /// A summary of the pack, or why it can't be read.
     pub preview: Option<Result<String, String>>,
     pub previewed_for: String,
@@ -223,6 +229,7 @@ pub struct SettingsForm {
     pub compat: String,
     pub allow_testing: bool,
     pub prefix_isolated: bool,
+    pub via_steam: bool,
     pub args: String,
     pub env: String,
     pub notes: String,
@@ -350,9 +357,11 @@ pub enum Msg {
     ToggleStar(String),
     SortBy(SortKey),
     SetVimKeys(bool),
+    CancelTask,
     OpenRename,
     RenameInstance,
     CleanStore,
+    ShareStore,
     RefreshStorage,
     AskRestoreHistory(u64, bool),
     RestoreHistory,
@@ -386,6 +395,8 @@ pub enum Done {
     Exported(Result<(PathBuf, Vec<String>), String>),
     Imported(Result<modpack::ImportReport, String>),
     Restored(Result<Vec<String>, String>),
+    CkanImported(Result<ckan_import::Report, String>),
+    Shared(Result<store::Shared, String>),
 }
 
 /// Messages from background threads.
@@ -407,6 +418,9 @@ pub struct Task {
     pub status: String,
     pub progress: Option<f32>,
     pub downloads: BTreeMap<String, (u64, Option<u64>)>,
+    /// Whether the work checks for cancellation.
+    pub cancellable: bool,
+    pub cancel: Cancel,
     rx: Receiver<TaskMsg>,
 }
 
@@ -465,6 +479,8 @@ pub struct App {
     pub mods_view: (f32, f32),
     pub focus_search: bool,
     pub storage: Option<Result<store::Usage, String>>,
+    /// KSP's launch options in Steam, as last read.
+    pub steam_launch_options: Option<String>,
     saved_prefs: Prefs,
     /// Write `gui.toml` (off in headless mode).
     persist: bool,
@@ -521,6 +537,7 @@ impl App {
             mods_view: (0.0, 0.0),
             focus_search: false,
             storage: None,
+            steam_launch_options: None,
             saved_prefs: Prefs::default(),
             persist: !opts.headless,
             generation: 0,
@@ -529,6 +546,7 @@ impl App {
             Ok(s) => app.starred = s,
             Err(e) => app.messages.push(format!("{e:#}")),
         }
+        app.steam_launch_options = launch::current_steam_launch_options(&app.steam);
         let prefs = Prefs::load(&app.ctx.paths);
         app.selected = prefs.selected.clone();
         app.filter = filter_from(&prefs.filter).unwrap_or(Filter::Installed);
@@ -673,6 +691,10 @@ impl App {
     }
 
     fn error(&mut self, msg: String) {
+        if msg.contains(CANCELLED) {
+            self.note("Cancelled");
+            return;
+        }
         log::error!("{msg}");
         self.messages.push(msg.clone());
         self.dialog = Some(Dialog::Error(msg));
@@ -717,7 +739,7 @@ impl App {
                 .extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            if ext == "orbispack" || ext == "ckan" {
+            if ext == "orbispack" || ext == "ckan" || ckan_import::is_ckan_install(&p) {
                 self.update(Msg::OpenImport(Some(p)));
             } else {
                 self.tab = Tab::Manual;
@@ -942,15 +964,36 @@ impl App {
 
     // ---- background work --------------------------------------------
 
+    /// Runs work that can't be stopped part-way.
     fn spawn(&mut self, title: &str, work: impl FnOnce(&Sender<TaskMsg>) -> Done + Send + 'static) {
+        self.spawn_task(title, false, move |tx, _| work(tx));
+    }
+
+    /// Runs work that obeys the Cancel button.
+    fn spawn_cancellable(
+        &mut self,
+        title: &str,
+        work: impl FnOnce(&Sender<TaskMsg>, &Cancel) -> Done + Send + 'static,
+    ) {
+        self.spawn_task(title, true, work);
+    }
+
+    fn spawn_task(
+        &mut self,
+        title: &str,
+        cancellable: bool,
+        work: impl FnOnce(&Sender<TaskMsg>, &Cancel) -> Done + Send + 'static,
+    ) {
         if self.task.is_some() {
             self.note("Another task is still running.");
             return;
         }
         let (tx, rx) = mpsc::channel();
         let egui = self.egui.clone();
+        let cancel = Cancel::default();
+        let flag = cancel.clone();
         std::thread::spawn(move || {
-            let done = work(&tx);
+            let done = work(&tx, &flag);
             let _ = tx.send(TaskMsg::Done(Box::new(done)));
             egui.request_repaint();
         });
@@ -959,6 +1002,8 @@ impl App {
             status: String::new(),
             progress: None,
             downloads: BTreeMap::new(),
+            cancellable,
+            cancel,
             rx,
         });
     }
@@ -1049,6 +1094,50 @@ impl App {
                 self.recount_upgrades();
             }
             Done::IndexUpdated(Err(e)) => self.error(format!("Update failed: {e}")),
+            Done::CkanImported(r) => match r {
+                Ok(report) => {
+                    self.note(format!(
+                        "Imported {} mods into {}",
+                        report.imported, report.instance.config.name
+                    ));
+                    self.selected = Some(report.instance.id.clone());
+                    self.queue = Queue::default();
+                    self.reload();
+                    let mut notes = report.warnings.clone();
+                    if !report.unmanaged.is_empty() {
+                        notes.push(format!(
+                            "CKAN didn't track these GameData folders; adopt them on the Manual mods tab: {}",
+                            report.unmanaged.join(", ")
+                        ));
+                    }
+                    if !notes.is_empty() {
+                        self.error(format!("Imported, with notes:\n{}", notes.join("\n")));
+                    }
+                }
+                Err(e) => {
+                    self.reload();
+                    self.error(format!("Import failed: {e}"));
+                }
+            },
+            Done::Shared(r) => {
+                match r {
+                    Ok(s) => {
+                        self.note(format!(
+                            "{} files ({:.1} MiB) now share disk space with the store",
+                            s.files,
+                            s.bytes as f64 / 1_048_576.0
+                        ));
+                        if !s.skipped.is_empty() {
+                            self.error(format!(
+                                "Some mods were skipped because their downloads aren't cached (reinstalling them shares space too):\n{}",
+                                s.skipped.join("\n")
+                            ));
+                        }
+                    }
+                    Err(e) => self.error(format!("Sharing disk space failed: {e}")),
+                }
+                self.update(Msg::RefreshStorage);
+            }
             Done::Restored(r) => {
                 self.reload();
                 match r {
@@ -1416,15 +1505,15 @@ impl App {
             Msg::UpdateIndex => {
                 let paths = self.ctx.paths.clone();
                 let config = self.ctx.config.clone();
-                self.spawn("Updating mod index", move |tx| {
+                self.spawn_cancellable("Updating mod index", move |tx, cancel| {
                     let mut report = |s: String| {
                         let _ = tx.send(TaskMsg::Status(s));
                     };
-                    let r = repo::update(&paths, &config, &mut report).and_then(|s| {
+                    let r = repo::update(&paths, &config, &mut report, cancel).and_then(|s| {
                         let index = Index::load(&paths)?.unwrap_or_default();
                         Ok((s, index))
                     });
-                    Done::IndexUpdated(r.map_err(|e| format!("{e:#}")))
+                    Done::IndexUpdated(r.map_err(task_error))
                 });
             }
             Msg::OpenNewInstance => {
@@ -1613,6 +1702,14 @@ impl App {
             }
             Msg::SetShowDeps(v) => self.show_deps = v,
             Msg::SetVimKeys(v) => self.vim_keys = v,
+            Msg::CancelTask => {
+                if let Some(t) = &mut self.task
+                    && t.cancellable
+                {
+                    t.cancel.cancel();
+                    t.status = "Cancelling (finishing the current step)...".into();
+                }
+            }
             Msg::OpenRename => {
                 if let Some(v) = self.current() {
                     self.dialog = Some(Dialog::RenameInstance {
@@ -1635,6 +1732,15 @@ impl App {
                         Err(e) => self.error(format!("{e:#}")),
                     }
                 }
+            }
+            Msg::ShareStore => {
+                let paths = self.ctx.paths.clone();
+                self.spawn_cancellable("Sharing disk space", move |tx, cancel| {
+                    let mut report = |m: String| {
+                        let _ = tx.send(TaskMsg::Status(m));
+                    };
+                    Done::Shared(store::share(&paths, cancel, &mut report).map_err(task_error))
+                });
             }
             Msg::RefreshStorage => {
                 self.storage = Some(store::usage(&self.ctx.paths).map_err(|e| format!("{e:#}")));
@@ -1677,11 +1783,11 @@ impl App {
                 let paths = self.ctx.paths.clone();
                 let config = self.ctx.config.clone();
                 let egui = self.egui.clone();
-                self.spawn("Restoring mod list", move |tx| {
+                self.spawn_cancellable("Restoring mod list", move |tx, cancel| {
                     let r = forward_events(tx, &egui, |etx| {
-                        ops::restore(&paths, &config, &inst, &index, &target, etx)
+                        ops::restore(&paths, &config, &inst, &index, &target, etx, cancel)
                     });
-                    Done::Restored(r.map_err(|e| format!("{e:#}")))
+                    Done::Restored(r.map_err(task_error))
                 });
             }
             Msg::BackupNow => {
@@ -1856,6 +1962,27 @@ impl App {
             Msg::PreviewImport => {
                 if let Some(Dialog::Import(form)) = &mut self.dialog {
                     form.previewed_for = form.path.clone();
+                    let path = PathBuf::from(form.path.trim());
+                    form.ckan_install = ckan_import::is_ckan_install(&path);
+                    if form.ckan_install {
+                        if form.name.is_empty() {
+                            form.name = path.file_name().map_or("CKAN install".into(), |n| {
+                                n.to_string_lossy().into_owned()
+                            });
+                        }
+                        form.preview = Some(
+                            ckan_import::read_registry(&path)
+                                .map(|(mods, _)| {
+                                    let deps = mods.iter().filter(|m| m.auto_installed).count();
+                                    format!(
+                                        "CKAN-managed KSP install: {} mods ({deps} dependencies), plus its saves and settings",
+                                        mods.len()
+                                    )
+                                })
+                                .map_err(|e| format!("{e:#}")),
+                        );
+                        return;
+                    }
                     form.preview = (!form.path.trim().is_empty()).then(|| {
                         modpack::read(&PathBuf::from(form.path.trim()))
                             .map(|p| {
@@ -1867,6 +1994,25 @@ impl App {
                             .map_err(|e| format!("{e:#}"))
                     });
                 }
+            }
+            Msg::Import if matches!(&self.dialog, Some(Dialog::Import(f)) if f.ckan_install) => {
+                let Some(Dialog::Import(form)) = self.dialog.take() else {
+                    return;
+                };
+                let paths = self.ctx.paths.clone();
+                let dir = PathBuf::from(form.path.trim());
+                let mode = if form.full_copy {
+                    CopyMode::Copy
+                } else {
+                    CopyMode::Link
+                };
+                self.spawn("Importing CKAN install", move |tx| {
+                    let mut p = |d, t| {
+                        let _ = tx.send(TaskMsg::Copy(d, t));
+                    };
+                    let r = ckan_import::import(&paths, &dir, &form.name, mode, &mut p);
+                    Done::CkanImported(r.map_err(|e| format!("{e:#}")))
+                });
             }
             Msg::Import => {
                 let Some(index) = self.index.clone() else {
@@ -1883,17 +2029,18 @@ impl App {
                         base: PathBuf::from(form.base.trim()),
                         exact: form.exact,
                     };
-                    self.spawn("Importing modpack", move |tx| {
+                    self.spawn_cancellable("Importing modpack", move |tx, cancel| {
                         let r = forward_events(tx, &egui, |etx| {
-                            modpack::import(&paths, &config, &index, &opts, etx)
+                            modpack::import(&paths, &config, &index, &opts, etx, cancel)
                         });
-                        Done::Imported(r.map_err(|e| format!("{e:#}")))
+                        Done::Imported(r.map_err(task_error))
                     });
                 }
             }
             Msg::CloseDialog => self.dialog = None,
             Msg::Refresh => {
                 self.steam = self.ctx.steam();
+                self.steam_launch_options = launch::current_steam_launch_options(&self.steam);
                 self.reload();
             }
         }
@@ -2004,11 +2151,11 @@ impl App {
         let paths = self.ctx.paths.clone();
         let config = self.ctx.config.clone();
         let egui = self.egui.clone();
-        self.spawn("Applying changes", move |tx| {
+        self.spawn_cancellable("Applying changes", move |tx, cancel| {
             let r = forward_events(tx, &egui, |etx| {
-                ops::apply(&paths, &config, &inst, &plan, etx)
+                ops::apply(&paths, &config, &inst, &plan, etx, cancel)
             });
-            Done::Applied(r.map_err(|e| format!("{e:#}")))
+            Done::Applied(r.map_err(task_error))
         });
     }
 
@@ -2100,6 +2247,22 @@ impl App {
             Ok(None) => {}
             Err(e) => self.note(format!("Save backup failed: {e:#}")),
         }
+        if inst.config.launch.via_steam {
+            let result = instance::sync_links(&mut inst)
+                .and_then(|()| launch::launch_via_steam(&self.ctx.paths, &inst, &self.steam));
+            match result {
+                Ok(()) => {
+                    self.note(format!("Asked Steam to start {}", inst.config.name));
+                    inst.config.last_played = Some(orbis::paths::now_secs());
+                    if let Err(e) = inst.save() {
+                        log::warn!("save last played: {e:#}");
+                    }
+                    self.reload();
+                }
+                Err(e) => self.error(format!("Launch failed: {e:#}")),
+            }
+            return;
+        }
         let result = instance::sync_links(&mut inst)
             .and_then(|()| launch::plan(&inst, &self.steam, &self.ctx.config))
             .and_then(|p| {
@@ -2138,6 +2301,7 @@ impl App {
                 .join(", "),
             allow_testing: c.allow_testing,
             prefix_isolated: c.launch.prefix == PrefixMode::Instance,
+            via_steam: c.launch.via_steam,
             args: c.launch.args.join(" "),
             env: c
                 .launch
@@ -2201,6 +2365,7 @@ impl App {
         inst.config.name = f.name.trim().to_owned();
         inst.config.compat = compat;
         inst.config.allow_testing = f.allow_testing;
+        inst.config.launch.via_steam = f.via_steam;
         inst.config.launch.prefix = if f.prefix_isolated {
             PrefixMode::Instance
         } else {
@@ -2357,6 +2522,18 @@ pub fn when(secs: u64) -> String {
     )
 }
 
+/// Marks a task error as a cancellation, which is reported as a note.
+const CANCELLED: &str = "\u{2063}cancelled";
+
+/// Formats a task error, marking cancellations.
+fn task_error(e: anyhow::Error) -> String {
+    if orbis::cancel::is_cancelled(&e) {
+        CANCELLED.to_owned()
+    } else {
+        format!("{e:#}")
+    }
+}
+
 fn filter_from(s: &str) -> Option<Filter> {
     match s {
         "installed" => Some(Filter::Installed),
@@ -2493,8 +2670,10 @@ fn preview_manual(form: &AddManualForm) -> Option<Result<Vec<String>, String>> {
             .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
         {
             orbis::install::Source::Zip(path.clone())
+        } else if orbis::install::is_packed(&path) {
+            orbis::install::Source::Packed(path.clone())
         } else {
-            anyhow::bail!("pick a .zip file or a folder");
+            anyhow::bail!("pick a .zip, .7z or .rar file, or a folder");
         };
         let entries = source.entries()?;
         let opts = add_options(form);

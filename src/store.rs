@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::cancel::Cancel;
 use crate::download;
 use crate::install::Source;
 use crate::instance::{self, ModSource};
@@ -201,6 +202,146 @@ pub fn clean(paths: &Paths) -> Result<(usize, u64)> {
     Ok((removed, bytes))
 }
 
+/// Filesystems where a copy can share data blocks (reflink).
+const REFLINK_FILESYSTEMS: [&str; 3] = ["xfs", "btrfs", "bcachefs"];
+
+/// The filesystem type of a path, from `stat -f`.
+pub fn filesystem(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(path)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// What sharing space did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shared {
+    /// Files replaced by copies that share the store's data.
+    pub files: usize,
+    pub bytes: u64,
+    /// Mods whose unpacked copy couldn't be made (download not cached).
+    pub skipped: Vec<String>,
+}
+
+/// Makes mods installed before the store existed share disk space with it:
+/// every installed file identical to the store's copy is replaced by a
+/// reflinked copy of it. Files a mod changed are left alone. Only runs on
+/// filesystems with reflinks, where it saves space.
+pub fn share(paths: &Paths, cancel: &Cancel, progress: &mut dyn FnMut(String)) -> Result<Shared> {
+    let fs_type = filesystem(&paths.data).unwrap_or_default();
+    if !REFLINK_FILESYSTEMS.contains(&fs_type.as_str()) {
+        bail!(
+            "{} is on {fs_type}, which can't share file data (btrfs and XFS can)",
+            paths.data.display()
+        );
+    }
+    let mut total = Shared::default();
+    for inst in instance::list(paths)? {
+        cancel.check()?;
+        progress(format!("Sharing space in {}", inst.config.name));
+        let r = share_instance(paths, &inst, cancel)?;
+        total.files += r.files;
+        total.bytes += r.bytes;
+        total.skipped.extend(r.skipped);
+    }
+    Ok(total)
+}
+
+/// [`share`] for one instance, without the filesystem check.
+pub fn share_instance(paths: &Paths, inst: &instance::Instance, cancel: &Cancel) -> Result<Shared> {
+    let game = inst.game_dir();
+    let library = manual::list(paths)?;
+    let mut out = Shared::default();
+    for (id, m) in &inst.registry()?.mods {
+        cancel.check()?;
+        let (source, directives) = match m.source {
+            ModSource::Ckan => {
+                if m.module.kind != crate::metadata::Kind::Package {
+                    continue;
+                }
+                let Some(archive) = download::cached(&paths.downloads(), &m.module) else {
+                    out.skipped
+                        .push(format!("{}: {id} (download not cached)", inst.config.name));
+                    continue;
+                };
+                (ckan_source(paths, &archive)?, m.module.directives())
+            }
+            ModSource::Manual => {
+                let key = id.strip_prefix(manual::PREFIX).unwrap_or(id);
+                let Some(lib) = library.iter().find(|l| l.id == key) else {
+                    continue;
+                };
+                // Folder mods already copy from the library, not the store.
+                if lib.is_dir {
+                    continue;
+                }
+                (manual_source(paths, lib)?, lib.install.clone())
+            }
+        };
+        let Source::Dir(root) = &source else { continue };
+        let Ok(planned) = crate::install::plan(&directives, &source.entries()?) else {
+            continue;
+        };
+        let installed: HashSet<&String> = m.files.iter().collect();
+        for p in planned
+            .iter()
+            .filter(|p| !p.is_dir && installed.contains(&p.dest))
+        {
+            if crate::install::through_link(&game, &p.dest).is_some() {
+                continue;
+            }
+            let target = game.join(&p.dest);
+            let original = root.join(&p.source);
+            if !same_content(&target, &original)? {
+                continue;
+            }
+            let tmp = target.with_file_name(format!(
+                ".{}.orbis-share",
+                target
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            ));
+            fs::copy(&original, &tmp).with_context(|| format!("copy {}", original.display()))?;
+            fs::rename(&tmp, &target).with_context(|| format!("replace {}", target.display()))?;
+            out.files += 1;
+            out.bytes += fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether two files have the same bytes.
+fn same_content(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read;
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else {
+        return Ok(false);
+    };
+    if ma.len() != mb.len() || !ma.is_file() || !mb.is_file() {
+        return Ok(false);
+    }
+    let mut fa = File::open(a).with_context(|| format!("open {}", a.display()))?;
+    let mut fb = File::open(b).with_context(|| format!("open {}", b.display()))?;
+    let mut ba = vec![0; 1 << 16];
+    let mut bb = vec![0; 1 << 16];
+    loop {
+        let n = fa
+            .read(&mut ba)
+            .with_context(|| format!("read {}", a.display()))?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])
+            .with_context(|| format!("read {}", b.display()))?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
 /// Visible entries of a directory: (path, name).
 fn entries(dir: &Path) -> Vec<(PathBuf, String)> {
     let Ok(read) = fs::read_dir(dir) else {
@@ -239,6 +380,74 @@ fn tree_size(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn shares_only_unchanged_files() {
+        use crate::instance::{CopyMode, CreateOptions, InstalledMod};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let ksp = tmp.path().join("ksp");
+        fs::create_dir_all(ksp.join("GameData/Squad")).expect("mkdir");
+        fs::write(ksp.join("KSP_x64.exe"), b"").expect("write");
+        fs::write(ksp.join("readme.txt"), "Version 1.12.5\n").expect("write");
+        let inst = instance::create(
+            &paths,
+            &CreateOptions {
+                name: "s".into(),
+                source: ksp,
+                stock_only: true,
+                with_saves: false,
+                mode: CopyMode::Link,
+            },
+            &mut |_, _| {},
+        )
+        .expect("create");
+        // A mod installed "before the store": files written straight into the
+        // instance, one of them since changed by the mod.
+        let module: crate::metadata::Module = serde_json::from_value(serde_json::json!({
+            "identifier": "Mod", "version": "1", "download": "https://example.invalid/mod.zip"
+        }))
+        .expect("module");
+        let archive = download::cache_path(&paths.downloads(), &module);
+        fs::create_dir_all(archive.parent().expect("parent")).expect("mkdir");
+        {
+            let mut w = zip::ZipWriter::new(File::create(&archive).expect("create"));
+            let o = zip::write::SimpleFileOptions::default();
+            w.start_file("GameData/Mod/same.cfg", o).expect("start");
+            w.write_all(b"same").expect("write");
+            w.start_file("GameData/Mod/settings.cfg", o).expect("start");
+            w.write_all(b"default").expect("write");
+            w.finish().expect("finish");
+        }
+        let gd = inst.game_dir().join("GameData/Mod");
+        fs::create_dir_all(&gd).expect("mkdir");
+        fs::write(gd.join("same.cfg"), b"same").expect("write");
+        fs::write(gd.join("settings.cfg"), b"changed by the mod").expect("write");
+        let mut reg = inst.registry().expect("registry");
+        reg.mods.insert(
+            "Mod".into(),
+            InstalledMod {
+                source: ModSource::Ckan,
+                auto_installed: false,
+                installed_at: 0,
+                files: vec![
+                    "GameData/Mod/same.cfg".into(),
+                    "GameData/Mod/settings.cfg".into(),
+                ],
+                dirs: vec!["GameData/Mod".into()],
+                module,
+            },
+        );
+        inst.save_registry(&reg).expect("save");
+
+        let r = share_instance(&paths, &inst, &Cancel::default()).expect("share");
+        assert_eq!(r.files, 1);
+        assert_eq!(fs::read(gd.join("same.cfg")).expect("read"), b"same");
+        assert_eq!(
+            fs::read(gd.join("settings.cfg")).expect("read"),
+            b"changed by the mod"
+        );
+    }
 
     #[test]
     fn unpacks_once_and_matches_the_zip() {

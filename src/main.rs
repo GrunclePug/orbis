@@ -26,9 +26,21 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = Args::parse();
     let ctx = cli::Context::new(args.root.as_deref())?;
-    match args.command {
+    let result = match args.command {
         None => gui::run(ctx, gui::Options::default()),
         Some(cli::Command::Gui(opts)) => gui::run(ctx, opts),
         Some(cmd) => cli::run(&ctx, cmd),
+    };
+    match result {
+        // Output piped into something that stopped reading (`| head`).
+        Err(e) if broken_pipe(&e) => Ok(()),
+        other => other,
     }
+}
+
+fn broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }

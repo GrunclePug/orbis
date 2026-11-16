@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use anyhow::{Context, Result, bail};
 
 use crate::backup;
+use crate::cancel::Cancel;
 use crate::config::Config;
 use crate::download::{self, DownloadEvent};
 use crate::history;
@@ -78,6 +79,7 @@ pub fn apply(
     inst: &Instance,
     plan: &Plan,
     events: &mpsc::Sender<Event>,
+    cancel: &Cancel,
 ) -> Result<()> {
     if plan.is_empty() {
         return Ok(());
@@ -91,7 +93,7 @@ pub fn apply(
         )));
     }
     let before = history::snapshot(&inst.registry()?);
-    let result = apply_changes(paths, config, inst, plan, events);
+    let result = apply_changes(paths, config, inst, plan, events, cancel);
     let after = history::snapshot(&inst.registry()?);
     let mut summary: Vec<String> = plan.changes.iter().map(ToString::to_string).collect();
     if let Err(e) = &result {
@@ -107,6 +109,7 @@ fn apply_changes(
     inst: &Instance,
     plan: &Plan,
     events: &mpsc::Sender<Event>,
+    cancel: &Cancel,
 ) -> Result<()> {
     let to_fetch: Vec<&Module> = plan
         .changes
@@ -132,7 +135,8 @@ fn apply_changes(
                     let _ = events.send(Event::Download(e));
                 }
             });
-            let r = download::download_modules(&dir, &to_fetch, config.download_workers, &tx);
+            let r =
+                download::download_modules(&dir, &to_fetch, config.download_workers, &tx, cancel);
             drop(tx);
             let _ = forward.join();
             r
@@ -144,6 +148,7 @@ fn apply_changes(
             .collect()
     };
 
+    cancel.check()?;
     let game = inst.game_dir();
     let mut reg = inst.registry()?;
     let mut auto_before: HashMap<String, bool> = HashMap::new();
@@ -165,6 +170,8 @@ fn apply_changes(
         }
     }
     for c in &plan.changes {
+        // Stop between mods, never in the middle of one.
+        cancel.check()?;
         let (module, reason) = match c {
             Change::Install { module, reason } | Change::Upgrade { module, reason, .. } => {
                 (module, reason)
@@ -222,17 +229,19 @@ pub fn restore(
     index: &Index,
     target: &[history::SnapMod],
     events: &mpsc::Sender<Event>,
+    cancel: &Cancel,
 ) -> Result<Vec<String>> {
     let rp = history::restore_plan(paths, inst, index, target)?;
     let mut warnings = rp.warnings;
     if !rp.request.install.is_empty() || !rp.request.remove.is_empty() {
         let p = plan(inst, index, &rp.request)?.map_err(|e| anyhow::anyhow!("{e}"))?;
-        apply(paths, config, inst, &p, events)?;
+        apply(paths, config, inst, &p, events, cancel)?;
     }
     for m in &rp.manual {
+        cancel.check()?;
         let result = plan_manual(inst, index, m).and_then(|p| {
             let p = p.map_err(|e| anyhow::anyhow!("{e}"))?;
-            apply(paths, config, inst, &p, events)
+            apply(paths, config, inst, &p, events, cancel)
         });
         if let Err(e) = result {
             warnings.push(format!("manual mod {}: {e:#}", m.name));
@@ -434,7 +443,14 @@ mod tests {
             ..Request::default()
         };
         let p = plan(&inst, &index, &req).expect("io").expect("resolves");
-        apply(&paths, &config, &inst, &p, &tx).expect("apply");
+        // Cancelled before it starts: nothing changes.
+        let stop = Cancel::default();
+        stop.cancel();
+        let err = apply(&paths, &config, &inst, &p, &tx, &stop).expect_err("cancelled");
+        assert!(crate::cancel::is_cancelled(&err));
+        assert!(inst.registry().expect("registry").mods.is_empty());
+        assert!(!inst.game_dir().join("GameData/App").exists());
+        apply(&paths, &config, &inst, &p, &tx, &Cancel::default()).expect("apply");
         let g = inst.game_dir();
         assert!(g.join("GameData/App/app.dll").is_file());
         assert!(g.join("GameData/Lib/lib.dll").is_file());
@@ -447,7 +463,7 @@ mod tests {
             ..Request::default()
         };
         let p = plan(&inst, &index, &req).expect("io").expect("resolves");
-        apply(&paths, &config, &inst, &p, &tx).expect("upgrade");
+        apply(&paths, &config, &inst, &p, &tx, &Cancel::default()).expect("upgrade");
         assert!(!g.join("GameData/App/app.dll").exists());
         assert!(g.join("GameData/App/app2.dll").is_file());
 
@@ -457,7 +473,7 @@ mod tests {
         };
         let p = plan(&inst, &index, &req).expect("io").expect("resolves");
         assert_eq!(p.changes.len(), 2, "Lib goes too: {:?}", p.changes);
-        apply(&paths, &config, &inst, &p, &tx).expect("remove");
+        apply(&paths, &config, &inst, &p, &tx, &Cancel::default()).expect("remove");
         assert!(!g.join("GameData/App").exists());
         assert!(!g.join("GameData/Lib").exists());
         assert!(inst.registry().expect("registry").mods.is_empty());
@@ -467,7 +483,16 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert!(entries[0].summary[0].starts_with("remove App"));
         let first = entries.last().expect("first entry").after.clone();
-        let warnings = restore(&paths, &config, &inst, &index, &first, &tx).expect("restore");
+        let warnings = restore(
+            &paths,
+            &config,
+            &inst,
+            &index,
+            &first,
+            &tx,
+            &Cancel::default(),
+        )
+        .expect("restore");
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(g.join("GameData/App/app.dll").is_file());
         let reg = inst.registry().expect("registry");
@@ -531,7 +556,15 @@ mod tests {
         };
         let index = Index::default();
         let p = plan(&inst, &index, &req).expect("io").expect("plan");
-        apply(&paths, &Config::default(), &inst, &p, &tx).expect("remove");
+        apply(
+            &paths,
+            &Config::default(),
+            &inst,
+            &p,
+            &tx,
+            &Cancel::default(),
+        )
+        .expect("remove");
         assert!(!gd.join("HandMod").exists());
         assert!(m.plan(&paths).expect("library copy").len() > 1);
     }

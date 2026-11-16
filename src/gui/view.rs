@@ -15,7 +15,7 @@ const ROW_H: f32 = 24.0;
 
 pub fn draw(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     top_bar(app, ui, msgs);
-    status_bar(app, ui);
+    status_bar(app, ui, msgs);
     instances_panel(app, ui, msgs);
     if app.tab == Tab::Mods {
         details_panel(app, ui, msgs);
@@ -62,7 +62,7 @@ fn top_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     });
 }
 
-fn status_bar(app: &App, ui: &mut Ui) {
+fn status_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     egui::Panel::bottom("status").show(ui, |ui| {
         ui.add_space(2.0);
         match &app.task {
@@ -70,6 +70,14 @@ fn status_bar(app: &App, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(RichText::new(&task.title).strong());
+                    if task.cancellable
+                        && ui
+                            .add_enabled(!task.cancel.is_set(), egui::Button::new("Cancel"))
+                            .on_hover_text("Stop after the current download or mod; partial downloads resume next time")
+                            .clicked()
+                    {
+                        msgs.push(Msg::CancelTask);
+                    }
                     ui.label(&task.status);
                     if let Some(p) = task.progress {
                         ui.add(
@@ -831,15 +839,18 @@ fn actions(app: &App, ui: &mut Ui, m: &Module, msgs: &mut Vec<Msg>) {
                     .map_or(id.clone(), |o| o.module.display_name().to_owned())
             })
             .collect();
-        ui.horizontal_wrapped(|ui| {
-            if i.auto_installed {
-                let text = if required_by.is_empty() {
-                    "Installed as a dependency; nothing needs it now".to_owned()
-                } else {
-                    format!("Dependency of {}", required_by.join(", "))
-                };
-                ui.label(RichText::new(text).weak());
-                if ui
+        if !i.auto_installed && required_by.is_empty() {
+            // Nothing to say about dependencies.
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                if i.auto_installed {
+                    let text = if required_by.is_empty() {
+                        "Installed as a dependency; nothing needs it now".to_owned()
+                    } else {
+                        format!("Dependency of {}", required_by.join(", "))
+                    };
+                    ui.label(RichText::new(text).weak());
+                    if ui
                     .small_button("Keep it")
                     .on_hover_text(
                         "Treat it as something you installed, so it stays when what needed it goes",
@@ -848,21 +859,22 @@ fn actions(app: &App, ui: &mut Ui, m: &Module, msgs: &mut Vec<Msg>) {
                 {
                     msgs.push(Msg::SetAuto(m.identifier.clone(), false));
                 }
-            } else if !required_by.is_empty() {
-                ui.label(
-                    RichText::new(format!("Also needed by {}", required_by.join(", "))).weak(),
-                );
-                if ui
-                    .small_button("Mark as dependency")
-                    .on_hover_text(
-                        "Hide it with the dependencies and remove it once nothing needs it",
-                    )
-                    .clicked()
-                {
-                    msgs.push(Msg::SetAuto(m.identifier.clone(), true));
+                } else if !required_by.is_empty() {
+                    ui.label(
+                        RichText::new(format!("Also needed by {}", required_by.join(", "))).weak(),
+                    );
+                    if ui
+                        .small_button("Mark as dependency")
+                        .on_hover_text(
+                            "Hide it with the dependencies and remove it once nothing needs it",
+                        )
+                        .clicked()
+                    {
+                        msgs.push(Msg::SetAuto(m.identifier.clone(), true));
+                    }
                 }
-            }
-        });
+            });
+        }
     }
     ui.horizontal(|ui| match installed {
         Some(i) => {
@@ -934,7 +946,7 @@ fn manual_tab(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         });
     });
     ui.label(
-        RichText::new("Tip: drop a .zip or folder onto the window to add it.")
+        RichText::new("Tip: drop a .zip, .7z, .rar or folder onto the window to add it.")
             .small()
             .weak(),
     );
@@ -1088,6 +1100,10 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                             "Off: share Steam's KSP prefix (KSP keeps its data in the game folder)",
                         );
                         ui.end_row();
+                        ui.label("Launch");
+                        ui.checkbox(&mut f.via_steam, "Through Steam (overlay and playtime)")
+                            .on_hover_text("Off: orbis runs Proton itself, no Steam setup needed");
+                        ui.end_row();
                         ui.label("Launch arguments");
                         ui.add(
                             egui::TextEdit::singleline(&mut f.args)
@@ -1113,6 +1129,30 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     });
                 if ui.button("Save instance settings").clicked() {
                     msgs.push(Msg::SaveInstanceSettings);
+                }
+                if app.settings.via_steam {
+                    let wanted = orbis::launch::steam_launch_options(app.ctx.root.as_deref());
+                    let current = app.steam_launch_options.clone().unwrap_or_default();
+                    if current.contains("steam-run") {
+                        ui.label(RichText::new("Steam is set up to launch instances.").small().color(GOOD));
+                    } else {
+                        ui.label(
+                            RichText::new("One-time setup: in Steam, open KSP > Properties > Launch Options and enter:")
+                                .small()
+                                .color(WARN),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&wanted).monospace().small());
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(wanted.clone());
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Launching KSP from your Steam library stays vanilla; only Launch here picks an instance. Save, then press Re-detect after changing Steam.")
+                                .small()
+                                .weak(),
+                        );
+                    }
                 }
                 if let Some(v) = app.current() {
                     ui.label(
@@ -1183,6 +1223,13 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                             msgs.push(Msg::CleanStore);
                         }
                     });
+                    if ui
+                        .add_enabled(!app.busy(), egui::Button::new("Share space with older installs"))
+                        .on_hover_text("Mods installed before the store existed are separate copies; this makes identical files share disk space (btrfs and XFS)")
+                        .clicked()
+                    {
+                        msgs.push(Msg::ShareStore);
+                    }
                 }
             }
             ui.add_space(12.0);
@@ -1758,11 +1805,11 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
             }
             Dialog::AddManual(form) => {
                 ui.heading("Add manual mod");
-                ui.label("A .zip or a folder. If it has a GameData folder, its contents are installed; otherwise each top-level folder goes into GameData.");
+                ui.label("A .zip, .7z or .rar archive, or a folder. If it has a GameData folder, its contents are installed; otherwise each top-level folder goes into GameData.");
                 ui.add_space(6.0);
                 egui::Grid::new("add-manual").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                     ui.label("File or folder");
-                    ui.add(egui::TextEdit::singleline(&mut form.path).hint_text("/path/to/mod.zip").desired_width(380.0));
+                    ui.add(egui::TextEdit::singleline(&mut form.path).hint_text("/path/to/mod.zip, .7z or .rar").desired_width(380.0));
                     ui.end_row();
                     ui.label("Name");
                     ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(380.0));
@@ -1854,25 +1901,31 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 buttons(ui, msgs, "Export", ok, Msg::Export);
             }
             Dialog::Import(form) => {
-                ui.heading("Import modpack");
-                ui.label("Creates a new instance linked to the game install and installs the pack's mods. Drop a .orbispack or .ckan file on the window to get here.");
+                ui.heading("Import");
+                ui.label("A modpack (.orbispack or CKAN .ckan) becomes a new instance with the pack's mods. A KSP folder that CKAN manages becomes an instance with its mods, saves and settings, tracked by orbis.");
                 ui.add_space(6.0);
                 egui::Grid::new("import").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    ui.label("Modpack file");
+                    ui.label("Pack file or KSP folder");
                     ui.add(
                         egui::TextEdit::singleline(&mut form.path)
-                            .hint_text("/path/to/pack.orbispack")
+                            .hint_text("/path/to/pack.orbispack or /path/to/KSP")
                             .desired_width(380.0),
                     );
                     ui.end_row();
                     ui.label("Instance name");
                     ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(380.0));
                     ui.end_row();
-                    ui.label("Game install");
-                    ui.add(egui::TextEdit::singleline(&mut form.base).desired_width(380.0));
-                    ui.end_row();
+                    if !form.ckan_install {
+                        ui.label("Game install");
+                        ui.add(egui::TextEdit::singleline(&mut form.base).desired_width(380.0));
+                        ui.end_row();
+                    }
                 });
-                ui.checkbox(&mut form.exact, "Install the pack's exact versions (otherwise the newest compatible)");
+                if form.ckan_install {
+                    ui.checkbox(&mut form.full_copy, "Full copy (otherwise stock files are linked from that folder, which must stay)");
+                } else {
+                    ui.checkbox(&mut form.exact, "Install the pack's exact versions (otherwise the newest compatible)");
+                }
                 if form.previewed_for != form.path {
                     msgs.push(Msg::PreviewImport);
                 }
@@ -1886,8 +1939,9 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                     None => {}
                 }
                 ui.add_space(8.0);
-                let ok = !busy && matches!(form.preview, Some(Ok(_))) && app_index_ready;
-                if !app_index_ready {
+                let needs_index = !form.ckan_install;
+                let ok = !busy && matches!(form.preview, Some(Ok(_))) && (app_index_ready || !needs_index);
+                if needs_index && !app_index_ready {
                     ui.label(RichText::new("Load the mod index first (Update index).").color(WARN));
                 }
                 buttons(ui, msgs, "Import", ok, Msg::Import);
