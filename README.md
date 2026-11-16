@@ -317,7 +317,7 @@ Fork the repository and open a pull request.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Portions are derived from CKAN, MIT licensed by the CKAN authors; see [NOTICE](NOTICE).
+MIT. See [LICENSE](LICENSE). Portions are derived from CKAN, MIT licensed by the CKAN authors; see [NOTICE](NOTICE). The interface font, Noto Sans, is embedded under the SIL Open Font License; see [assets/fonts/OFL.txt](assets/fonts/OFL.txt).
 
 ## Author
 

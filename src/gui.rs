@@ -2,6 +2,7 @@
 
 mod app;
 mod headless;
+mod theme;
 mod view;
 
 use std::path::PathBuf;

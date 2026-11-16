@@ -44,3 +44,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+The interface font is Noto Sans (Regular and SemiBold), Copyright 2022 The
+Noto Project Authors, embedded unmodified from assets/fonts/ under the SIL
+Open Font License 1.1 (see assets/fonts/OFL.txt).

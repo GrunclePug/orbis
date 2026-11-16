@@ -33,7 +33,7 @@ use orbis::version::{GameVersion, ModVersion};
 use orbis::{backup, flags, history, logs, running, store};
 
 /// Height of one mod table row including spacing (see `view::ROW_H`).
-pub const ROW_STEP: f32 = 30.0;
+pub const ROW_STEP: f32 = 34.0;
 use serde::{Deserialize, Serialize};
 
 use super::Options;
@@ -666,10 +666,7 @@ impl App {
         if let Some(f) = opts.filter.as_deref().and_then(filter_from) {
             app.filter = f;
         }
-        app.egui.global_style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            s.spacing.button_padding = egui::vec2(8.0, 4.0);
-        });
+        super::theme::apply(&app.egui);
         app
     }
 
