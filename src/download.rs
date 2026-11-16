@@ -27,9 +27,24 @@ pub enum Fetched {
     NotModified,
 }
 
-/// Downloads the first URL that works into `dest`, reporting the bytes
-/// written so far. With `etag`, sends the saved ETag and returns
-/// `NotModified` when the server says nothing changed.
+/// A connection slower than this many bytes per second for `SLOW_SECS`
+/// is dropped and the download resumes on a fresh connection. Hosts like
+/// SpaceDock sometimes hand out one crawling connection while a new one is
+/// fast.
+const SLOW_BYTES_PER_SEC: &str = "131072";
+const SLOW_SECS: &str = "15";
+/// Attempts in a row that add no bytes before a download gives up.
+const MAX_STALLS: usize = 4;
+
+/// Downloads into `dest`, reporting the bytes written so far.
+///
+/// With `etag`, this is a conditional fetch of a single file: the saved
+/// ETag is sent and `NotModified` comes back when nothing changed.
+///
+/// Without it, all URLs are treated as mirrors of the same file: a slow or
+/// broken connection is dropped and the download resumes from the partial
+/// file, moving on to the next URL. The partial file is kept on failure so
+/// a later attempt resumes it (the caller verifies hashes afterwards).
 pub fn fetch(
     urls: &[String],
     dest: &Path,
@@ -42,45 +57,105 @@ pub fn fetch(
     let dir = dest.parent().context("destination has no parent")?;
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let part = dest.with_extension("part");
-    let mut errors = Vec::new();
-    for url in urls {
-        match fetch_one(url, &part, etag, progress) {
-            Ok(Fetched::NotModified) => {
+    let finish = |fetched: Fetched| -> Result<Fetched> {
+        match fetched {
+            Fetched::NotModified => {
                 let _ = fs::remove_file(&part);
-                return Ok(Fetched::NotModified);
             }
-            Ok(Fetched::Downloaded) => {
+            Fetched::Downloaded => {
                 fs::rename(&part, dest)
                     .with_context(|| format!("move download to {}", dest.display()))?;
-                return Ok(Fetched::Downloaded);
             }
-            Err(e) => {
+        }
+        Ok(fetched)
+    };
+
+    let mut errors = Vec::new();
+    if let Some(etag) = etag {
+        for url in urls {
+            let _ = fs::remove_file(&part);
+            match run_curl(url, &part, Some(etag), false, progress)? {
+                Ok(f) => return finish(f),
+                Err(Failure::Refused(e) | Failure::Transient(e)) => {
+                    errors.push(format!("{url}: {e}"))
+                }
+            }
+        }
+        let _ = fs::remove_file(&part);
+        bail!("download failed:\n  {}", errors.join("\n  "));
+    }
+
+    let mut live: Vec<&String> = urls.iter().collect();
+    let mut stalls = 0;
+    let mut turn = 0;
+    while !live.is_empty() {
+        let idx = turn % live.len();
+        let url = live[idx];
+        let before = file_len(&part);
+        match run_curl(url, &part, None, before > 0, progress)? {
+            Ok(f) => return finish(f),
+            Err(Failure::Refused(e)) if before > 0 => {
+                // Maybe the server can't resume: start this source over.
+                log::info!("{url}: {e}; restarting from scratch");
                 let _ = fs::remove_file(&part);
-                errors.push(format!("{url}: {e:#}"));
+            }
+            Err(Failure::Refused(e)) => {
+                errors.push(format!("{url}: {e}"));
+                live.remove(idx);
+            }
+            Err(Failure::Transient(e)) => {
+                if file_len(&part) > before {
+                    stalls = 0;
+                } else {
+                    stalls += 1;
+                    errors.push(format!("{url}: {e}"));
+                }
+                if stalls >= MAX_STALLS {
+                    break;
+                }
+                log::info!("{url}: {e}; resuming on a new connection");
+                turn += 1;
             }
         }
     }
     bail!("download failed:\n  {}", errors.join("\n  "))
 }
 
-fn fetch_one(
+fn file_len(p: &Path) -> u64 {
+    fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Why one curl run failed.
+enum Failure {
+    /// The server answered with an error (or can't resume): this source
+    /// won't work as is.
+    Refused(String),
+    /// Network trouble or a too-slow connection: worth another try.
+    Transient(String),
+}
+
+/// Runs curl once. The outer error is for curl not starting at all.
+fn run_curl(
     url: &str,
     part: &Path,
     etag: Option<&Path>,
+    resume: bool,
     progress: &mut dyn FnMut(u64),
-) -> Result<Fetched> {
+) -> Result<Result<Fetched, Failure>> {
     let mut cmd = Command::new("curl");
-    cmd.args([
-        "--fail",
-        "--location",
-        "--silent",
-        "--show-error",
-        "--retry",
-        "2",
-    ])
-    .args(["--connect-timeout", "30", "--user-agent", &user_agent()])
-    .args(["--write-out", "%{http_code}", "--output"])
-    .arg(part);
+    cmd.args(["--fail", "--location", "--silent", "--show-error"])
+        .args(["--connect-timeout", "30", "--user-agent", &user_agent()])
+        .args([
+            "--speed-limit",
+            SLOW_BYTES_PER_SEC,
+            "--speed-time",
+            SLOW_SECS,
+        ])
+        .args(["--write-out", "%{http_code}", "--output"])
+        .arg(part);
+    if resume {
+        cmd.args(["--continue-at", "-"]);
+    }
     if let Some(etag) = etag {
         if etag.is_file() {
             cmd.arg("--etag-compare").arg(etag);
@@ -102,23 +177,28 @@ fn fetch_one(
             if let Some(mut e) = child.stderr.take() {
                 e.read_to_string(&mut err).ok();
             }
-            if !status.success() {
-                bail!("{}", err.trim());
-            }
-            if code.trim() == "304" {
-                return Ok(Fetched::NotModified);
-            }
-            if let Ok(meta) = fs::metadata(part) {
-                progress(meta.len());
-            } else {
-                // curl succeeded but wrote nothing, e.g. an empty file.
-                File::create(part).with_context(|| format!("create {}", part.display()))?;
-            }
-            return Ok(Fetched::Downloaded);
+            let err = err.trim().to_owned();
+            return Ok(match status.code() {
+                Some(0) => {
+                    if code.trim() == "304" {
+                        Ok(Fetched::NotModified)
+                    } else {
+                        if !part.exists() {
+                            // curl succeeded but wrote nothing (an empty file).
+                            File::create(part)
+                                .with_context(|| format!("create {}", part.display()))?;
+                        }
+                        progress(file_len(part));
+                        Ok(Fetched::Downloaded)
+                    }
+                }
+                // 22: HTTP error status. 33: the server can't resume.
+                // 36: bad resume offset.
+                Some(22 | 33 | 36) => Err(Failure::Refused(err)),
+                _ => Err(Failure::Transient(err)),
+            });
         }
-        if let Ok(meta) = fs::metadata(part) {
-            progress(meta.len());
-        }
+        progress(file_len(part));
         std::thread::sleep(Duration::from_millis(150));
     }
 }
@@ -273,7 +353,13 @@ fn download_one(dir: &Path, m: &Module, events: &mpsc::Sender<DownloadEvent>) ->
             total,
         });
     };
-    fetch(&m.download, &dest, None, &mut report)?;
+    let mut urls = m.download.clone();
+    if let Some(mirror) = m.mirror_url()
+        && !urls.contains(&mirror)
+    {
+        urls.push(mirror);
+    }
+    fetch(&urls, &dest, None, &mut report)?;
     if let Err(e) = verify(&dest, m.download_hash.as_ref()) {
         let _ = fs::remove_file(&dest);
         return Err(e);
@@ -308,6 +394,23 @@ mod tests {
             sha256: None,
         };
         assert!(verify(&p, Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn resumes_a_partial_download() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src.bin");
+        let body: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &body).expect("write");
+        let dest = tmp.path().join("dest.bin");
+        fs::write(dest.with_extension("part"), &body[..40_000]).expect("write part");
+        let urls = vec![
+            format!("file://{}", tmp.path().join("missing.bin").display()),
+            format!("file://{}", src.display()),
+        ];
+        fetch(&urls, &dest, None, &mut |_| {}).expect("fetch");
+        assert_eq!(fs::read(&dest).expect("read"), body);
+        assert!(!dest.with_extension("part").exists());
     }
 
     #[test]

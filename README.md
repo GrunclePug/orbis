@@ -15,6 +15,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1. 
 * **Manual mods**: add a `.zip` or folder once, then install it into any instance. A manual mod can replace CKAN mods (for example, a Patreon Volumetric Clouds build standing in for EVE Redux and Scatterer), so mods that depend on them keep working.
 * **Proton launch**: start any instance with the Proton build Steam has mapped to KSP, inside the Steam Linux Runtime when Proton asks for it.
 * **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
+* **Reliable downloads**: parallel downloads that drop stalled connections and resume where they left off, falling back to CKAN's archive.org mirror for freely licensed mods.
 * **Safe file handling**: every installed file is tracked per mod, conflicts are refused, and a failed install rolls back.
 * **GUI and CLI**: an egui interface, plus a CLI covering every operation.
 * **Headless rendering**: the GUI renders offscreen to PNG with a text state dump, so it can be checked without a display.

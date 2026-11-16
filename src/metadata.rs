@@ -340,11 +340,131 @@ impl Module {
         }
     }
 
+    /// CKAN's archive.org mirror of the download, offered only for licenses
+    /// that allow redistribution (CKAN uploads those automatically).
+    pub fn mirror_url(&self) -> Option<String> {
+        if !self
+            .license
+            .iter()
+            .any(|l| REDISTRIBUTABLE.contains(&l.as_str()))
+        {
+            return None;
+        }
+        let hash = self
+            .download_hash
+            .as_ref()
+            .and_then(|h| h.sha1.as_deref().or(h.sha256.as_deref()))?;
+        let raw = format!("{}-{}", self.identifier, self.version.as_str())
+            .replace(' ', "_")
+            .replace(':', "-");
+        let bucket: String = raw
+            .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .take(100)
+            .collect();
+        let prefix: String = hash.chars().take(8).collect();
+        if bucket.is_empty() || prefix.len() < 8 {
+            return None;
+        }
+        Some(format!(
+            "https://archive.org/download/{bucket}/{prefix}-{bucket}.zip"
+        ))
+    }
+
     /// The first string resource with the given key (homepage, repository...).
     pub fn resource(&self, key: &str) -> Option<&str> {
         self.resources.get(key).and_then(|v| v.as_str())
     }
 }
+
+/// Licenses CKAN may redistribute (`redistributable_license` in CKAN.schema).
+const REDISTRIBUTABLE: [&str; 84] = [
+    "public-domain",
+    "Apache",
+    "Apache-1.0",
+    "Apache-2.0",
+    "Artistic",
+    "Artistic-1.0",
+    "Artistic-2.0",
+    "BSD-2-clause",
+    "BSD-3-clause",
+    "BSD-4-clause",
+    "ISC",
+    "CC-BY",
+    "CC-BY-1.0",
+    "CC-BY-2.0",
+    "CC-BY-2.5",
+    "CC-BY-3.0",
+    "CC-BY-4.0",
+    "CC-BY-SA",
+    "CC-BY-SA-1.0",
+    "CC-BY-SA-2.0",
+    "CC-BY-SA-2.5",
+    "CC-BY-SA-3.0",
+    "CC-BY-SA-4.0",
+    "CC-BY-NC",
+    "CC-BY-NC-1.0",
+    "CC-BY-NC-2.0",
+    "CC-BY-NC-2.5",
+    "CC-BY-NC-3.0",
+    "CC-BY-NC-4.0",
+    "CC-BY-NC-SA",
+    "CC-BY-NC-SA-1.0",
+    "CC-BY-NC-SA-2.0",
+    "CC-BY-NC-SA-2.5",
+    "CC-BY-NC-SA-3.0",
+    "CC-BY-NC-SA-4.0",
+    "CC-BY-NC-ND",
+    "CC-BY-NC-ND-1.0",
+    "CC-BY-NC-ND-2.0",
+    "CC-BY-NC-ND-2.5",
+    "CC-BY-NC-ND-3.0",
+    "CC-BY-NC-ND-4.0",
+    "CC-BY-ND",
+    "CC-BY-ND-1.0",
+    "CC-BY-ND-2.0",
+    "CC-BY-ND-2.5",
+    "CC-BY-ND-3.0",
+    "CC-BY-ND-4.0",
+    "CC0",
+    "CDDL",
+    "CPL",
+    "EFL-1.0",
+    "EFL-2.0",
+    "Expat",
+    "MIT",
+    "GPL-1.0",
+    "GPL-2.0",
+    "GPL-3.0",
+    "LGPL-2.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+    "GFDL-1.0",
+    "GFDL-1.1",
+    "GFDL-1.2",
+    "GFDL-1.3",
+    "GFDL-NIV-1.0",
+    "GFDL-NIV-1.1",
+    "GFDL-NIV-1.2",
+    "GFDL-NIV-1.3",
+    "LPPL-1.0",
+    "LPPL-1.1",
+    "LPPL-1.2",
+    "LPPL-1.3c",
+    "MPL-1.1",
+    "MPL-2.0",
+    "Perl",
+    "Python-2.0",
+    "QPL-1.0",
+    "W3C",
+    "Zlib",
+    "Zope",
+    "WTFPL",
+    "Unlicense",
+    "open-source",
+    "unrestricted",
+];
 
 fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     Ok(opt_one_or_many(d)?.unwrap_or_default())
@@ -409,6 +529,32 @@ mod tests {
         let round = serde_json::to_string(&m).expect("serializes");
         let back: Module = serde_json::from_str(&round).expect("round trip");
         assert_eq!(back.version, m.version);
+    }
+
+    #[test]
+    fn mirror_urls_follow_ckan() {
+        let mut m: Module = serde_json::from_value(serde_json::json!({
+            "identifier": "FelineUtilityRovers",
+            "version": "1.3.6",
+            "license": "CC-BY-NC",
+            "download_hash": { "sha1": "EEBEA0EB357588CACEF24B627EDDF32A4F4BBE2F" }
+        }))
+        .expect("parses");
+        assert_eq!(
+            m.mirror_url().as_deref(),
+            Some(
+                "https://archive.org/download/FelineUtilityRovers-1.3.6/EEBEA0EB-FelineUtilityRovers-1.3.6.zip"
+            )
+        );
+        m.version = ModVersion::new("2:v 1.0+b");
+        assert_eq!(
+            m.mirror_url().as_deref(),
+            Some(
+                "https://archive.org/download/FelineUtilityRovers-2-v_1.0b/EEBEA0EB-FelineUtilityRovers-2-v_1.0b.zip"
+            )
+        );
+        m.license = vec!["restricted".into()];
+        assert_eq!(m.mirror_url(), None);
     }
 
     #[test]
