@@ -414,8 +414,9 @@ fn installed_files(reg: &Registry) -> BTreeMap<String, (String, Vec<String>)> {
         .collect()
 }
 
-/// Whether a folder holds any file (in subfolders too), apart from the
-/// stash marker at its top.
+/// Whether a folder holds any file in its subfolders. Set-aside files
+/// always sit in `<stash>/<mod>/...`; files at the top are the stash's own
+/// marker (or a half-written one) and don't count.
 fn holds_files(dir: &std::path::Path, top: bool) -> Result<bool> {
     for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let e = e.with_context(|| format!("read {}", dir.display()))?;
@@ -426,7 +427,7 @@ fn holds_files(dir: &std::path::Path, top: bool) -> Result<bool> {
             if holds_files(&e.path(), false)? {
                 return Ok(true);
             }
-        } else if !(top && e.file_name() == BEFORE) {
+        } else if !top {
             return Ok(true);
         }
     }
@@ -466,7 +467,9 @@ fn clear_committed_stash(inst: &Instance, stash: &std::path::Path) -> Result<()>
         .ok()
         .and_then(|b| serde_json::from_slice::<BTreeMap<String, (String, Vec<String>)>>(&b).ok());
     let now = installed_files(&inst.registry()?);
-    let interrupted = has_files && before.is_some_and(|b| b == now);
+    // No record (a stash from before 0.13.2, or one written moments before
+    // a crash) can't prove the change was saved: keep the files.
+    let interrupted = has_files && before.is_none_or(|b| b == now);
     if !interrupted {
         return remove_stash(stash)
             .with_context(|| format!("clear the leftover {}", stash.display()));
@@ -1156,6 +1159,17 @@ mod tests {
             stash.join("two/GameData/Two/old.dll").is_file(),
             "kept for recovery"
         );
+
+        // A stash from before the record existed is never taken as finished.
+        fs::remove_file(stash.join(BEFORE)).expect("rm marker");
+        fs::write(stash.join(".installed-before.json.tmp"), "half").expect("write");
+        let err = run(Request {
+            remove: vec!["Two".into()],
+            ..Request::default()
+        })
+        .expect_err("no record: interrupted");
+        assert!(format!("{err:#}").contains("interrupted"), "{err:#}");
+        assert!(stash.join("two/GameData/Two/old.dll").is_file());
     }
 
     #[test]
