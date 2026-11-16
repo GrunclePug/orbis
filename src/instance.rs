@@ -47,6 +47,9 @@ pub struct InstanceConfig {
     pub notes: String,
     #[serde(default)]
     pub launch: LaunchConfig,
+    /// The game install this instance links to. `None` for a full copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<PathBuf>,
 }
 
 /// How an instance starts.
@@ -258,12 +261,16 @@ pub fn find(paths: &Paths, key: &str) -> Result<Instance> {
     bail!("no instance {key:?} (have: {})", names.join(", "))
 }
 
-/// How to copy game files.
+/// How an instance gets its game files.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CopyMode {
-    /// A normal copy. On reflink filesystems (btrfs, XFS) the kernel shares
-    /// the data blocks, so this is instant and takes no space.
+    /// Link the stock game from the source install and own only mods,
+    /// saves and settings. The source is never written to, and the instance
+    /// follows it when it updates.
     #[default]
+    Link,
+    /// A full, independent copy that keeps its game version. On reflink
+    /// filesystems (btrfs, XFS) the copy shares data blocks and is instant.
     Copy,
     /// Hard links, for filesystems without reflinks. Stock files are shared
     /// with the source, so never edit them in place.
@@ -300,15 +307,27 @@ pub fn create(paths: &Paths, opts: &CreateOptions, progress: CopyProgress) -> Re
     if partial.exists() {
         fs::remove_dir_all(&partial).with_context(|| format!("clear {}", partial.display()))?;
     }
+    let base = match opts.mode {
+        CopyMode::Link => Some(
+            fs::canonicalize(&opts.source)
+                .with_context(|| format!("resolve {}", opts.source.display()))?,
+        ),
+        CopyMode::Copy | CopyMode::Hardlink => None,
+    };
     let result = (|| -> Result<Instance> {
-        let files = collect(&opts.source, opts)?;
-        copy_tree(
-            &opts.source,
-            &partial.join("game"),
-            &files,
-            opts.mode,
-            progress,
-        )?;
+        match &base {
+            Some(base) => build_linked(base, &partial.join("game"), opts.with_saves, progress)?,
+            None => {
+                let files = collect(&opts.source, opts)?;
+                copy_tree(
+                    &opts.source,
+                    &partial.join("game"),
+                    &files,
+                    opts.mode,
+                    progress,
+                )?;
+            }
+        }
         for d in [
             "Ships/VAB",
             "Ships/SPH",
@@ -333,6 +352,7 @@ pub fn create(paths: &Paths, opts: &CreateOptions, progress: CopyProgress) -> Re
                 last_played: None,
                 notes: String::new(),
                 launch: LaunchConfig::default(),
+                base: base.clone(),
             },
         };
         inst.save()?;
@@ -366,6 +386,7 @@ pub fn clone_instance(
         source: src.game_dir(),
         stock_only: false,
         with_saves,
+        // Copying a linked instance copies its links as links.
         mode: CopyMode::Copy,
     };
     let mut inst = create(paths, &opts, progress)?;
@@ -387,6 +408,146 @@ pub fn delete(inst: &Instance) -> Result<()> {
         bail!("{} does not look like an instance", inst.dir.display());
     }
     fs::remove_dir_all(&inst.dir).with_context(|| format!("delete {}", inst.dir.display()))
+}
+
+/// Top-level entries a linked instance owns: copied at creation, never linked.
+const OWNED: [&str; 7] = [
+    "GameData",
+    "saves",
+    "Ships",
+    "Missions",
+    "UserLoadingScreens",
+    "settings.cfg",
+    "Physics.cfg",
+];
+
+/// Top-level entries the game or other tools write: neither copied nor linked.
+const GENERATED: [&str; 7] = [
+    "Logs",
+    "Screenshots",
+    "thumbs",
+    "KSP.log",
+    "PartDatabase.cfg",
+    "CKAN",
+    "orbis-launch.log",
+];
+
+/// Stock GameData folders a linked instance links from its base.
+const STOCK_GAMEDATA: [&str; 2] = ["Squad", "SquadExpansion"];
+
+fn is_in(list: &[&str], name: &str) -> bool {
+    list.iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Builds a linked game directory: owned entries copied from `base`, stock
+/// GameData and every other top-level entry symlinked to it.
+fn build_linked(base: &Path, game: &Path, with_saves: bool, progress: CopyProgress) -> Result<()> {
+    let opts = CreateOptions {
+        name: String::new(),
+        source: base.to_path_buf(),
+        stock_only: true,
+        with_saves,
+        mode: CopyMode::Copy,
+    };
+    let owned: Vec<(String, fs::FileType)> = collect(base, &opts)?
+        .into_iter()
+        .filter(|(rel, _)| {
+            let first = rel.split('/').next().unwrap_or("");
+            is_in(&OWNED, first) && !first.eq_ignore_ascii_case("GameData")
+        })
+        .collect();
+    copy_tree(base, game, &owned, CopyMode::Copy, progress)?;
+    fs::create_dir_all(game.join("GameData")).context("create GameData")?;
+    link_missing(base, game)?;
+    Ok(())
+}
+
+/// Creates the links a linked game directory should have and removes links
+/// whose target is gone. Returns how many links changed.
+fn link_missing(base: &Path, game: &Path) -> Result<usize> {
+    let mut changed = 0;
+    let mut wanted: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(base).with_context(|| format!("read {}", base.display()))? {
+        let name = entry
+            .with_context(|| format!("read {}", base.display()))?
+            .file_name();
+        let n = name.to_string_lossy();
+        if is_in(&OWNED, &n) || is_in(&GENERATED, &n) {
+            continue;
+        }
+        wanted.push((base.join(&name), game.join(&name)));
+    }
+    for stock in STOCK_GAMEDATA {
+        let target = base.join("GameData").join(stock);
+        if target.is_dir() {
+            wanted.push((target, game.join("GameData").join(stock)));
+        }
+    }
+    for (target, link) in wanted {
+        match fs::symlink_metadata(&link) {
+            Ok(m) if m.file_type().is_symlink() => {
+                if fs::read_link(&link).ok().as_deref() == Some(target.as_path()) {
+                    continue;
+                }
+                fs::remove_file(&link).with_context(|| format!("replace {}", link.display()))?;
+            }
+            // Something real is there; the user put it there on purpose.
+            Ok(_) => continue,
+            Err(_) => {}
+        }
+        std::os::unix::fs::symlink(&target, &link)
+            .with_context(|| format!("link {}", link.display()))?;
+        changed += 1;
+    }
+    for dir in [game.to_path_buf(), game.join("GameData")] {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let dangling = entry.file_type().is_ok_and(|t| t.is_symlink()) && !p.exists();
+            if dangling {
+                fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
+                changed += 1;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// Brings a linked instance in line with its base install: adds links for
+/// new files, drops links to removed ones, and records the base's current
+/// game version. Does nothing for a full copy. Run it before launching.
+pub fn sync_links(inst: &mut Instance) -> Result<()> {
+    let Some(base) = inst.config.base.clone() else {
+        return Ok(());
+    };
+    if !game::is_game_dir(&base) {
+        bail!(
+            "{} links to {}, which is no longer a KSP install",
+            inst.config.name,
+            base.display()
+        );
+    }
+    let changed = link_missing(&base, &inst.game_dir())?;
+    if changed > 0 {
+        log::info!(
+            "{}: updated {changed} links to {}",
+            inst.config.name,
+            base.display()
+        );
+    }
+    let version = game::detect_version(&inst.game_dir())?;
+    if version != inst.config.game_version {
+        log::info!(
+            "{}: game version {} -> {version}",
+            inst.config.name,
+            inst.config.game_version
+        );
+        inst.config.game_version = version;
+        inst.save()?;
+    }
+    Ok(())
 }
 
 fn unique_id(root: &Path, base: &str) -> String {
@@ -530,6 +691,61 @@ mod tests {
         }
         fs::write(dir.join("readme.txt"), "Version 1.12.5\n").expect("write");
         fs::write(dir.join("buildID64.txt"), "build id = 03190\n").expect("write");
+    }
+
+    #[test]
+    fn creates_linked_instance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ksp = tmp.path().join("ksp");
+        fake_ksp(&ksp);
+        fs::create_dir_all(ksp.join("KSP_x64_Data")).expect("mkdir");
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let opts = CreateOptions {
+            name: "Linked".into(),
+            source: ksp.clone(),
+            stock_only: true,
+            with_saves: false,
+            mode: CopyMode::Link,
+        };
+        let mut inst = create(&paths, &opts, &mut |_, _| {}).expect("create");
+        let g = inst.game_dir();
+        let is_link = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+        assert_eq!(
+            inst.config.base.as_deref(),
+            Some(fs::canonicalize(&ksp).expect("canon").as_path())
+        );
+        assert!(is_link(&g.join("KSP_x64.exe")));
+        assert!(is_link(&g.join("KSP_x64_Data")));
+        assert!(is_link(&g.join("GameData/Squad")));
+        assert!(is_link(&g.join("GameData/SquadExpansion")));
+        assert!(!is_link(&g.join("GameData")));
+        assert!(!is_link(&g.join("settings.cfg")) && g.join("settings.cfg").is_file());
+        assert!(g.join("saves/scenarios/s.sfs").is_file() && !is_link(&g.join("saves")));
+        assert!(!g.join("saves/MyCareer").exists());
+        assert!(!g.join("GameData/SomeMod").exists());
+        assert!(!g.join("KSP.log").exists() && !g.join("Logs").exists());
+        assert_eq!(inst.config.game_version.to_string(), "1.12.5.3190");
+        assert_eq!(game::detect_dlc(&g).len(), 0);
+
+        // The base gains a file and loses one; sync follows it.
+        fs::write(ksp.join("NewThing.dll"), b"x").expect("write");
+        fs::remove_file(ksp.join("buildID64.txt")).expect("remove");
+        fs::write(ksp.join("readme.txt"), "Version 1.12.6\n").expect("write");
+        sync_links(&mut inst).expect("sync");
+        assert!(is_link(&g.join("NewThing.dll")));
+        assert!(fs::symlink_metadata(g.join("buildID64.txt")).is_err());
+        assert_eq!(inst.config.game_version.to_string(), "1.12.6");
+
+        // A real file the user put in place of a link is left alone.
+        fs::remove_file(g.join("NewThing.dll")).expect("remove");
+        fs::write(g.join("NewThing.dll"), b"mine").expect("write");
+        sync_links(&mut inst).expect("sync");
+        assert_eq!(fs::read(g.join("NewThing.dll")).expect("read"), b"mine");
+
+        // Deleting the instance removes links, not what they point to.
+        delete(&inst).expect("delete");
+        assert!(ksp.join("KSP_x64.exe").is_file());
+        assert!(ksp.join("GameData/Squad/Parts/part.cfg").is_file());
     }
 
     #[test]

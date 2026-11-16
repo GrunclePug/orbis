@@ -107,6 +107,14 @@ pub fn plan(inst: &Instance, steam: &SteamInfo, config: &Config) -> Result<Launc
         ("SteamAppId".into(), KSP_APP_ID.into()),
         ("SteamGameId".into(), KSP_APP_ID.into()),
     ];
+    // Let the Steam Runtime container see the linked base install, which
+    // may live outside the home directory.
+    if let Some(base) = &inst.config.base {
+        env.push((
+            "STEAM_COMPAT_MOUNTS".into(),
+            join(&[base.clone(), inst.dir.clone()]),
+        ));
+    }
     for (k, v) in &inst.config.launch.env {
         env.retain(|(ek, _)| ek != k);
         env.push((k.clone(), v.into()));

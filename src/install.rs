@@ -333,6 +333,15 @@ pub fn install(
     overwrite: bool,
 ) -> Result<InstalledFiles> {
     let mut problems = Vec::new();
+    for p in planned {
+        if let Some(link) = through_link(game, &p.dest) {
+            bail!(
+                "{} would be written through {link}, which links to the base game install; \
+                 orbis never changes that install",
+                p.dest
+            );
+        }
+    }
     for p in planned.iter().filter(|p| !p.is_dir) {
         check_safe(&p.dest)?;
         if let Some(owner) = owners.get(&fold(&p.dest)) {
@@ -367,6 +376,23 @@ pub fn install(
     }
     done.dirs = dirs.into_iter().filter(|d| !is_kept_dir(d)).collect();
     Ok(done)
+}
+
+/// The first component of `rel` (under `game`) that is a symlink, if any.
+/// Linked instances link stock files from the base install, and nothing may
+/// be written or deleted through those links.
+pub fn through_link(game: &Path, rel: &str) -> Option<String> {
+    let mut prefix = String::new();
+    for part in rel.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        if fs::symlink_metadata(game.join(&prefix)).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 fn check_safe(dest: &str) -> Result<()> {
@@ -445,6 +471,10 @@ fn is_kept_dir(d: &str) -> bool {
 /// now empty (deepest first). Missing files are ignored.
 pub fn uninstall(game: &Path, installed: &InstalledFiles) {
     for f in &installed.files {
+        if let Some(link) = through_link(game, f) {
+            log::warn!("not removing {f}: {link} links to the base game install");
+            continue;
+        }
         let path = game.join(f);
         if let Err(e) = fs::remove_file(&path)
             && e.kind() != io::ErrorKind::NotFound
@@ -455,6 +485,9 @@ pub fn uninstall(game: &Path, installed: &InstalledFiles) {
     let mut dirs: Vec<&String> = installed.dirs.iter().filter(|d| !is_kept_dir(d)).collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
     for d in dirs {
+        if through_link(game, d).is_some() {
+            continue;
+        }
         // Fails harmlessly when the directory still has other files.
         let _ = fs::remove_dir(game.join(d));
     }
@@ -589,5 +622,22 @@ mod tests {
         uninstall(&game, &done);
         assert!(!game.join("GameData/Mod").exists());
         assert!(game.join("GameData").is_dir());
+
+        // Nothing is written through a link into a base install.
+        let base = tmp.path().join("base");
+        fs::create_dir_all(base.join("Mod")).expect("mkdir");
+        fs::remove_dir(game.join("GameData")).expect("rmdir");
+        std::os::unix::fs::symlink(&base, game.join("GameData")).expect("symlink");
+        let err = install(&game, &src, &planned, &HashMap::new(), true).expect_err("refused");
+        assert!(
+            err.to_string().contains("links to the base game install"),
+            "{err}"
+        );
+        assert!(
+            fs::read_dir(base.join("Mod"))
+                .expect("read")
+                .next()
+                .is_none()
+        );
     }
 }

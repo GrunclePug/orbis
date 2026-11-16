@@ -144,22 +144,30 @@ pub struct PlanFlags {
 pub enum InstanceCmd {
     /// List instances.
     List,
-    /// Create an instance from the Steam install (stock game only).
+    /// Create an instance linked to the Steam install (or --from DIR). The
+    /// instance holds its own mods, saves and settings; the stock game is
+    /// linked and never changed.
     Create {
         name: String,
-        /// Copy from this KSP directory instead of Steam's.
+        /// Use this KSP directory instead of Steam's.
         #[arg(long, value_name = "DIR")]
         from: Option<PathBuf>,
         /// Copy the source's saves too.
         #[arg(long)]
         with_saves: bool,
-        /// Copy non-stock GameData too (mods orbis won't know about).
+        /// Make a full, independent copy that keeps its game version.
         #[arg(long)]
+        copy: bool,
+        /// With --copy: copy non-stock GameData too (mods orbis won't know about).
+        #[arg(long, requires = "copy")]
         keep_mods: bool,
-        /// Hard-link files instead of copying (for filesystems without reflinks).
-        #[arg(long)]
+        /// With --copy: hard-link files instead of copying (for filesystems
+        /// without reflinks).
+        #[arg(long, requires = "copy")]
         hardlink: bool,
     },
+    /// Re-link a linked instance to its base install (done before every launch).
+    Sync { instance: Option<String> },
     /// Copy an instance with its mods.
     Clone {
         source: String,
@@ -335,6 +343,7 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
         Command::Manual(c) => manual_cmd(ctx, c),
         Command::Launch { instance, dry_run } => {
             let mut inst = ctx.instance(instance.as_deref())?;
+            instance::sync_links(&mut inst)?;
             let plan = launch::plan(&inst, &ctx.steam(), &ctx.config)?;
             if dry_run {
                 println!("{}", plan.display());
@@ -596,6 +605,7 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             name,
             from,
             with_saves,
+            copy,
             keep_mods,
             hardlink,
         } => {
@@ -611,14 +621,17 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
                 source,
                 stock_only: !keep_mods,
                 with_saves,
-                mode: if hardlink {
-                    CopyMode::Hardlink
-                } else {
-                    CopyMode::Copy
+                mode: match (copy, hardlink) {
+                    (false, _) => CopyMode::Link,
+                    (true, false) => CopyMode::Copy,
+                    (true, true) => CopyMode::Hardlink,
                 },
             };
             let inst = instance::create(&ctx.paths, &opts, progress)?;
             eprintln!();
+            if let Some(base) = &inst.config.base {
+                println!("Linked to {}", base.display());
+            }
             println!(
                 "Created {} ({}) at {}",
                 inst.config.name,
@@ -641,6 +654,20 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
                 inst.config.name,
                 inst.dir.display()
             );
+            Ok(())
+        }
+        InstanceCmd::Sync { instance } => {
+            let mut inst = ctx.instance(instance.as_deref())?;
+            instance::sync_links(&mut inst)?;
+            match &inst.config.base {
+                Some(b) => println!(
+                    "{} is linked to {} (KSP {})",
+                    inst.config.name,
+                    b.display(),
+                    inst.config.game_version
+                ),
+                None => println!("{} is a full copy; nothing to sync", inst.config.name),
+            }
             Ok(())
         }
         InstanceCmd::Rename { instance, name } => {
@@ -683,6 +710,10 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             println!("testing:      {}", c.allow_testing);
             println!("prefix:       {:?}", c.launch.prefix);
             println!("source:       {}", c.source);
+            match &c.base {
+                Some(b) => println!("layout:       linked to {}", b.display()),
+                None => println!("layout:       full copy"),
+            }
             let dlc: Vec<String> = inst.dlc().into_iter().map(|d| d.identifier).collect();
             println!("dlc:          {}", dlc.join(", "));
             Ok(())

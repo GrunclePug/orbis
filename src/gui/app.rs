@@ -156,6 +156,7 @@ pub enum Dialog {
         name: String,
         source: String,
         with_saves: bool,
+        full_copy: bool,
         keep_mods: bool,
     },
     CloneInstance {
@@ -774,6 +775,7 @@ impl App {
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
                     with_saves: false,
+                    full_copy: false,
                     keep_mods: false,
                 });
             }
@@ -782,6 +784,7 @@ impl App {
                     name,
                     source,
                     with_saves,
+                    full_copy,
                     keep_mods,
                 }) = self.dialog.take()
                 {
@@ -789,9 +792,13 @@ impl App {
                     let opts = CreateOptions {
                         name,
                         source: PathBuf::from(source.trim()),
-                        stock_only: !keep_mods,
+                        stock_only: !(full_copy && keep_mods),
                         with_saves,
-                        mode: CopyMode::Copy,
+                        mode: if full_copy {
+                            CopyMode::Copy
+                        } else {
+                            CopyMode::Link
+                        },
                     };
                     self.spawn("Creating instance", move |tx| {
                         let mut p = |d, t| {
@@ -1070,10 +1077,12 @@ impl App {
             self.note(format!("{} is already running", inst.config.name));
             return;
         }
-        let result = launch::plan(&inst, &self.steam, &self.ctx.config).and_then(|p| {
-            log::info!("launch: {}", p.display());
-            launch::spawn(&p)
-        });
+        let result = instance::sync_links(&mut inst)
+            .and_then(|()| launch::plan(&inst, &self.steam, &self.ctx.config))
+            .and_then(|p| {
+                log::info!("launch: {}", p.display());
+                launch::spawn(&p)
+            });
         match result {
             Ok(child) => {
                 self.note(format!("Started {}", inst.config.name));

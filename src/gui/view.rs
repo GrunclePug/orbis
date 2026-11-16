@@ -831,6 +831,11 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                             .small()
                             .weak(),
                     );
+                    let layout = match &v.inst.config.base {
+                        Some(b) => format!("Linked to: {}", b.display()),
+                        None => "Full copy".to_owned(),
+                    };
+                    ui.label(RichText::new(layout).small().weak());
                     let dlc: Vec<String> = v.dlc.iter().map(|d| d.identifier.clone()).collect();
                     if !dlc.is_empty() {
                         ui.label(
@@ -933,21 +938,25 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 name,
                 source,
                 with_saves,
+                full_copy,
                 keep_mods,
             } => {
                 ui.heading("New instance");
-                ui.label("Copies the game into its own folder. On btrfs or XFS the copy is instant and takes no extra space.");
+                ui.label("The instance keeps its own mods, saves and settings, and links the stock game from the install below. That install is never changed, so launching it from Steam stays vanilla.");
                 ui.add_space(6.0);
                 egui::Grid::new("new").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     ui.label("Name");
                     ui.add(egui::TextEdit::singleline(name).desired_width(360.0));
                     ui.end_row();
-                    ui.label("Copy from");
+                    ui.label("Game install");
                     ui.add(egui::TextEdit::singleline(source).desired_width(360.0));
                     ui.end_row();
                 });
-                ui.checkbox(with_saves, "Copy saves");
-                ui.checkbox(keep_mods, "Copy non-stock GameData too (orbis won't manage those files)");
+                ui.checkbox(with_saves, "Copy the install's saves");
+                ui.checkbox(full_copy, "Full copy instead (keeps this game version when the install updates)");
+                if *full_copy {
+                    ui.checkbox(keep_mods, "Also copy non-stock GameData (orbis won't manage those files)");
+                }
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Create", !busy && !name.trim().is_empty(), Msg::CreateInstance);
             }
