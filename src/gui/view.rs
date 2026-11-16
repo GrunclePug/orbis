@@ -116,6 +116,15 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     {
                         msgs.push(Msg::OpenNewInstance);
                     }
+                    if ui
+                        .add_enabled(!app.busy(), egui::Button::new("Import"))
+                        .on_hover_text(
+                            "Create an instance from a modpack (.orbispack or CKAN .ckan)",
+                        )
+                        .clicked()
+                    {
+                        msgs.push(Msg::OpenImport(None));
+                    }
                 });
             });
             ui.separator();
@@ -196,6 +205,13 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     {
                         msgs.push(Msg::OpenDelete);
                     }
+                    if ui
+                        .add_enabled(has && !app.busy(), egui::Button::new("Export"))
+                        .on_hover_text("Save this instance's mods as a modpack")
+                        .clicked()
+                    {
+                        msgs.push(Msg::OpenExport);
+                    }
                     if let Some(v) = app.current() {
                         ui.menu_button("Open", |ui| {
                             for (label, path) in instance_paths(v) {
@@ -234,6 +250,43 @@ fn mods_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             app.search.clear();
         }
         ui.label(RichText::new(format!("{} mods", app.rows.len())).weak());
+    });
+    ui.horizontal(|ui| {
+        let mut starred = app.starred_only;
+        if ui
+            .checkbox(&mut starred, "Starred only")
+            .on_hover_text("Show only mods you starred")
+            .changed()
+        {
+            msgs.push(Msg::SetStarredOnly(starred));
+        }
+        if app.filter == Filter::Installed {
+            let mut deps = app.show_deps;
+            let label = if app.show_deps || app.hidden_deps == 0 {
+                "Show dependencies".to_owned()
+            } else {
+                format!("Show dependencies ({} hidden)", app.hidden_deps)
+            };
+            if ui.checkbox(&mut deps, label).changed() {
+                msgs.push(Msg::SetShowDeps(deps));
+            }
+        }
+        let installable = app
+            .rows
+            .iter()
+            .filter(|r| {
+                r.installed.is_none() && r.latest.is_some() && !app.queue.install.contains(&r.id)
+            })
+            .count();
+        if app.starred_only
+            && installable > 0
+            && ui
+                .button(format!("Queue all {installable}"))
+                .on_hover_text("Queue every shown starred mod that isn't installed")
+                .clicked()
+        {
+            msgs.push(Msg::QueueShown);
+        }
     });
     ui.add_space(4.0);
     queue_bar(app, ui, msgs);
@@ -302,6 +355,7 @@ fn queue_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
 
 struct Cols {
     action: f32,
+    star: f32,
     name: f32,
     installed: f32,
     latest: f32,
@@ -310,9 +364,10 @@ struct Cols {
 }
 
 fn columns(width: f32) -> Cols {
-    let fixed = 34.0 + 110.0 + 110.0 + 110.0 + 90.0 + 8.0 * 6.0;
+    let fixed = 34.0 + 22.0 + 110.0 + 110.0 + 110.0 + 90.0 + 8.0 * 7.0;
     Cols {
         action: 34.0,
+        star: 22.0,
         name: (width - fixed).max(160.0),
         installed: 110.0,
         latest: 110.0,
@@ -327,6 +382,7 @@ fn header(ui: &mut Ui, c: &Cols) {
             cell(ui, w, egui::Label::new(RichText::new(t).small().strong()));
         };
         h(ui, c.action, "");
+        h(ui, c.star, "");
         h(ui, c.name, "Name");
         h(ui, c.installed, "Installed");
         h(ui, c.latest, "Latest");
@@ -375,17 +431,38 @@ fn mod_row(app: &App, ui: &mut Ui, row: &Row, c: &Cols, msgs: &mut Vec<Msg>) {
         if row.manual {
             name = name.color(ACCENT);
         }
-        let name_label = egui::Label::new(name)
-            .truncate()
-            .sense(egui::Sense::click());
-        let name_resp = cell(ui, c.name, name_label).on_hover_text(&row.summary);
-        let tag = if row.manual {
-            " manual"
-        } else if row.auto {
-            " auto"
-        } else {
-            ""
-        };
+        cell_ui(ui, c.star, |ui| {
+            if row.dlc {
+                return;
+            }
+            let tip = if row.starred {
+                "Unstar"
+            } else {
+                "Star: find it again with Starred only"
+            };
+            if star(ui, row.starred, 15.0).on_hover_text(tip).clicked() {
+                msgs.push(Msg::ToggleStar(row.id.clone()));
+            }
+        });
+        let name_resp = cell_ui(ui, c.name, |ui| {
+            let resp = ui
+                .add(
+                    egui::Label::new(name)
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(&row.summary);
+            if row.auto {
+                let note = if row.required_by.is_empty() {
+                    "dependency, no longer needed".to_owned()
+                } else {
+                    format!("dependency of {}", row.required_by.join(", "))
+                };
+                ui.add(egui::Label::new(RichText::new(note).small().weak()).truncate());
+            }
+            resp
+        });
+        let tag = if row.manual { " manual" } else { "" };
         let inst = row
             .installed
             .as_ref()
@@ -445,6 +522,43 @@ fn mod_row(app: &App, ui: &mut Ui, row: &Row, c: &Cols, msgs: &mut Vec<Msg>) {
     }
 }
 
+/// A clickable star, drawn as a shape (egui's default fonts have no star
+/// glyph). Filled when `on`.
+fn star(ui: &mut Ui, on: bool, size: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let c = rect.center();
+    let (outer, inner) = (size * 0.48, size * 0.2);
+    let points: Vec<egui::Pos2> = (0..10)
+        .map(|i| {
+            let r = if i % 2 == 0 { outer } else { inner };
+            let a = std::f32::consts::PI * (f32::from(i as u8) / 5.0) - std::f32::consts::FRAC_PI_2;
+            c + egui::vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    let hovered = resp.hovered();
+    let color = match (on, hovered) {
+        (true, _) => WARN,
+        (false, true) => ui.visuals().text_color(),
+        (false, false) => ui.visuals().weak_text_color(),
+    };
+    if on {
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(c, color);
+        for p in &points {
+            mesh.colored_vertex(*p, color);
+        }
+        for i in 0..10u32 {
+            mesh.add_triangle(0, 1 + i, 1 + (i + 1) % 10);
+        }
+        ui.painter().add(egui::Shape::mesh(mesh));
+    }
+    ui.painter().add(egui::Shape::closed_line(
+        points,
+        egui::Stroke::new(1.2, color),
+    ));
+    resp
+}
+
 /// A fixed-width, left-aligned table cell holding one widget.
 fn cell(ui: &mut Ui, width: f32, widget: impl egui::Widget) -> egui::Response {
     cell_ui(ui, width, |ui| ui.add(widget))
@@ -486,7 +600,19 @@ fn details_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 .id_salt("details")
                 .show(ui, |ui| {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(m.display_name()).heading().strong());
+                    ui.horizontal(|ui| {
+                        let starred = app.starred.contains(&m.identifier);
+                        if star(ui, starred, 20.0)
+                            .on_hover_text(if starred { "Unstar" } else { "Star" })
+                            .clicked()
+                        {
+                            msgs.push(Msg::ToggleStar(m.identifier.clone()));
+                        }
+                        ui.add(
+                            egui::Label::new(RichText::new(m.display_name()).heading().strong())
+                                .wrap(),
+                        );
+                    });
                     ui.label(
                         RichText::new(format!("{} · {}", m.identifier, m.version))
                             .small()
@@ -604,6 +730,51 @@ fn actions(app: &App, ui: &mut Ui, m: &Module, msgs: &mut Vec<Msg>) {
     let Some(view) = app.current() else { return };
     let installed = view.reg.mods.get(&m.identifier);
     let row = app.rows.iter().find(|r| r.id == m.identifier);
+    if let Some(i) = installed {
+        let required_by: Vec<String> = view
+            .reg
+            .required_by(&m.identifier)
+            .iter()
+            .map(|id| {
+                view.reg
+                    .mods
+                    .get(id)
+                    .map_or(id.clone(), |o| o.module.display_name().to_owned())
+            })
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            if i.auto_installed {
+                let text = if required_by.is_empty() {
+                    "Installed as a dependency; nothing needs it now".to_owned()
+                } else {
+                    format!("Dependency of {}", required_by.join(", "))
+                };
+                ui.label(RichText::new(text).weak());
+                if ui
+                    .small_button("Keep it")
+                    .on_hover_text(
+                        "Treat it as something you installed, so it stays when what needed it goes",
+                    )
+                    .clicked()
+                {
+                    msgs.push(Msg::SetAuto(m.identifier.clone(), false));
+                }
+            } else if !required_by.is_empty() {
+                ui.label(
+                    RichText::new(format!("Also needed by {}", required_by.join(", "))).weak(),
+                );
+                if ui
+                    .small_button("Mark as dependency")
+                    .on_hover_text(
+                        "Hide it with the dependencies and remove it once nothing needs it",
+                    )
+                    .clicked()
+                {
+                    msgs.push(Msg::SetAuto(m.identifier.clone(), true));
+                }
+            }
+        });
+    }
     ui.horizontal(|ui| match installed {
         Some(i) => {
             ui.label(RichText::new(format!("Installed {}", i.module.version)).color(GOOD));
@@ -930,6 +1101,7 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
 
 fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
     let busy = app.busy();
+    let app_index_ready = app.index.is_some();
     let Some(d) = &mut app.dialog else { return };
     let resp = egui::Modal::new(egui::Id::unique("orbis-dialog")).show(ctx, |ui| {
         ui.set_max_width(560.0);
@@ -984,6 +1156,24 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
             }
             Dialog::Confirm { plan, picks, .. } => {
                 ui.heading("Apply changes");
+                let bytes: u64 = plan
+                    .changes
+                    .iter()
+                    .filter_map(|c| match c {
+                        orbis::resolver::Change::Install { module, .. }
+                        | orbis::resolver::Change::Upgrade { module, .. } => module.download_size,
+                        orbis::resolver::Change::Remove { .. } => None,
+                    })
+                    .sum();
+                if bytes > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "Download: up to {:.1} MiB (cached files are reused)",
+                            bytes as f64 / 1_048_576.0
+                        ))
+                        .weak(),
+                    );
+                }
                 egui::ScrollArea::vertical().max_height(300.0).id_salt("plan").show(ui, |ui| {
                     for c in &plan.changes {
                         let (icon, color) = match c {
@@ -1093,6 +1283,77 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 ui.add_space(8.0);
                 let ok = !busy && matches!(form.preview, Some(Ok(_))) && !form.name.trim().is_empty();
                 buttons(ui, msgs, "Add to library", ok, Msg::AddManual);
+            }
+            Dialog::Export(form) => {
+                ui.heading("Export modpack");
+                ui.label("The mod list with exact versions. Dependencies are marked so they stay hidden after import.");
+                ui.add_space(6.0);
+                egui::Grid::new("export").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Save to");
+                    ui.add(egui::TextEdit::singleline(&mut form.path).desired_width(380.0));
+                    ui.end_row();
+                    ui.label("Pack name");
+                    ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(380.0));
+                    ui.end_row();
+                    ui.label("Description");
+                    ui.add(egui::TextEdit::singleline(&mut form.description).desired_width(380.0));
+                    ui.end_row();
+                });
+                ui.checkbox(&mut form.ckan, "CKAN format (.ckan, mods only) for CKAN users");
+                ui.add_enabled_ui(!form.ckan, |ui| {
+                    ui.checkbox(&mut form.craft, "Include craft (Ships folder)");
+                    ui.checkbox(&mut form.manual_files, "Include manual mod files (only for mods you may share)");
+                    if !form.saves.is_empty() {
+                        ui.label("Include saves:");
+                        egui::ScrollArea::vertical().max_height(140.0).id_salt("saves").show(ui, |ui| {
+                            for (name, on) in &mut form.saves {
+                                ui.checkbox(on, name.as_str());
+                            }
+                        });
+                    }
+                });
+                ui.add_space(8.0);
+                let ok = !busy && !form.path.trim().is_empty();
+                buttons(ui, msgs, "Export", ok, Msg::Export);
+            }
+            Dialog::Import(form) => {
+                ui.heading("Import modpack");
+                ui.label("Creates a new instance linked to the game install and installs the pack's mods. Drop a .orbispack or .ckan file on the window to get here.");
+                ui.add_space(6.0);
+                egui::Grid::new("import").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Modpack file");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.path)
+                            .hint_text("/path/to/pack.orbispack")
+                            .desired_width(380.0),
+                    );
+                    ui.end_row();
+                    ui.label("Instance name");
+                    ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(380.0));
+                    ui.end_row();
+                    ui.label("Game install");
+                    ui.add(egui::TextEdit::singleline(&mut form.base).desired_width(380.0));
+                    ui.end_row();
+                });
+                ui.checkbox(&mut form.exact, "Install the pack's exact versions (otherwise the newest compatible)");
+                if form.previewed_for != form.path {
+                    msgs.push(Msg::PreviewImport);
+                }
+                match &form.preview {
+                    Some(Ok(text)) => {
+                        ui.label(RichText::new(text).small().color(GOOD));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(e).small().color(BAD));
+                    }
+                    None => {}
+                }
+                ui.add_space(8.0);
+                let ok = !busy && matches!(form.preview, Some(Ok(_))) && app_index_ready;
+                if !app_index_ready {
+                    ui.label(RichText::new("Load the mod index first (Update index).").color(WARN));
+                }
+                buttons(ui, msgs, "Import", ok, Msg::Import);
             }
             Dialog::Error(e) => {
                 ui.heading(RichText::new("Something went wrong").color(BAD));

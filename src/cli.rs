@@ -13,10 +13,12 @@ use orbis::instance::{self, CopyMode, CreateOptions, Instance};
 use orbis::launch;
 use orbis::manual::{self, AddOptions};
 use orbis::metadata::InstallDirective;
+use orbis::modpack;
 use orbis::ops::{self, Event};
 use orbis::paths::Paths;
 use orbis::repo::{self, Index};
 use orbis::resolver::{Plan, Request, ResolveError};
+use orbis::starred::Starred;
 use orbis::steam::{self, SteamInfo};
 use orbis::version::{GameVersion, ModVersion};
 
@@ -124,6 +126,63 @@ pub enum Command {
     },
     /// Show what orbis detected of Steam, KSP and Proton.
     Steam,
+    /// Star mods so they're easy to find again (shared by all instances).
+    Star {
+        #[arg(required = true)]
+        mods: Vec<String>,
+    },
+    /// Remove stars.
+    Unstar {
+        #[arg(required = true)]
+        mods: Vec<String>,
+    },
+    /// List starred mods.
+    Starred,
+    /// Export and import modpacks.
+    #[command(subcommand)]
+    Pack(PackCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PackCmd {
+    /// Write an instance's mods (and optionally craft, saves and manual mod
+    /// files) to an .orbispack file.
+    Export {
+        #[arg(short, long)]
+        instance: Option<String>,
+        /// Output file.
+        out: PathBuf,
+        /// Pack name (the instance name by default).
+        #[arg(long, default_value = "")]
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Include the Ships folder (craft).
+        #[arg(long)]
+        craft: bool,
+        /// Include these saves (comma-separated folder names, or "all").
+        #[arg(long, value_delimiter = ',')]
+        saves: Vec<String>,
+        /// Include manual mod archives (only for mods you may share).
+        #[arg(long)]
+        manual_files: bool,
+        /// Write a CKAN modpack (.ckan) instead; mods only.
+        #[arg(long)]
+        ckan: bool,
+    },
+    /// Create a new instance from an .orbispack or CKAN .ckan modpack.
+    Import {
+        file: PathBuf,
+        /// Instance name (the pack's name by default).
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Link to this KSP directory instead of Steam's.
+        #[arg(long, value_name = "DIR")]
+        from: Option<PathBuf>,
+        /// Install the newest compatible releases instead of the pack's versions.
+        #[arg(long)]
+        latest: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -366,6 +425,102 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             }
             Ok(())
         }
+        Command::Star { mods } => {
+            let mut s = Starred::load(&ctx.paths)?;
+            s.mods.extend(mods);
+            s.save(&ctx.paths)
+        }
+        Command::Unstar { mods } => {
+            let mut s = Starred::load(&ctx.paths)?;
+            for m in &mods {
+                s.mods.remove(m);
+            }
+            s.save(&ctx.paths)
+        }
+        Command::Starred => {
+            let index = Index::load(&ctx.paths)?.unwrap_or_default();
+            for id in Starred::load(&ctx.paths)?.mods {
+                let summary = index
+                    .versions(&id)
+                    .first()
+                    .map_or("", |m| m.summary.as_str());
+                println!("{id:36} {summary}");
+            }
+            Ok(())
+        }
+        Command::Pack(c) => pack_cmd(ctx, c),
+    }
+}
+
+fn pack_cmd(ctx: &Context, cmd: PackCmd) -> Result<()> {
+    match cmd {
+        PackCmd::Export {
+            instance,
+            out,
+            name,
+            description,
+            craft,
+            saves,
+            manual_files,
+            ckan,
+        } => {
+            let inst = ctx.instance(instance.as_deref())?;
+            if ckan {
+                modpack::export_ckan(&inst, &out, &name)?;
+                println!("Wrote CKAN modpack {}", out.display());
+                return Ok(());
+            }
+            let saves = if saves.iter().any(|s| s == "all") {
+                modpack::save_names(&inst)
+            } else {
+                saves
+            };
+            let opts = modpack::ExportOptions {
+                out: out.clone(),
+                name,
+                description,
+                craft,
+                saves,
+                manual_files,
+            };
+            for w in modpack::export(&ctx.paths, &inst, &opts)? {
+                eprintln!("warning: {w}");
+            }
+            println!("Wrote {}", out.display());
+            Ok(())
+        }
+        PackCmd::Import {
+            file,
+            name,
+            from,
+            latest,
+        } => {
+            let index = ctx.index()?;
+            let base = match from {
+                Some(p) => p,
+                None => ctx
+                    .steam()
+                    .ksp
+                    .context("KSP not found in Steam; pass --from <dir>")?,
+            };
+            let opts = modpack::ImportOptions {
+                path: file,
+                name,
+                base,
+                exact: !latest,
+            };
+            let report =
+                with_progress(|tx| modpack::import(&ctx.paths, &ctx.config, &index, &opts, tx))?;
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!(
+                "Imported into {} at {}",
+                report.instance.config.name,
+                report.instance.dir.display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -447,6 +602,11 @@ fn confirm_and_apply(ctx: &Context, inst: &Instance, plan: &Plan, flags: &PlanFl
             return Ok(());
         }
     }
+    with_progress(|tx| ops::apply(&ctx.paths, &ctx.config, inst, plan, tx))
+}
+
+/// Runs `work` while printing its progress events to stderr.
+fn with_progress<T>(work: impl FnOnce(&mpsc::Sender<Event>) -> Result<T>) -> Result<T> {
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|s| {
         let printer = s.spawn(move || {
@@ -471,7 +631,7 @@ fn confirm_and_apply(ctx: &Context, inst: &Instance, plan: &Plan, flags: &PlanFl
                 }
             }
         });
-        let r = ops::apply(&ctx.paths, &ctx.config, inst, plan, &tx);
+        let r = work(&tx);
         drop(tx);
         let _ = printer.join();
         r
@@ -568,7 +728,16 @@ fn list(ctx: &Context, instance: Option<&str>) -> Result<()> {
         .map(|i| ops::upgradable(&inst, i, &reg))
         .unwrap_or_default();
     for (id, m) in &reg.mods {
-        let auto = if m.auto_installed { " (auto)" } else { "" };
+        let auto = if m.auto_installed {
+            let by = reg.required_by(id);
+            if by.is_empty() {
+                " (dependency, no longer needed)".to_owned()
+            } else {
+                format!(" (dependency of {})", by.join(", "))
+            }
+        } else {
+            String::new()
+        };
         let up = upgrades
             .iter()
             .find(|(u, _)| u == id)

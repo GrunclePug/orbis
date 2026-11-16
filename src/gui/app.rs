@@ -19,12 +19,15 @@ use orbis::instance::{self, CopyMode, CreateOptions, Instance, ModSource, Prefix
 use orbis::launch;
 use orbis::manual::{self, AddOptions, ManualMod};
 use orbis::metadata::Module;
+use orbis::modpack;
 use orbis::ops;
 use orbis::paths::Paths;
 use orbis::repo::{self, Index};
 use orbis::resolver::{Plan, Request, ResolveError};
+use orbis::starred::Starred;
 use orbis::steam::SteamInfo;
 use orbis::version::{GameVersion, ModVersion};
+use serde::{Deserialize, Serialize};
 
 use super::Options;
 use crate::cli::{self, Context};
@@ -83,6 +86,9 @@ pub struct Row {
     pub manual: bool,
     pub auto: bool,
     pub dlc: bool,
+    pub starred: bool,
+    /// Display names of installed mods that depend on this one.
+    pub required_by: Vec<String>,
 }
 
 impl Row {
@@ -92,7 +98,8 @@ impl Row {
 }
 
 /// Changes the user has queued but not applied.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Queue {
     pub install: BTreeSet<String>,
     pub remove: BTreeSet<String>,
@@ -107,6 +114,61 @@ impl Queue {
     pub fn len(&self) -> usize {
         self.install.len() + self.remove.len() + self.upgrade.len()
     }
+}
+
+/// Interface state kept between runs in `<config>/gui.toml`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Prefs {
+    pub selected: Option<String>,
+    pub filter: String,
+    pub show_deps: bool,
+    pub starred_only: bool,
+    /// Unapplied changes, per instance id.
+    pub queues: BTreeMap<String, Queue>,
+}
+
+impl Prefs {
+    fn path(paths: &Paths) -> PathBuf {
+        paths.config.join("gui.toml")
+    }
+
+    fn load(paths: &Paths) -> Self {
+        std::fs::read_to_string(Self::path(paths))
+            .ok()
+            .and_then(|t| toml::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, paths: &Paths) -> Result<()> {
+        let text = toml::to_string_pretty(self)?;
+        orbis::paths::write_atomic(&Self::path(paths), text.as_bytes())
+    }
+}
+
+/// Fields of the export dialog.
+#[derive(Clone, Debug, Default)]
+pub struct ExportForm {
+    pub instance: String,
+    pub path: String,
+    pub name: String,
+    pub description: String,
+    pub craft: bool,
+    pub saves: Vec<(String, bool)>,
+    pub manual_files: bool,
+    pub ckan: bool,
+}
+
+/// Fields of the import dialog.
+#[derive(Clone, Debug, Default)]
+pub struct ImportForm {
+    pub path: String,
+    pub name: String,
+    pub base: String,
+    pub exact: bool,
+    /// A summary of the pack, or why it can't be read.
+    pub preview: Option<Result<String, String>>,
+    pub previewed_for: String,
 }
 
 /// Text buffers for the instance settings form.
@@ -181,6 +243,8 @@ pub enum Dialog {
         manual: Option<ManualMod>,
     },
     AddManual(Box<AddManualForm>),
+    Export(Box<ExportForm>),
+    Import(Box<ImportForm>),
     DeleteManual(ManualMod),
     Error(String),
 }
@@ -218,6 +282,16 @@ pub enum Msg {
     DeleteManual,
     SaveInstanceSettings,
     SaveGlobalSettings,
+    ToggleStar(String),
+    SetShowDeps(bool),
+    SetStarredOnly(bool),
+    QueueShown,
+    SetAuto(String, bool),
+    OpenExport,
+    Export,
+    OpenImport(Option<PathBuf>),
+    PreviewImport,
+    Import,
     CloseDialog,
     Refresh,
 }
@@ -229,6 +303,8 @@ pub enum Done {
     Applied(Result<(), String>),
     InstanceCreated(Result<Instance, String>),
     ManualAdded(Result<ManualMod, String>),
+    Exported(Result<(PathBuf, Vec<String>), String>),
+    Imported(Result<modpack::ImportReport, String>),
 }
 
 /// Messages from background threads.
@@ -266,7 +342,7 @@ pub struct App {
     pub filter: Filter,
     pub search: String,
     pub rows: Vec<Row>,
-    rows_key: Option<(String, Filter, String, u64, usize)>,
+    rows_key: Option<(String, Filter, String, u64, usize, bool, bool)>,
     pub selected_mod: Option<String>,
     pub queue: Queue,
     pub choices: HashMap<String, String>,
@@ -277,6 +353,15 @@ pub struct App {
     pub settings: SettingsForm,
     pub global: GlobalForm,
     pub running: Vec<(String, Child)>,
+    pub starred: Starred,
+    pub show_deps: bool,
+    pub starred_only: bool,
+    /// Dependencies hidden from the Installed list.
+    pub hidden_deps: usize,
+    queues: BTreeMap<String, Queue>,
+    saved_prefs: Prefs,
+    /// Write `gui.toml` (off in headless mode).
+    persist: bool,
     generation: u64,
 }
 
@@ -306,9 +391,30 @@ impl App {
             settings: SettingsForm::default(),
             global: GlobalForm::default(),
             running: Vec::new(),
+            starred: Starred::default(),
+            show_deps: false,
+            starred_only: false,
+            hidden_deps: 0,
+            queues: BTreeMap::new(),
+            saved_prefs: Prefs::default(),
+            persist: !opts.headless,
             generation: 0,
         };
+        match Starred::load(&app.ctx.paths) {
+            Ok(s) => app.starred = s,
+            Err(e) => app.messages.push(format!("{e:#}")),
+        }
+        let prefs = Prefs::load(&app.ctx.paths);
+        app.selected = prefs.selected.clone();
+        app.filter = filter_from(&prefs.filter).unwrap_or(Filter::Installed);
+        app.show_deps = prefs.show_deps;
+        app.starred_only = prefs.starred_only;
+        app.queues = prefs.queues.clone();
+        app.saved_prefs = prefs;
         app.reload();
+        if let Some(sel) = &app.selected {
+            app.queue = app.queues.remove(sel).unwrap_or_default();
+        }
         if let Some(key) = &opts.instance
             && let Some(v) = app
                 .instances
@@ -322,12 +428,9 @@ impl App {
             Some("settings") => Tab::Settings,
             _ => Tab::Mods,
         };
-        app.filter = match opts.filter.as_deref() {
-            Some("available") => Filter::Available,
-            Some("upgradable") => Filter::Upgradable,
-            Some("all") => Filter::All,
-            _ => Filter::Installed,
-        };
+        if let Some(f) = opts.filter.as_deref().and_then(filter_from) {
+            app.filter = f;
+        }
         app.egui.global_style_mut(|s| {
             s.spacing.item_spacing = egui::vec2(8.0, 6.0);
             s.spacing.button_padding = egui::vec2(8.0, 4.0);
@@ -397,6 +500,7 @@ impl App {
         for m in msgs {
             self.update(m);
         }
+        self.save_prefs();
         if self.task.is_some() || !self.running.is_empty() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(250));
@@ -412,8 +516,16 @@ impl App {
                 .collect()
         });
         if let Some(p) = dropped.into_iter().next() {
-            self.tab = Tab::Manual;
-            self.update(Msg::OpenAddManual(Some(p)));
+            let ext = p
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if ext == "orbispack" || ext == "ckan" {
+                self.update(Msg::OpenImport(Some(p)));
+            } else {
+                self.tab = Tab::Manual;
+                self.update(Msg::OpenAddManual(Some(p)));
+            }
         }
     }
 
@@ -541,6 +653,33 @@ impl App {
                 }
                 Err(e) => self.error(format!("Creating the instance failed: {e}")),
             },
+            Done::Exported(r) => match r {
+                Ok((path, warnings)) => {
+                    self.note(format!("Exported {}", path.display()));
+                    if !warnings.is_empty() {
+                        self.error(format!("Exported with warnings:\n{}", warnings.join("\n")));
+                    }
+                }
+                Err(e) => self.error(format!("Export failed: {e}")),
+            },
+            Done::Imported(r) => match r {
+                Ok(report) => {
+                    self.note(format!("Imported {}", report.instance.config.name));
+                    self.selected = Some(report.instance.id.clone());
+                    self.queue = Queue::default();
+                    self.reload();
+                    if !report.warnings.is_empty() {
+                        self.error(format!(
+                            "Imported with warnings:\n{}",
+                            report.warnings.join("\n")
+                        ));
+                    }
+                }
+                Err(e) => {
+                    self.reload();
+                    self.error(format!("Import failed: {e}"));
+                }
+            },
             Done::ManualAdded(r) => match r {
                 Ok(m) => {
                     self.note(format!("Added {} to the manual library", m.name));
@@ -560,73 +699,105 @@ impl App {
             self.search.trim().to_lowercase(),
             self.generation,
             self.queue.len(),
+            self.show_deps,
+            self.starred_only,
         );
         if self.rows_key.as_ref() == Some(&key) {
             return;
         }
-        self.rows = self.build_rows(&key.2);
+        let (rows, hidden) = self.build_rows(&key.2);
+        self.rows = rows;
+        self.hidden_deps = hidden;
         self.rows_key = Some(key);
     }
 
-    fn build_rows(&self, query: &str) -> Vec<Row> {
+    /// The rows for the current filter, and how many dependencies the
+    /// Installed list hid.
+    fn build_rows(&self, query: &str) -> (Vec<Row>, usize) {
         let Some(view) = self.current() else {
-            return vec![];
+            return (vec![], 0);
         };
         let compat = view.inst.compat_versions();
         let testing = view.inst.config.allow_testing;
-        let mut rows = Vec::new();
         let empty = Index::default();
         let index: &Index = self.index.as_deref().unwrap_or(&empty);
-        for (id, m) in &view.reg.mods {
-            let latest = index
-                .latest_compatible(id, &compat, testing)
-                .map(|l| l.version.clone());
-            if !cli::matches(&m.module, query) {
-                continue;
-            }
-            rows.push(Row {
-                id: id.clone(),
-                name: m.module.display_name().to_owned(),
-                summary: m.module.summary.clone(),
-                installed: Some(m.module.version.clone()),
-                latest,
-                game: m.module.game_range_label(),
-                downloads: index.download_count(id),
-                manual: m.source == ModSource::Manual,
-                auto: m.auto_installed,
-                dlc: false,
-            });
-        }
-        for d in &view.dlc {
-            if query.is_empty() || d.identifier.to_lowercase().contains(query) {
+        let name_of = |id: &str| {
+            view.reg
+                .mods
+                .get(id)
+                .map_or(id.to_owned(), |m| m.module.display_name().to_owned())
+        };
+        let mut rows = Vec::new();
+        let mut hidden = 0;
+        if matches!(self.filter, Filter::Installed | Filter::Upgradable) {
+            for (id, m) in &view.reg.mods {
+                if !cli::matches(&m.module, query) {
+                    continue;
+                }
+                let latest = index
+                    .latest_compatible(id, &compat, testing)
+                    .map(|l| l.version.clone());
+                let mut required_by: Vec<String> = view
+                    .reg
+                    .required_by(id)
+                    .iter()
+                    .map(|r| name_of(r))
+                    .collect();
+                required_by.sort_by_key(|n| n.to_lowercase());
                 rows.push(Row {
-                    id: d.identifier.clone(),
-                    name: d.identifier.clone(),
-                    summary: "Expansion (detected)".into(),
-                    installed: Some(d.version.clone().unwrap_or_else(|| ModVersion::new("?"))),
-                    latest: None,
-                    game: String::new(),
-                    downloads: 0,
-                    manual: false,
-                    auto: false,
-                    dlc: true,
+                    id: id.clone(),
+                    name: m.module.display_name().to_owned(),
+                    summary: m.module.summary.clone(),
+                    installed: Some(m.module.version.clone()),
+                    latest,
+                    game: m.module.game_range_label(),
+                    downloads: index.download_count(id),
+                    manual: m.source == ModSource::Manual,
+                    auto: m.auto_installed,
+                    dlc: false,
+                    starred: self.starred.contains(id),
+                    required_by,
                 });
             }
-        }
-        match self.filter {
-            Filter::Installed => {
-                rows.sort_by_key(|r| r.name.to_lowercase());
-                return rows;
+            if self.filter == Filter::Installed {
+                for d in &view.dlc {
+                    if query.is_empty() || d.identifier.to_lowercase().contains(query) {
+                        rows.push(Row {
+                            id: d.identifier.clone(),
+                            name: d.identifier.clone(),
+                            summary: "Expansion (detected)".into(),
+                            installed: Some(
+                                d.version.clone().unwrap_or_else(|| ModVersion::new("?")),
+                            ),
+                            latest: None,
+                            game: String::new(),
+                            downloads: 0,
+                            manual: false,
+                            auto: false,
+                            dlc: true,
+                            starred: false,
+                            required_by: vec![],
+                        });
+                    }
+                }
+                if !self.show_deps {
+                    let before = rows.len();
+                    rows.retain(|r| !r.auto);
+                    hidden = before - rows.len();
+                }
+            } else {
+                rows.retain(Row::upgradable);
             }
-            Filter::Upgradable => {
-                rows.retain(|r| r.upgradable());
-                rows.sort_by_key(|r| r.name.to_lowercase());
-                return rows;
+            if self.starred_only {
+                rows.retain(|r| r.starred);
             }
-            Filter::Available | Filter::All => {}
+            rows.sort_by_key(|r| r.name.to_lowercase());
+            return (rows, hidden);
         }
-        rows.clear();
         for (id, versions) in index.iter() {
+            if self.starred_only && !self.starred.contains(id) {
+                continue;
+            }
             let installed = view.reg.mods.get(id);
             let latest = index.latest_compatible(id, &compat, testing);
             if self.filter == Filter::Available && (latest.is_none() || installed.is_some()) {
@@ -649,10 +820,20 @@ impl App {
                 manual: false,
                 auto: installed.is_some_and(|m| m.auto_installed),
                 dlc: false,
+                starred: self.starred.contains(id),
+                required_by: installed
+                    .map(|_| {
+                        view.reg
+                            .required_by(id)
+                            .iter()
+                            .map(|r| name_of(r))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.downloads));
-        rows
+        (rows, 0)
     }
 
     /// The module to show in the details pane.
@@ -683,8 +864,14 @@ impl App {
         match msg {
             Msg::SelectInstance(id) => {
                 if self.selected.as_ref() != Some(&id) {
+                    if let Some(old) = self.selected.take() {
+                        let q = std::mem::take(&mut self.queue);
+                        if !q.is_empty() {
+                            self.queues.insert(old, q);
+                        }
+                    }
+                    self.queue = self.queues.remove(&id).unwrap_or_default();
                     self.selected = Some(id);
-                    self.queue = Queue::default();
                     self.choices.clear();
                     self.settings.for_instance = None;
                     self.selected_mod = None;
@@ -925,6 +1112,142 @@ impl App {
             }
             Msg::SaveInstanceSettings => self.save_instance_settings(),
             Msg::SaveGlobalSettings => self.save_global_settings(),
+            Msg::ToggleStar(id) => {
+                self.starred.toggle(&id);
+                if let Err(e) = self.starred.save(&self.ctx.paths) {
+                    self.error(format!("{e:#}"));
+                }
+                self.generation += 1;
+            }
+            Msg::SetShowDeps(v) => self.show_deps = v,
+            Msg::SetStarredOnly(v) => self.starred_only = v,
+            Msg::QueueShown => {
+                let ids: Vec<String> = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.installed.is_none() && r.latest.is_some())
+                    .map(|r| r.id.clone())
+                    .collect();
+                self.note(format!("Queued {} mods", ids.len()));
+                self.queue.install.extend(ids);
+            }
+            Msg::SetAuto(id, auto) => {
+                if let Some(view) = self.current() {
+                    let inst = view.inst.clone();
+                    let result = inst.registry().and_then(|mut reg| {
+                        if let Some(m) = reg.mods.get_mut(&id) {
+                            m.auto_installed = auto;
+                        }
+                        inst.save_registry(&reg)
+                    });
+                    match result {
+                        Ok(()) => self.reload(),
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
+            Msg::OpenExport => {
+                if let Some(v) = self.current() {
+                    let dir = orbis::paths::home().unwrap_or_default();
+                    let file = format!("{}.orbispack", orbis::paths::slug(&v.inst.config.name));
+                    self.dialog = Some(Dialog::Export(Box::new(ExportForm {
+                        instance: v.inst.id.clone(),
+                        path: dir.join(file).display().to_string(),
+                        name: v.inst.config.name.clone(),
+                        saves: modpack::save_names(&v.inst)
+                            .into_iter()
+                            .map(|n| (n, false))
+                            .collect(),
+                        ..ExportForm::default()
+                    })));
+                }
+            }
+            Msg::Export => {
+                if let Some(Dialog::Export(form)) = self.dialog.take()
+                    && let Some(v) = self.instances.iter().find(|v| v.inst.id == form.instance)
+                {
+                    let inst = v.inst.clone();
+                    let paths = self.ctx.paths.clone();
+                    let mut out = PathBuf::from(form.path.trim());
+                    if form.ckan && out.extension().is_none_or(|e| e != "ckan") {
+                        out.set_extension("ckan");
+                    }
+                    self.spawn("Exporting modpack", move |_| {
+                        let r = if form.ckan {
+                            modpack::export_ckan(&inst, &out, &form.name).map(|()| vec![])
+                        } else {
+                            let opts = modpack::ExportOptions {
+                                out: out.clone(),
+                                name: form.name.clone(),
+                                description: form.description.clone(),
+                                craft: form.craft,
+                                saves: form
+                                    .saves
+                                    .iter()
+                                    .filter(|(_, on)| *on)
+                                    .map(|(n, _)| n.clone())
+                                    .collect(),
+                                manual_files: form.manual_files,
+                            };
+                            modpack::export(&paths, &inst, &opts)
+                        };
+                        Done::Exported(r.map(|w| (out, w)).map_err(|e| format!("{e:#}")))
+                    });
+                }
+            }
+            Msg::OpenImport(path) => {
+                let form = ImportForm {
+                    path: path.map(|p| p.display().to_string()).unwrap_or_default(),
+                    base: self
+                        .steam
+                        .ksp
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    exact: true,
+                    ..ImportForm::default()
+                };
+                self.dialog = Some(Dialog::Import(Box::new(form)));
+                self.update(Msg::PreviewImport);
+            }
+            Msg::PreviewImport => {
+                if let Some(Dialog::Import(form)) = &mut self.dialog {
+                    form.previewed_for = form.path.clone();
+                    form.preview = (!form.path.trim().is_empty()).then(|| {
+                        modpack::read(&PathBuf::from(form.path.trim()))
+                            .map(|p| {
+                                if form.name.is_empty() {
+                                    form.name = p.name.clone();
+                                }
+                                pack_summary(&p)
+                            })
+                            .map_err(|e| format!("{e:#}"))
+                    });
+                }
+            }
+            Msg::Import => {
+                let Some(index) = self.index.clone() else {
+                    return self
+                        .error("The mod index isn't loaded yet: press Update index.".into());
+                };
+                if let Some(Dialog::Import(form)) = self.dialog.take() {
+                    let paths = self.ctx.paths.clone();
+                    let config = self.ctx.config.clone();
+                    let egui = self.egui.clone();
+                    let opts = modpack::ImportOptions {
+                        path: PathBuf::from(form.path.trim()),
+                        name: form.name.clone(),
+                        base: PathBuf::from(form.base.trim()),
+                        exact: form.exact,
+                    };
+                    self.spawn("Importing modpack", move |tx| {
+                        let r = forward_events(tx, &egui, |etx| {
+                            modpack::import(&paths, &config, &index, &opts, etx)
+                        });
+                        Done::Imported(r.map_err(|e| format!("{e:#}")))
+                    });
+                }
+            }
             Msg::CloseDialog => self.dialog = None,
             Msg::Refresh => {
                 self.steam = self.ctx.steam();
@@ -1039,35 +1362,38 @@ impl App {
         let config = self.ctx.config.clone();
         let egui = self.egui.clone();
         self.spawn("Applying changes", move |tx| {
-            let (etx, erx) = mpsc::channel::<ops::Event>();
-            let r = std::thread::scope(|s| {
-                s.spawn(|| {
-                    for e in erx {
-                        let msg = match e {
-                            ops::Event::Status(s) => TaskMsg::Status(s),
-                            ops::Event::Download(DownloadEvent::Progress {
-                                identifier,
-                                bytes,
-                                total,
-                            }) => TaskMsg::Download {
-                                id: identifier,
-                                bytes,
-                                total,
-                            },
-                            ops::Event::Download(DownloadEvent::Done { identifier }) => {
-                                TaskMsg::DownloadDone(identifier)
-                            }
-                        };
-                        let _ = tx.send(msg);
-                        egui.request_repaint();
-                    }
-                });
-                let r = ops::apply(&paths, &config, &inst, &plan, &etx);
-                drop(etx);
-                r
+            let r = forward_events(tx, &egui, |etx| {
+                ops::apply(&paths, &config, &inst, &plan, etx)
             });
             Done::Applied(r.map_err(|e| format!("{e:#}")))
         });
+    }
+
+    /// Writes `gui.toml` when the remembered state changed.
+    fn save_prefs(&mut self) {
+        if !self.persist {
+            return;
+        }
+        let mut queues = self.queues.clone();
+        if let Some(sel) = &self.selected
+            && !self.queue.is_empty()
+        {
+            queues.insert(sel.clone(), self.queue.clone());
+        }
+        queues.retain(|id, q| !q.is_empty() && self.instances.iter().any(|v| &v.inst.id == id));
+        let prefs = Prefs {
+            selected: self.selected.clone(),
+            filter: filter_name(self.filter).to_owned(),
+            show_deps: self.show_deps,
+            starred_only: self.starred_only,
+            queues,
+        };
+        if prefs != self.saved_prefs {
+            if let Err(e) = prefs.save(&self.ctx.paths) {
+                log::warn!("save gui.toml: {e:#}");
+            }
+            self.saved_prefs = prefs;
+        }
     }
 
     fn launch(&mut self) {
@@ -1296,6 +1622,89 @@ impl App {
         line(format!("status: {}", self.last_message()));
         out
     }
+}
+
+fn filter_from(s: &str) -> Option<Filter> {
+    match s {
+        "installed" => Some(Filter::Installed),
+        "available" | "compatible" => Some(Filter::Available),
+        "upgradable" => Some(Filter::Upgradable),
+        "all" => Some(Filter::All),
+        _ => None,
+    }
+}
+
+fn filter_name(f: Filter) -> &'static str {
+    match f {
+        Filter::Installed => "installed",
+        Filter::Available => "available",
+        Filter::Upgradable => "upgradable",
+        Filter::All => "all",
+    }
+}
+
+/// Runs `work` on this thread, forwarding its progress events to the task
+/// channel and waking the GUI for each.
+fn forward_events<T>(
+    tx: &Sender<TaskMsg>,
+    egui: &egui::Context,
+    work: impl FnOnce(&Sender<ops::Event>) -> Result<T>,
+) -> Result<T> {
+    let (etx, erx) = mpsc::channel::<ops::Event>();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for e in erx {
+                let msg = match e {
+                    ops::Event::Status(s) => TaskMsg::Status(s),
+                    ops::Event::Download(DownloadEvent::Progress {
+                        identifier,
+                        bytes,
+                        total,
+                    }) => TaskMsg::Download {
+                        id: identifier,
+                        bytes,
+                        total,
+                    },
+                    ops::Event::Download(DownloadEvent::Done { identifier }) => {
+                        TaskMsg::DownloadDone(identifier)
+                    }
+                };
+                let _ = tx.send(msg);
+                egui.request_repaint();
+            }
+        });
+        let r = work(&etx);
+        drop(etx);
+        r
+    })
+}
+
+/// A short description of a pack for the import dialog.
+fn pack_summary(p: &modpack::Pack) -> String {
+    let deps = p.mods.iter().filter(|m| m.dependency).count();
+    let mut parts = vec![format!(
+        "{}: {} mods ({} dependencies)",
+        p.name,
+        p.mods.len(),
+        deps
+    )];
+    if !p.manual.is_empty() {
+        let included = p.manual.iter().filter(|m| m.included).count();
+        parts.push(format!(
+            "{} manual mods ({included} with files)",
+            p.manual.len()
+        ));
+    }
+    if !p.saves.is_empty() {
+        parts.push(format!("saves: {}", p.saves.join(", ")));
+    }
+    if p.craft {
+        parts.push("craft included".into());
+    }
+    if !p.game_version.is_any() {
+        parts.push(format!("made for KSP {}", p.game_version));
+    }
+    parts.join(" · ")
 }
 
 fn index_label(index: &Index) -> String {

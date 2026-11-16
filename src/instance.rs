@@ -124,6 +124,26 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Identifiers of installed mods that depend on `id` (directly, or
+    /// through something it provides).
+    pub fn required_by(&self, id: &str) -> Vec<String> {
+        let Some(target) = self.mods.get(id) else {
+            return vec![];
+        };
+        let m = &target.module;
+        self.mods
+            .iter()
+            .filter(|(other, _)| other.as_str() != id)
+            .filter(|(_, o)| {
+                o.module
+                    .depends
+                    .iter()
+                    .any(|r| r.matches(&m.identifier, Some(&m.version), &m.provides))
+            })
+            .map(|(other, _)| other.clone())
+            .collect()
+    }
+
     /// Folded file path -> identifier of the mod that owns it.
     pub fn owners(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
@@ -561,8 +581,15 @@ fn unique_id(root: &Path, base: &str) -> String {
 }
 
 /// Whether a relative path (with `/`) is copied into a new instance.
+/// Steam Cloud's marker file: it belongs to the Steam install, and copying
+/// it would make Steam treat an instance's saves as cloud saves.
+pub const STEAM_CLOUD_FILE: &str = "steam_autocloud.vdf";
+
 fn wanted(rel: &str, opts: &CreateOptions) -> bool {
     let lower = rel.to_lowercase();
+    if lower.rsplit('/').next() == Some(STEAM_CLOUD_FILE) {
+        return false;
+    }
     let first = lower.split('/').next().unwrap_or("");
     if [
         "logs",
@@ -683,6 +710,7 @@ mod tests {
             "GameData/ModuleManager.ConfigCache",
             "saves/MyCareer/persistent.sfs",
             "saves/scenarios/s.sfs",
+            "saves/steam_autocloud.vdf",
             "Logs/a.log",
             "KSP.log",
             "settings.cfg",
@@ -721,6 +749,7 @@ mod tests {
         assert!(!is_link(&g.join("GameData")));
         assert!(!is_link(&g.join("settings.cfg")) && g.join("settings.cfg").is_file());
         assert!(g.join("saves/scenarios/s.sfs").is_file() && !is_link(&g.join("saves")));
+        assert!(!g.join("saves/steam_autocloud.vdf").exists());
         assert!(!g.join("saves/MyCareer").exists());
         assert!(!g.join("GameData/SomeMod").exists());
         assert!(!g.join("KSP.log").exists() && !g.join("Logs").exists());
