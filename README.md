@@ -1,0 +1,154 @@
+# orbis
+
+A Kerbal Space Program mod manager with Prism-style instances, built on CKAN metadata.
+
+![orbis](docs/screenshot.png)
+
+## Overview
+
+orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1. Every instance is its own copy of the game with its own mods, saves and settings, like Prism Launcher instances for Minecraft. Mods come from the CKAN index with full dependency resolution, and mods CKAN doesn't carry (Patreon builds, betas, personal patches) live in a manual mod library that any instance can use. It ships as a single binary with a GUI and a scriptable CLI, and it launches the Windows build of KSP through the Proton that Steam uses.
+
+## Features
+
+* **Instances**: copy the stock game from your Steam install into as many separate instances as you like. On btrfs or XFS the copy is instant and takes no extra space.
+* **CKAN mods**: browse, search, install, upgrade and remove the whole CKAN catalogue, with dependencies, conflicts, recommendations and provider choices handled the way CKAN does.
+* **Manual mods**: add a `.zip` or folder once, then install it into any instance. A manual mod can replace CKAN mods (for example, a Patreon Volumetric Clouds build standing in for EVE Redux and Scatterer), so mods that depend on them keep working.
+* **Proton launch**: start any instance with the Proton build Steam has mapped to KSP, inside the Steam Linux Runtime when Proton asks for it.
+* **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
+* **Safe file handling**: every installed file is tracked per mod, conflicts are refused, and a failed install rolls back.
+* **GUI and CLI**: an egui interface, plus a CLI covering every operation.
+* **Headless rendering**: the GUI renders offscreen to PNG with a text state dump, so it can be checked without a display.
+* **Pure Rust**: a single binary with no C dependencies; downloads go through the system `curl`.
+
+## Installation
+
+### Requirements
+
+* Rust 1.100 or newer and Make
+* `curl` at runtime
+* A Vulkan driver (any GPU driver, or lavapipe for software rendering)
+* Steam with KSP installed, set to run under Proton (Proton-GE or Valve Proton)
+
+### Build
+
+```sh
+git clone https://github.com/grunclepug/orbis
+cd orbis
+make build
+sudo make install    # optional, installs to /usr/local/bin
+```
+
+## Usage
+
+Run `orbis` with no arguments to open the GUI:
+
+1. Press **Update index** to download the CKAN catalogue.
+2. Press **+ New** to create an instance from your Steam install.
+3. Tick mods in the **Compatible** list, press **Apply changes**, and confirm.
+4. Press **Launch**.
+
+The same steps from the CLI:
+
+```sh
+orbis update
+orbis instance create "Stock Career"
+orbis search scatterer -i "Stock Career"
+orbis install -i "Stock Career" Scatterer EnvironmentalVisualEnhancements
+orbis launch "Stock Career"
+```
+
+When only one instance exists, `-i` can be left out.
+
+### CLI commands
+
+| Command | Action |
+|---------|--------|
+| `orbis gui` | Open the GUI (the default with no command) |
+| `orbis update` | Download the latest CKAN index |
+| `orbis search <query> [-i <instance>]` | Search mods, optionally only those compatible with an instance |
+| `orbis show <identifier>` | Show a mod's details, relationships and releases |
+| `orbis list [-i <instance>]` | List installed mods and detected DLC |
+| `orbis install [-i <instance>] <mod>[=<version>]...` | Install mods and their dependencies |
+| `orbis remove [-i <instance>] <mod>...` | Remove mods and anything that depends on them |
+| `orbis upgrade [-i <instance>] [<mod>...]` | Upgrade the named mods, or every upgradable one |
+| `orbis instance list\|create\|clone\|rename\|delete\|info\|compat` | Manage instances |
+| `orbis manual list\|add\|show\|install\|delete` | Manage the manual mod library |
+| `orbis launch [<instance>] [--dry-run]` | Start an instance, or print the command |
+| `orbis steam` | Show the detected Steam, KSP and Proton paths |
+
+`install`, `remove` and `upgrade` show the plan and ask before applying it. Pass `-y` to skip the question, `--dry-run` to only show the plan, and `--choose '<relationship>=<identifier>'` to answer a provider choice.
+
+### Configuration
+
+Settings live in `~/.config/orbis/config.toml` and can also be edited on the GUI's Settings tab.
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `steam_root` | | detected | Steam's root directory |
+| `proton` | | the Proton Steam maps to KSP | Directory holding the `proton` script |
+| `use_steam_runtime` | | `true` | Run Proton inside the Steam Linux Runtime when Proton asks for it |
+| `repositories` | | CKAN-meta `master.tar.gz` | CKAN metadata archives, each a `{ name, url }` table |
+| `download_workers` | | `4` | Parallel mod downloads (1 to 16) |
+| | `--root <dir>` | XDG directories | Keep config, data and cache under one directory |
+| `RUST_LOG` | | `warn` | Log level, written to stderr |
+
+Per-instance settings (compatible versions, testing releases, launch arguments, environment, prefix) live in each instance's `instance.toml` and on the Settings tab.
+
+## Instances
+
+An instance is a directory under `~/.local/share/orbis/instances/<id>/`:
+
+```
+instance.toml   name, game version, compatible versions, launch settings
+registry.json   installed mods and the files each one owns
+game/           the KSP directory
+prefix/         a separate Wine prefix, when the instance uses one
+```
+
+Creating an instance copies only the stock game from Steam: `GameData/Squad`, `GameData/SquadExpansion`, the executables and data, `settings.cfg`, the stock scenarios and training saves, and craft. Other mods, your saves, logs and CKAN's files stay behind unless you ask for them (`--with-saves`, `--keep-mods`). Cloning an instance copies everything, mods included.
+
+Each instance remembers the KSP version it was copied from, so a Steam update never changes an existing instance. Create a new instance to get the new version.
+
+By default, instances share Steam's KSP Wine prefix. That's safe because KSP keeps its saves and settings in the game directory. Switch an instance to a separate prefix in its settings if you want full isolation; Proton builds it on first launch.
+
+## Manual mods
+
+The manual library lives in `~/.local/share/orbis/manual/`. Add a mod in the GUI (**Manual mods > + Add mod**, or drop a file on the window) or with the CLI:
+
+```sh
+orbis manual add ~/Downloads/VolumetricClouds.zip --name "Volumetric Clouds" --version 5.0 \
+    --provides EnvironmentalVisualEnhancements,Scatterer
+orbis manual install volumetric-clouds -i "Stock Career"
+```
+
+orbis works out where the files go: if the archive has a `GameData` folder anywhere, its contents are installed; otherwise each top-level folder goes into `GameData`. Use `--find <folder>` to install a single folder instead. Only `.zip` archives and plain folders are supported; unpack other formats first.
+
+`--provides` lists the CKAN identifiers the mod replaces. Installing it removes the CKAN copies, and CKAN mods that depend on those identifiers are satisfied by the manual mod. `--depends` and `--conflicts` take CKAN identifiers too.
+
+## Launching
+
+orbis runs `KSP_x64.exe` from the instance with the Proton build Steam has mapped to KSP, passing the same `STEAM_COMPAT_*` environment Steam does. When that Proton requires the Steam Linux Runtime, orbis starts it through the runtime's entry point just as Steam does. KSP 1 has no DRM, so Steam doesn't need to start the game, though the Steam overlay and playtime tracking don't apply. Proton's output goes to `orbis-launch.log` in the instance directory. `orbis launch --dry-run` prints the exact command.
+
+## Development
+
+```sh
+make run ARGS="gui"   # run a debug build
+make test             # unit and integration tests
+make lint             # clippy with warnings as errors
+make fmt              # rustfmt
+make build            # release build
+make gui-shot         # headless GUI render to target/gui.png and target/gui.txt
+make clean            # remove build output
+```
+
+## Contributing
+
+Fork the repository and open a pull request.
+
+## License
+
+MIT. See [LICENSE](LICENSE). orbis reads metadata from CKAN, which is MIT licensed by the CKAN authors.
+
+## Author
+
+Chad Humphries | [Website](https://grunclepug.com/) | [GitHub](https://github.com/GrunclePug) | [More projects](https://github.com/GrunclePug?tab=repositories)
