@@ -35,7 +35,7 @@ pub struct Options {
     /// Select this instance on start.
     #[arg(long)]
     pub instance: Option<String>,
-    /// Open this tab on start: mods, manual or settings.
+    /// Open this tab on start: mods, manual, flags, history, logs or settings.
     #[arg(long)]
     pub tab: Option<String>,
     /// Start with this search text.

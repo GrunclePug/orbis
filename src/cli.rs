@@ -11,6 +11,7 @@ use orbis::cancel::Cancel;
 use orbis::ckan_import;
 use orbis::config::Config;
 use orbis::download::DownloadEvent;
+use orbis::flags;
 use orbis::instance::{self, CopyMode, CreateOptions, Instance};
 use orbis::launch;
 use orbis::manual::{self, AddOptions};
@@ -127,6 +128,9 @@ pub enum Command {
     /// Manage the manual mod library.
     #[command(subcommand)]
     Manual(ManualCmd),
+    /// Manage the custom flag library (shared by all instances).
+    #[command(subcommand)]
+    Flag(FlagCmd),
     /// Start an instance through Proton.
     Launch {
         instance: Option<String>,
@@ -309,6 +313,21 @@ pub enum InstanceCmd {
         #[arg(long, value_name = "VERSION")]
         remove: Vec<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FlagCmd {
+    /// List the flags in the library.
+    List,
+    /// Add a PNG to the library.
+    Add {
+        path: PathBuf,
+        /// Name to give the flag (default: the file name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete a flag from the library.
+    Remove { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -528,9 +547,10 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             plan_and_apply(ctx, &inst, req, &plan)
         }
         Command::Manual(c) => manual_cmd(ctx, c),
+        Command::Flag(c) => flag_cmd(ctx, c),
         Command::Launch { instance, dry_run } => {
             let mut inst = ctx.instance(instance.as_deref())?;
-            instance::sync_links(&mut inst)?;
+            instance::sync(&ctx.paths, &mut inst)?;
             if inst.config.launch.via_steam {
                 let steam = ctx.steam();
                 if dry_run {
@@ -1237,7 +1257,7 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
         }
         InstanceCmd::Sync { instance } => {
             let mut inst = ctx.instance(instance.as_deref())?;
-            instance::sync_links(&mut inst)?;
+            instance::sync(&ctx.paths, &mut inst)?;
             match &inst.config.base {
                 Some(b) => writeln!(
                     io::stdout(),
@@ -1330,6 +1350,37 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             )?;
             Ok(())
         }
+    }
+}
+
+fn flag_cmd(ctx: &Context, cmd: FlagCmd) -> Result<()> {
+    match cmd {
+        FlagCmd::List => {
+            for f in flags::list(&ctx.paths)? {
+                writeln!(
+                    io::stdout(),
+                    "{:32} {}x{}  {}/Flags/{}",
+                    f.name,
+                    f.width,
+                    f.height,
+                    flags::FOLDER,
+                    f.name
+                )?;
+            }
+            Ok(())
+        }
+        FlagCmd::Add { path, name } => {
+            let f = flags::add(&ctx.paths, &path, name.as_deref())?;
+            writeln!(
+                io::stdout(),
+                "Added {} ({}x{}); every instance shows it in the flag picker",
+                f.name,
+                f.width,
+                f.height
+            )?;
+            Ok(())
+        }
+        FlagCmd::Remove { name } => flags::remove(&ctx.paths, &name),
     }
 }
 

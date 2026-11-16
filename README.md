@@ -14,6 +14,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 * **CKAN mods**: browse, search, install, upgrade and remove the whole CKAN catalogue, with dependencies, conflicts, recommendations and provider choices handled the way CKAN does.
 * **Dependencies out of the way**: the Installed list shows the mods you chose; dependencies stay hidden behind a checkbox and say which mods need them.
 * **Starred mods**: star the mods you always use, then show only starred mods in any list and queue them all at once in a new instance.
+* **Custom flags**: add your own flag images once, on the Flags tab or with `orbis flag add`, and pick them in every instance.
 * **Modpacks**: export an instance's mods (optionally with craft, saves and manual mod files) and import them as a new instance; CKAN's `.ckan` modpacks work both ways.
 * **Save backups**: saves are snapshotted before every mod change and launch (only when they changed), with one-click restore of a single save or all of them.
 * **History and undo**: every change is recorded; undo the last one or put the mod list back to any earlier point, exact versions included.
@@ -90,6 +91,7 @@ When only one instance exists, `-i` can be left out.
 | `orbis instance import-ckan <dir> [--copy]` | Create an instance from a KSP install CKAN manages |
 | `orbis instance launcher [<instance>] --via direct\|steam` | Start the instance directly through Proton or through Steam |
 | `orbis manual list\|add\|show\|install\|delete` | Manage the manual mod library |
+| `orbis flag list\|add <png> [--name]\|remove <name>` | Manage the custom flag library |
 | `orbis launch [<instance>] [--dry-run]` | Start an instance, or print the command |
 | `orbis steam` | Show the detected Steam, KSP and Proton paths |
 | `orbis history list\|undo\|restore <id> [--before]` | Show changes, undo the last one, or restore an earlier mod list |
@@ -178,7 +180,7 @@ These always work:
 | `Ctrl+F` | Search |
 | `Ctrl+Up` / `Ctrl+Down` | Previous / next instance |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
-| `Ctrl+1` to `Ctrl+5` | Mods, Manual mods, History, Logs, Settings |
+| `Ctrl+1` to `Ctrl+6` | Mods, Manual mods, Flags, History, Logs, Settings |
 | `Ctrl+Z` | Undo the last mod change (asks first) |
 | `F2` | Rename the instance |
 | `F5` | Re-read instances from disk |
@@ -198,6 +200,16 @@ Vim-style keys work too, unless turned off under **Settings > Interface**:
 | `h` / `l` | Previous / next filter |
 | `J` / `K` | Next / previous instance |
 | `gt` / `gT` | Next / previous tab |
+
+## Flags
+
+The flag library lives in `~/.local/share/orbis/flags/`. Add a PNG on the **Flags** tab (**+ Add flag**, or drop it on the window) or with the CLI:
+
+```sh
+orbis flag add ~/Pictures/my-agency.png --name "My Agency"
+```
+
+Every instance has a `GameData/OrbisFlags/Flags` link to the library, so a flag you add shows up in every instance's flag picker under `OrbisFlags/Flags/<name>`, with nothing to install. KSP's own flags are 256 by 160 pixels; other sizes are stretched to fit. Deleting a flag makes saves and craft that used it show the default flag.
 
 ## Mod store
 

@@ -29,7 +29,7 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::SteamInfo;
 use orbis::version::{GameVersion, ModVersion};
-use orbis::{backup, history, logs, store};
+use orbis::{backup, flags, history, logs, store};
 
 /// Height of one mod table row including spacing (see `view::ROW_H`).
 pub const ROW_STEP: f32 = 30.0;
@@ -42,6 +42,7 @@ use crate::cli::{self, Context};
 pub enum Tab {
     Mods,
     Manual,
+    Flags,
     History,
     Logs,
     Settings,
@@ -313,6 +314,11 @@ pub enum Dialog {
     Export(Box<ExportForm>),
     Import(Box<ImportForm>),
     DeleteManual(ManualMod),
+    AddFlag {
+        path: String,
+        name: String,
+    },
+    DeleteFlag(String),
     RenameInstance {
         id: String,
         name: String,
@@ -352,6 +358,10 @@ pub enum Msg {
     RemoveManual(String),
     AskDeleteManual(String),
     DeleteManual,
+    OpenAddFlag(Option<PathBuf>),
+    AddFlag,
+    AskDeleteFlag(String),
+    DeleteFlag,
     SaveInstanceSettings,
     SaveGlobalSettings,
     ToggleStar(String),
@@ -446,6 +456,9 @@ pub struct App {
     pub task: Option<Task>,
     pub messages: Vec<String>,
     pub manual: Vec<ManualMod>,
+    pub flags: Vec<flags::Flag>,
+    /// Flag images by flag name, loaded with the library.
+    pub flag_textures: HashMap<String, egui::TextureHandle>,
     pub settings: SettingsForm,
     pub global: GlobalForm,
     pub running: Vec<(String, Child)>,
@@ -511,6 +524,8 @@ impl App {
             task: None,
             messages: Vec::new(),
             manual: Vec::new(),
+            flags: Vec::new(),
+            flag_textures: HashMap::new(),
             settings: SettingsForm::default(),
             global: GlobalForm::default(),
             running: Vec::new(),
@@ -575,6 +590,7 @@ impl App {
         }
         app.tab = match opts.tab.as_deref() {
             Some("manual") => Tab::Manual,
+            Some("flags") => Tab::Flags,
             Some("history") => Tab::History,
             Some("logs") => Tab::Logs,
             Some("settings") => Tab::Settings,
@@ -616,6 +632,7 @@ impl App {
             Ok(m) => self.manual = m,
             Err(e) => self.error(format!("{e:#}")),
         }
+        self.load_flags();
         if self
             .selected
             .as_ref()
@@ -627,6 +644,32 @@ impl App {
         self.settings.for_instance = None;
         self.load_side_data();
         self.recount_upgrades();
+    }
+
+    /// Re-reads the flag library and decodes each flag for display.
+    fn load_flags(&mut self) {
+        self.flags = flags::list(&self.ctx.paths).unwrap_or_else(|e| {
+            log::warn!("flags: {e:#}");
+            vec![]
+        });
+        self.flag_textures.clear();
+        for f in &self.flags {
+            match flags::rgba(&f.path) {
+                Ok((w, h, px)) => {
+                    let (Ok(w), Ok(h)) = (usize::try_from(w), usize::try_from(h)) else {
+                        continue;
+                    };
+                    let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
+                    let tex = self.egui.load_texture(
+                        format!("flag-{}", f.name),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.flag_textures.insert(f.name.clone(), tex);
+                }
+                Err(e) => log::warn!("{}: {e:#}", f.path.display()),
+            }
+        }
     }
 
     /// Reads the current instance's history, backups and unmanaged files.
@@ -743,6 +786,9 @@ impl App {
                 .unwrap_or_default();
             if ext == "orbispack" || ext == "ckan" || ckan_import::is_ckan_install(&p) {
                 self.update(Msg::OpenImport(Some(p)));
+            } else if ext == "png" {
+                self.tab = Tab::Flags;
+                self.update(Msg::OpenAddFlag(Some(p)));
             } else {
                 self.tab = Tab::Manual;
                 self.update(Msg::OpenAddManual(Some(p)));
@@ -792,6 +838,7 @@ impl App {
         let tabs = [
             Tab::Mods,
             Tab::Manual,
+            Tab::Flags,
             Tab::History,
             Tab::Logs,
             Tab::Settings,
@@ -800,11 +847,18 @@ impl App {
             Key::ArrowDown if m.ctrl => self.cycle_instance(1),
             Key::ArrowUp if m.ctrl => self.cycle_instance(-1),
             Key::Tab if m.ctrl => self.cycle_tab(if m.shift { -1 } else { 1 }),
-            Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 if m.ctrl => {
-                let i = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5]
-                    .iter()
-                    .position(|k| *k == key)
-                    .unwrap_or(0);
+            Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 if m.ctrl => {
+                let i = [
+                    Key::Num1,
+                    Key::Num2,
+                    Key::Num3,
+                    Key::Num4,
+                    Key::Num5,
+                    Key::Num6,
+                ]
+                .iter()
+                .position(|k| *k == key)
+                .unwrap_or(0);
                 self.update(Msg::SetTab(tabs[i]));
             }
             Key::F if m.ctrl => {
@@ -941,6 +995,7 @@ impl App {
         let all = [
             Tab::Mods,
             Tab::Manual,
+            Tab::Flags,
             Tab::History,
             Tab::Logs,
             Tab::Settings,
@@ -1699,6 +1754,42 @@ impl App {
                     }
                 }
             }
+            Msg::OpenAddFlag(path) => {
+                let (path, name) = match path {
+                    Some(p) => (
+                        p.display().to_string(),
+                        p.file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    ),
+                    None => (String::new(), String::new()),
+                };
+                self.dialog = Some(Dialog::AddFlag { path, name });
+            }
+            Msg::AddFlag => {
+                if let Some(Dialog::AddFlag { path, name }) = self.dialog.take() {
+                    let path = PathBuf::from(path.trim());
+                    match flags::add(&self.ctx.paths, &path, Some(name.as_str())) {
+                        Ok(f) => {
+                            self.note(format!("Added flag {}", f.name));
+                            self.load_flags();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
+            Msg::AskDeleteFlag(name) => self.dialog = Some(Dialog::DeleteFlag(name)),
+            Msg::DeleteFlag => {
+                if let Some(Dialog::DeleteFlag(name)) = self.dialog.take() {
+                    match flags::remove(&self.ctx.paths, &name) {
+                        Ok(()) => {
+                            self.note(format!("Deleted flag {name}"));
+                            self.load_flags();
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
+            }
             Msg::SaveInstanceSettings => self.save_instance_settings(),
             Msg::SaveGlobalSettings => self.save_global_settings(),
             Msg::ToggleStar(id) => {
@@ -2257,7 +2348,7 @@ impl App {
             Err(e) => self.note(format!("Save backup failed: {e:#}")),
         }
         if inst.config.launch.via_steam {
-            let result = instance::sync_links(&mut inst)
+            let result = instance::sync(&self.ctx.paths, &mut inst)
                 .and_then(|()| launch::launch_via_steam(&self.ctx.paths, &inst, &self.steam));
             match result {
                 Ok(()) => {
@@ -2272,7 +2363,7 @@ impl App {
             }
             return;
         }
-        let result = instance::sync_links(&mut inst)
+        let result = instance::sync(&self.ctx.paths, &mut inst)
             .and_then(|()| launch::plan(&inst, &self.steam, &self.ctx.config))
             .and_then(|p| {
                 log::info!("launch: {}", p.display());
@@ -2482,6 +2573,21 @@ impl App {
             self.manual
                 .iter()
                 .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        line(format!(
+            "flags: {}",
+            self.flags
+                .iter()
+                .map(|f| {
+                    let shown = if self.flag_textures.contains_key(&f.name) {
+                        ""
+                    } else {
+                        " (not shown)"
+                    };
+                    format!("{} {}x{}{shown}", f.name, f.width, f.height)
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ));

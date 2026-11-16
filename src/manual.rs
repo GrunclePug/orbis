@@ -344,6 +344,7 @@ pub fn unmanaged(
         if ft.is_symlink()
             || name.eq_ignore_ascii_case("Squad")
             || name.eq_ignore_ascii_case("SquadExpansion")
+            || name.eq_ignore_ascii_case(crate::flags::FOLDER)
         {
             continue;
         }

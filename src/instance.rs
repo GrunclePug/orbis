@@ -355,6 +355,7 @@ pub fn create(paths: &Paths, opts: &CreateOptions, progress: CopyProgress) -> Re
             fs::create_dir_all(partial.join("game").join(d))
                 .with_context(|| format!("create {d}"))?;
         }
+        crate::flags::link(paths, &partial.join("game"))?;
         let inst = Instance {
             id: id.clone(),
             dir: partial.clone(),
@@ -564,6 +565,13 @@ pub fn sync_links(inst: &mut Instance) -> Result<()> {
         inst.save()?;
     }
     Ok(())
+}
+
+/// Gets an instance ready to run: `sync_links`, then the link to the flag
+/// library (which full copies need too).
+pub fn sync(paths: &Paths, inst: &mut Instance) -> Result<()> {
+    sync_links(inst)?;
+    crate::flags::link(paths, &inst.game_dir())
 }
 
 fn unique_id(root: &Path, base: &str) -> String {

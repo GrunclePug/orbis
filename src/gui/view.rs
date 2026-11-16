@@ -23,6 +23,7 @@ pub fn draw(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     egui::CentralPanel::default_margins().show(ui, |ui| match app.tab {
         Tab::Mods => mods_tab(app, ui, msgs),
         Tab::Manual => manual_tab(app, ui, msgs),
+        Tab::Flags => flags_tab(app, ui, msgs),
         Tab::History => history_tab(app, ui, msgs),
         Tab::Logs => logs_tab(app, ui, msgs),
         Tab::Settings => settings_tab(app, ui, msgs),
@@ -39,6 +40,7 @@ fn top_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             for (tab, label) in [
                 (Tab::Mods, "Mods"),
                 (Tab::Manual, "Manual mods"),
+                (Tab::Flags, "Flags"),
                 (Tab::History, "History"),
                 (Tab::Logs, "Logs"),
                 (Tab::Settings, "Settings"),
@@ -1063,6 +1065,81 @@ fn manual_tab(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         });
 }
 
+fn flags_tab(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Flag library").strong());
+        ui.label(RichText::new("Your own flags, in the flag picker of every instance.").weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("+ Add flag...").clicked() {
+                msgs.push(Msg::OpenAddFlag(None));
+            }
+            if ui
+                .button("Open folder")
+                .on_hover_text("PNGs copied in here show up too (press F5)")
+                .clicked()
+            {
+                msgs.push(Msg::OpenFolder(orbis::flags::dir(&app.ctx.paths)));
+            }
+        });
+    });
+    ui.label(
+        RichText::new(
+            "Tip: drop a .png onto the window to add it. In KSP, flags are under OrbisFlags.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.separator();
+    if app.flags.is_empty() {
+        ui.add_space(20.0);
+        ui.label(RichText::new("No flags yet.").weak());
+        return;
+    }
+    const THUMB: egui::Vec2 = egui::vec2(192.0, 120.0);
+    egui::ScrollArea::vertical()
+        .id_salt("flags")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for f in &app.flags {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(THUMB.x);
+                        ui.vertical(|ui| {
+                            match app.flag_textures.get(&f.name) {
+                                Some(tex) => {
+                                    ui.add(
+                                        egui::Image::new(tex)
+                                            .fit_to_exact_size(THUMB)
+                                            .maintain_aspect_ratio(false),
+                                    )
+                                    .on_hover_text("Stretched to 8:5, as KSP shows it");
+                                }
+                                None => {
+                                    ui.allocate_ui(THUMB, |ui| {
+                                        ui.label(RichText::new("can't show this image").weak());
+                                    });
+                                }
+                            }
+                            ui.label(RichText::new(&f.name).strong());
+                            ui.label(
+                                RichText::new(format!("{} x {}", f.width, f.height))
+                                    .small()
+                                    .weak(),
+                            );
+                            if ui
+                                .small_button("Delete")
+                                .on_hover_text("Remove from the library")
+                                .clicked()
+                            {
+                                msgs.push(Msg::AskDeleteFlag(f.name.clone()));
+                            }
+                        });
+                    });
+                }
+            });
+        });
+}
+
 fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     app.sync_settings_form();
     app.sync_global_form();
@@ -1682,7 +1759,7 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                             ("Ctrl+F", "search"),
                             ("Ctrl+Up / Down", "previous / next instance"),
                             ("Ctrl+Tab", "next tab (Shift: previous)"),
-                            ("Ctrl+1 .. 5", "go to a tab"),
+                            ("Ctrl+1 .. 6", "go to a tab"),
                             ("Ctrl+Z", "undo the last mod change"),
                             ("F2", "rename instance"),
                             ("F5", "re-read instances"),
@@ -1727,6 +1804,33 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 ui.label(format!("Delete {name}, including its saves and mods? This can't be undone."));
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Delete", true, Msg::DeleteInstance);
+            }
+            Dialog::AddFlag { path, name } => {
+                ui.heading("Add flag");
+                ui.label("A PNG image. KSP's own flags are 256 by 160 pixels; other sizes are stretched to fit.");
+                ui.add_space(6.0);
+                egui::Grid::new("add-flag").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("PNG file");
+                    ui.add(egui::TextEdit::singleline(path).hint_text("/path/to/flag.png").desired_width(380.0));
+                    ui.end_row();
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("default: the file name")
+                            .desired_width(380.0),
+                    );
+                    ui.end_row();
+                });
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Add", !path.trim().is_empty(), Msg::AddFlag);
+            }
+            Dialog::DeleteFlag(name) => {
+                ui.heading("Delete flag");
+                ui.label(format!(
+                    "Remove {name} from the library? Saves and craft that use it show KSP's default flag instead."
+                ));
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Delete", true, Msg::DeleteFlag);
             }
             Dialog::DeleteManual(m) => {
                 ui.heading("Delete manual mod");

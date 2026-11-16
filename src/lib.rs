@@ -5,6 +5,7 @@ pub mod cancel;
 pub mod ckan_import;
 pub mod config;
 pub mod download;
+pub mod flags;
 pub mod game;
 pub mod history;
 pub mod install;
