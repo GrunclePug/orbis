@@ -226,12 +226,81 @@ fn unknown_roots(text: &str, known: &HashMap<String, String>) -> Vec<String> {
 /// Reads and analyses a log file, blaming exceptions on mods.
 pub fn read(path: &Path, asm: &Assemblies) -> Result<Report> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let text = String::from_utf8_lossy(&bytes);
+    Ok(read_text(path, &String::from_utf8_lossy(&bytes), asm))
+}
+
+/// Analyses log text read from `path` (a session's kept copy, say),
+/// blaming exceptions on mods.
+pub fn read_text(path: &Path, text: &str, asm: &Assemblies) -> Report {
     let mut owners = asm.by_stem.clone();
-    owners.extend(asm.resolve_roots(&unknown_roots(&text, &owners)));
-    let mut report = analyse(&text, &owners);
+    owners.extend(asm.resolve_roots(&unknown_roots(text, &owners)));
+    let mut report = analyse(text, &owners);
     report.path = path.to_path_buf();
-    Ok(report)
+    report
+}
+
+/// The time of a KSP.log line (`[LOG 21:47:13.154] ...`) in seconds since
+/// midnight, the game's local time.
+pub fn line_time(line: &str) -> Option<u32> {
+    tag_level(line)?;
+    let t = line.get(5..13)?;
+    let mut parts = t.split(':').map(|p| p.parse::<u32>().ok());
+    let (h, m, s) = (parts.next()??, parts.next()??, parts.next()??);
+    (h < 24 && m < 60 && s < 60).then_some(h * 3600 + m * 60 + s)
+}
+
+/// The exceptions logged from `before` seconds ahead of line `at` to
+/// `after` seconds past it (KSP.log times), grouped like
+/// `Report::exceptions` and blamed the same way, most frequent first.
+pub fn around(report: &Report, at: usize, before: u32, after: u32) -> Vec<ExceptionGroup> {
+    let Some(reference) = report
+        .lines
+        .get(..=at)
+        .unwrap_or(&report.lines)
+        .iter()
+        .rev()
+        .find_map(|l| line_time(&l.text))
+    else {
+        return vec![];
+    };
+    let mut out: Vec<ExceptionGroup> = Vec::new();
+    for (i, l) in report.lines.iter().enumerate() {
+        if l.level != Level::Exception {
+            continue;
+        }
+        let Some(t) = line_time(&l.text) else {
+            continue;
+        };
+        // Seconds from the mark, taking the shorter way around midnight.
+        let mut d = i64::from(t) - i64::from(reference);
+        if d > 43_200 {
+            d -= 86_400;
+        } else if d < -43_200 {
+            d += 86_400;
+        }
+        if d < -i64::from(before) || d > i64::from(after) {
+            continue;
+        }
+        let message = strip_tag(&l.text).trim().to_owned();
+        if let Some(g) = out.iter_mut().find(|g| g.message == message) {
+            g.count += 1;
+            continue;
+        }
+        let mods = report
+            .exceptions
+            .iter()
+            .find(|g| g.message == message)
+            .map(|g| g.mods.clone())
+            .unwrap_or_default();
+        out.push(ExceptionGroup {
+            message,
+            count: 1,
+            first_line: i,
+            mods,
+        });
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.count));
+    out
 }
 
 /// Analyses log text. KSP.log lines start with `[LOG|WRN|ERR|EXC hh:mm:ss]`;
@@ -401,5 +470,43 @@ mod tests {
         let r = analyse(player, &owners);
         assert_eq!(r.exceptions.len(), 1);
         assert_eq!(r.exceptions[0].mods, ["MechJeb2"]);
+    }
+
+    #[test]
+    fn finds_exceptions_around_a_moment() {
+        let log = "\
+[EXC 23:50:00.000] OldException: long before
+[LOG 23:58:00.000] flying
+[EXC 23:58:30.000] NullReferenceException: boom
+  at Kopernicus.Ring.Update () [0x0]
+[EXC 23:59:50.000] NullReferenceException: boom
+[LOG 23:59:59.000] the mark
+[EXC 00:00:10.000] LateException: just after midnight
+[EXC 00:05:00.000] FarException: much later
+";
+        let mut owners = HashMap::new();
+        owners.insert("kopernicus".to_owned(), "Kopernicus".to_owned());
+        let r = analyse(log, &owners);
+        let near = around(&r, 5, 300, 30);
+        let found: Vec<(&str, usize)> =
+            near.iter().map(|e| (e.message.as_str(), e.count)).collect();
+        assert_eq!(
+            found,
+            [
+                ("NullReferenceException: boom", 2),
+                ("LateException: just after midnight", 1)
+            ]
+        );
+        assert_eq!(near[0].mods, ["Kopernicus"]);
+        assert_eq!(near[0].first_line, 2);
+        assert_eq!(line_time("[LOG 21:47:13.154] x"), Some(78_433));
+        assert_eq!(line_time("plain"), None);
+        // An empty log, or a line past its end, finds nothing and doesn't panic.
+        assert!(around(&analyse("", &owners), 0, 300, 30).is_empty());
+        assert_eq!(
+            around(&r, 99, 300, 30).len(),
+            2,
+            "uses the last line's time"
+        );
     }
 }

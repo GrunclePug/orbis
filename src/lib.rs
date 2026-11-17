@@ -23,6 +23,7 @@ pub mod repo;
 pub mod report;
 pub mod resolver;
 pub mod running;
+pub mod sessions;
 pub mod starred;
 pub mod steam;
 pub mod store;

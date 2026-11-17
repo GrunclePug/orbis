@@ -525,6 +525,15 @@ pub fn steam_run(paths: &crate::paths::Paths, command: &[OsString]) -> Result<i3
         .as_ref()
         .filter(|_| r.cwd.is_some())
         .map(|n| n.instance_dir.clone());
+    // Session logs, before the instance counts as running; any trouble
+    // here only skips them.
+    let session = instance_dir.as_ref().and_then(|dir| {
+        let inst = Instance::load(dir).ok()?;
+        let config = Config::load(paths).ok()?;
+        let steam = crate::steam::detect(config.steam_root.as_deref(), config.proton.as_deref());
+        let id = crate::sessions::launching(paths, &inst, &steam, &config)?;
+        Some((inst, steam, config, id))
+    });
     if let Some(dir) = &instance_dir
         && let Err(e) = crate::running::mark(dir, std::process::id(), "steam")
     {
@@ -533,6 +542,9 @@ pub fn steam_run(paths: &crate::paths::Paths, command: &[OsString]) -> Result<i3
     let status = cmd
         .status()
         .with_context(|| format!("run {}", r.args[0].to_string_lossy()));
+    if let Some((inst, steam, config, id)) = &session {
+        crate::sessions::exited(inst, steam, config, id);
+    }
     if let Some(dir) = &instance_dir {
         crate::running::clear(dir, std::process::id());
         let line = match paths

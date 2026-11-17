@@ -38,6 +38,10 @@ pub struct Config {
     pub auto_update_hours: u64,
     /// Look for a newer orbis release when the GUI starts.
     pub check_updates: bool,
+    /// Keep each game session's logs in `<instance>/sessions/`.
+    pub session_logs: bool,
+    /// Sessions kept per instance when `session_logs` is on.
+    pub session_logs_keep: usize,
 }
 
 /// One CKAN metadata repository.
@@ -63,6 +67,8 @@ impl Default for Config {
             backups_keep: 10,
             auto_update_hours: 24,
             check_updates: true,
+            session_logs: false,
+            session_logs_keep: 10,
         }
     }
 }
@@ -108,6 +114,9 @@ impl Config {
         }
         if self.backups_keep > 1000 {
             bail!("backups_keep must be at most 1000");
+        }
+        if !(1..=1000).contains(&self.session_logs_keep) {
+            bail!("session_logs_keep must be between 1 and 1000");
         }
         Ok(())
     }

@@ -310,6 +310,21 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 {
                     msgs.push(Msg::Launch);
                 }
+                let markable = app.ctx.config.session_logs
+                    && app.current().is_some_and(|v| app.instance_running(&v.inst));
+                if markable
+                    && ui
+                        .add_sized(
+                            [ui.available_width(), 28.0],
+                            egui::Button::new(theme::semibold("Something broke").color(WARN)),
+                        )
+                        .on_hover_text(
+                            "Mark this moment in the game's session logs (also: orbis mark)",
+                        )
+                        .clicked()
+                {
+                    msgs.push(Msg::OpenMark);
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(has && !app.busy(), egui::Button::new("Clone"))
@@ -2067,6 +2082,17 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                     ui.label("orbis updates");
                     ui.checkbox(&mut g.check_updates, "Check for a new orbis release on start");
                     ui.end_row();
+                    ui.label("Session logs");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut g.session_logs, "Keep each game session's logs")
+                            .on_hover_text("KSP.log, Player.log and the launch log of every run, kept per instance, so a problem can be looked at after the next launch");
+                        ui.add_enabled(
+                            g.session_logs,
+                            egui::TextEdit::singleline(&mut g.session_logs_keep).desired_width(60.0),
+                        );
+                        ui.add_enabled(g.session_logs, egui::Label::new("sessions to keep"));
+                    });
+                    ui.end_row();
                     ui.label("Repositories");
                     ui.add(
                         egui::TextEdit::multiline(&mut g.repos)
@@ -2296,6 +2322,43 @@ fn logs_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             }
         }
         ui.separator();
+        if !app.sessions.is_empty() || app.ctx.config.session_logs {
+            let label = |s: &orbis::sessions::Session| {
+                let length = s.minutes().map_or("running".to_owned(), |m| format!("{m} min"));
+                let marks = match s.marks.len() {
+                    0 => String::new(),
+                    1 => ", 1 mark".to_owned(),
+                    n => format!(", {n} marks"),
+                };
+                format!("{} ({length}{marks})", when(s.started / 1000))
+            };
+            let current = app
+                .log_session
+                .as_ref()
+                .and_then(|id| app.sessions.iter().find(|s| &s.id == id))
+                .map_or("Current files".to_owned(), label);
+            egui::ComboBox::from_id_salt("log-session")
+                .selected_text(current)
+                .width(250.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(app.log_session.is_none(), "Current files")
+                        .clicked()
+                    {
+                        msgs.push(Msg::SelectLogSession(None));
+                    }
+                    for s in &app.sessions {
+                        if ui
+                            .selectable_label(app.log_session.as_ref() == Some(&s.id), label(s))
+                            .clicked()
+                        {
+                            msgs.push(Msg::SelectLogSession(Some(s.id.clone())));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Kept game sessions (Settings > Session logs)");
+        }
         if ui.button("Reload").clicked() {
             msgs.push(Msg::LoadLog(app.log_kind));
         }
@@ -2355,33 +2418,59 @@ fn logs_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         count(ui, report.errors, "errors", theme::ERROR);
         count(ui, report.warnings, "warnings", WARN);
     });
+    if !app.log_marks.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt("marks")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                for m in &app.log_marks {
+                    ui.horizontal(|ui| {
+                        let at = m
+                            .mark
+                            .ksp_time
+                            .clone()
+                            .unwrap_or_else(|| when(m.mark.at / 1000));
+                        let title = if m.mark.note.is_empty() {
+                            format!("Marked at {at}")
+                        } else {
+                            format!("Marked at {at}: {}", m.mark.note)
+                        };
+                        let text = RichText::new(title).color(WARN).strong();
+                        match m.line {
+                            Some(line) => {
+                                if ui.link(text).on_hover_text("Show it in the log").clicked() {
+                                    msgs.push(Msg::JumpToLog(line));
+                                }
+                            }
+                            None => {
+                                ui.label(text);
+                            }
+                        }
+                    });
+                    if m.line.is_some() && m.near.is_empty() {
+                        ui.label(
+                            RichText::new("    No exceptions in the 5 minutes before it.")
+                                .small()
+                                .color(theme::MUTED),
+                        );
+                    }
+                    for e in &m.near {
+                        exception_row(ui, msgs, e);
+                    }
+                }
+            });
+        ui.separator();
+    }
     if !report.exceptions.is_empty() {
+        if !app.log_marks.is_empty() {
+            ui.label(RichText::new("All exceptions").small().color(theme::MUTED));
+        }
         egui::ScrollArea::vertical()
             .id_salt("exc")
             .max_height(180.0)
             .show(ui, |ui| {
                 for e in &report.exceptions {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [44.0, 18.0],
-                            egui::Label::new(RichText::new(format!("{}x", e.count)).color(BAD)),
-                        );
-                        let blame = if e.mods.is_empty() {
-                            "unknown source".to_owned()
-                        } else {
-                            e.mods.join(", ")
-                        };
-                        ui.add_sized(
-                            [200.0, 18.0],
-                            egui::Label::new(RichText::new(blame).color(WARN)).truncate(),
-                        );
-                        let msg = egui::Label::new(RichText::new(&e.message).small().monospace())
-                            .truncate()
-                            .sense(egui::Sense::click());
-                        if ui.add(msg).on_hover_text("Show it in the log").clicked() {
-                            msgs.push(Msg::JumpToLog(e.first_line));
-                        }
-                    });
+                    exception_row(ui, msgs, e);
                 }
             });
         ui.separator();
@@ -2424,6 +2513,31 @@ fn logs_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 logs::Level::Info => theme::MUTED,
             };
             ui.add(egui::Label::new(RichText::new(&l.text).monospace().color(color)).extend());
+        }
+    });
+}
+
+/// One grouped exception: count, suspects, message (click to show it).
+fn exception_row(ui: &mut Ui, msgs: &mut Vec<Msg>, e: &logs::ExceptionGroup) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [44.0, 18.0],
+            egui::Label::new(RichText::new(format!("{}x", e.count)).color(BAD)),
+        );
+        let blame = if e.mods.is_empty() {
+            "unknown source".to_owned()
+        } else {
+            e.mods.join(", ")
+        };
+        ui.add_sized(
+            [200.0, 18.0],
+            egui::Label::new(RichText::new(blame).color(WARN)).truncate(),
+        );
+        let msg = egui::Label::new(RichText::new(&e.message).small().monospace())
+            .truncate()
+            .sense(egui::Sense::click());
+        if ui.add(msg).on_hover_text("Show it in the log").clicked() {
+            msgs.push(Msg::JumpToLog(e.first_line));
         }
     });
 }
@@ -2475,6 +2589,21 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 ui.add(egui::TextEdit::singleline(name).desired_width(360.0)).request_focus();
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Rename", !name.trim().is_empty(), Msg::RenameInstance);
+            }
+            Dialog::Mark { name, note, .. } => {
+                ui.heading("Something broke");
+                ui.label(format!(
+                    "Marks this moment in {name}'s session, so the Logs tab can show what was logged just before it."
+                ));
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(note)
+                        .hint_text("What happened (optional)")
+                        .desired_width(420.0),
+                )
+                .request_focus();
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Mark", true, Msg::SaveMark);
             }
             Dialog::KeyHelp => {
                 ui.heading("Keys");

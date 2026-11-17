@@ -34,7 +34,7 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::SteamInfo;
 use orbis::version::{GameVersion, ModVersion};
-use orbis::{backup, flags, history, logs, running, store, update};
+use orbis::{backup, flags, history, logs, running, sessions, store, update};
 
 /// Height of one mod table row including spacing (see `view::ROW_H`).
 pub const ROW_STEP: f32 = 34.0;
@@ -282,6 +282,8 @@ pub struct GlobalForm {
     pub backups_keep: String,
     pub auto_update_hours: String,
     pub check_updates: bool,
+    pub session_logs: bool,
+    pub session_logs_keep: String,
 }
 
 /// Fields of the "add manual mod" dialog.
@@ -302,6 +304,16 @@ pub struct AddManualForm {
     /// Set when adopting a hand-added GameData folder of the current
     /// instance instead of adding an archive.
     pub adopt_folder: Option<String>,
+}
+
+/// A "something broke" mark in the shown log.
+#[derive(Clone, Debug)]
+pub struct LogMark {
+    pub mark: sessions::Mark,
+    /// The log line it falls on (KSP.log only).
+    pub line: Option<usize>,
+    /// Exceptions logged shortly before it.
+    pub near: Vec<logs::ExceptionGroup>,
 }
 
 /// A modal dialog.
@@ -374,6 +386,12 @@ pub enum Dialog {
     RenameInstance {
         id: String,
         name: String,
+    },
+    /// "Something broke" in a running instance.
+    Mark {
+        id: String,
+        name: String,
+        note: String,
     },
     KeyHelp,
     /// A newer orbis release, and why it can't be installed from here.
@@ -467,6 +485,9 @@ pub enum Msg {
     CancelTask,
     OpenRename,
     RenameInstance,
+    OpenMark,
+    SaveMark,
+    SelectLogSession(Option<String>),
     CleanStore,
     ShareStore,
     RefreshStorage,
@@ -589,6 +610,8 @@ pub struct App {
     pub settings: SettingsForm,
     pub global: GlobalForm,
     pub running: Vec<(String, Child)>,
+    /// The session each running child's logs go to, by process id.
+    session_of: HashMap<u32, String>,
     pub starred: Starred,
     pub show_deps: bool,
     pub starred_only: bool,
@@ -610,6 +633,12 @@ pub struct App {
     pub log_rows: Vec<usize>,
     log_rows_key: Option<(logs::Level, String, usize)>,
     pub log_jump: Option<usize>,
+    /// Kept game sessions of the current instance, newest first.
+    pub sessions: Vec<sessions::Session>,
+    /// The session whose logs are shown; `None` shows the current files.
+    pub log_session: Option<String>,
+    /// Marks in the shown log, placed and with the exceptions near them.
+    pub log_marks: Vec<LogMark>,
     auto_updated: bool,
     pub vim_keys: bool,
     /// A `g` waiting for its second key (gg, gt, gT), with the time it came.
@@ -676,6 +705,7 @@ impl App {
             settings: SettingsForm::default(),
             global: GlobalForm::default(),
             running: Vec::new(),
+            session_of: HashMap::new(),
             starred: Starred::default(),
             show_deps: false,
             starred_only: false,
@@ -693,6 +723,9 @@ impl App {
             log_rows: Vec::new(),
             log_rows_key: None,
             log_jump: None,
+            sessions: Vec::new(),
+            log_session: None,
+            log_marks: Vec::new(),
             auto_updated: false,
             vim_keys: true,
             pending_g: None,
@@ -1509,6 +1542,14 @@ impl App {
         for (id, pid) in &exited {
             if let Some(v) = self.instances.iter().find(|v| &v.inst.id == id) {
                 running::clear(&v.inst.dir, *pid);
+                // Compressing the logs takes a moment: off the UI thread. The
+                // thread ends when they are kept; the session lock keeps it
+                // apart from anything else touching the sessions.
+                if let Some(id) = self.session_of.remove(pid) {
+                    let (inst, steam, config) =
+                        (v.inst.clone(), self.steam.clone(), self.ctx.config.clone());
+                    std::thread::spawn(move || sessions::exited(&inst, &steam, &config, &id));
+                }
             }
         }
         if !exited.is_empty() {
@@ -1933,6 +1974,9 @@ impl App {
                     self.selected = Some(id);
                     self.load_side_data();
                     self.log = None;
+                    self.log_session = None;
+                    self.log_marks.clear();
+                    self.sessions.clear();
                     self.choices.clear();
                     self.settings.for_instance = None;
                     self.selected_mod = None;
@@ -2519,18 +2563,40 @@ impl App {
                 self.log_jump = None;
                 if let Some(view) = self.current() {
                     let inst = view.inst.clone();
-                    self.log = Some(match logs::path(&inst, &self.steam, kind) {
-                        None => {
-                            Err("This log's location is unknown (no Proton prefix found).".into())
-                        }
-                        Some(p) if !p.is_file() => Err(format!(
-                            "{} doesn't exist yet: launch the game first.",
-                            p.display()
-                        )),
-                        Some(p) => logs::assemblies(&inst)
-                            .and_then(|asm| logs::read(&p, &asm))
-                            .map_err(|e| format!("{e:#}")),
+                    self.load_log(&inst, kind);
+                }
+            }
+            Msg::SelectLogSession(id) => {
+                self.log_session = id;
+                self.update(Msg::LoadLog(self.log_kind));
+            }
+            Msg::OpenMark => {
+                if let Some(v) = self.current()
+                    && self.instance_running(&v.inst)
+                {
+                    self.dialog = Some(Dialog::Mark {
+                        id: v.inst.id.clone(),
+                        name: v.inst.config.name.clone(),
+                        note: String::new(),
                     });
+                }
+            }
+            Msg::SaveMark => {
+                if let Some(Dialog::Mark { id, name, note }) = self.dialog.take()
+                    && let Some(v) = self.instances.iter().find(|v| v.inst.id == id)
+                {
+                    match sessions::mark(&v.inst, &note) {
+                        Ok(m) => {
+                            let at = m.ksp_time.unwrap_or_else(|| when(m.at / 1000));
+                            self.note(format!(
+                                "Marked {name} at {at}: the Logs tab shows what was logged around it"
+                            ));
+                            if self.tab == Tab::Logs && self.log_session.is_none() {
+                                self.update(Msg::LoadLog(self.log_kind));
+                            }
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
                 }
             }
             Msg::SetLogLevel(l) => self.log_min = l,
@@ -2977,6 +3043,81 @@ impl App {
         }
     }
 
+    /// Whether an instance's game is running, started from here or not.
+    pub fn instance_running(&self, inst: &Instance) -> bool {
+        self.running.iter().any(|(id, _)| *id == inst.id) || running::is_running(&inst.dir)
+    }
+
+    /// Reads the shown log: the current file, or a kept session's copy.
+    fn load_log(&mut self, inst: &Instance, kind: logs::LogKind) {
+        if !self.instance_running(inst) {
+            sessions::settle(inst, &self.steam, &self.ctx.config);
+        }
+        self.sessions = sessions::list(inst).unwrap_or_else(|e| {
+            log::warn!("list sessions: {e:#}");
+            Vec::new()
+        });
+        if let Some(id) = &self.log_session
+            && !self.sessions.iter().any(|s| &s.id == id)
+        {
+            self.log_session = None;
+        }
+        let session = self
+            .log_session
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id));
+        // The running session's marks point into the live KSP.log.
+        let marks = match session {
+            Some(s) => s.marks.clone(),
+            None => self
+                .sessions
+                .iter()
+                .find(|s| s.is_open())
+                .map(|s| s.marks.clone())
+                .unwrap_or_default(),
+        };
+        let text: Result<(PathBuf, String), String> = match session {
+            Some(s) if !s.has(kind) => Err(format!("This session kept no {}.", kind.label())),
+            Some(s) => sessions::read_log(inst, &s.id, kind).map_err(|e| format!("{e:#}")),
+            None => match logs::path(inst, &self.steam, kind) {
+                None => Err("This log's location is unknown (no Proton prefix found).".into()),
+                Some(p) if !p.is_file() => Err(format!(
+                    "{} doesn't exist yet: launch the game first.",
+                    p.display()
+                )),
+                Some(p) => std::fs::read(&p)
+                    .map(|b| (p.clone(), String::from_utf8_lossy(&b).into_owned()))
+                    .map_err(|e| format!("read {}: {e}", p.display())),
+            },
+        };
+        self.log_marks.clear();
+        self.log = Some(text.and_then(|(path, text)| {
+            let asm = logs::assemblies(inst).map_err(|e| format!("{e:#}"))?;
+            let report = logs::read_text(&path, &text, &asm);
+            for m in marks {
+                let line = (kind == logs::LogKind::Ksp)
+                    .then(|| sessions::mark_line(&text, &m))
+                    .flatten();
+                let near = line
+                    .map(|l| {
+                        logs::around(
+                            &report,
+                            l,
+                            sessions::MARK_BEFORE_SECS,
+                            sessions::MARK_AFTER_SECS,
+                        )
+                    })
+                    .unwrap_or_default();
+                self.log_marks.push(LogMark {
+                    mark: m,
+                    line,
+                    near,
+                });
+            }
+            Ok(report)
+        }));
+    }
+
     fn launch(&mut self) {
         if let Some(task) = &self.task {
             let title = task.title.clone();
@@ -2985,7 +3126,7 @@ impl App {
         }
         let Some(view) = self.current() else { return };
         let mut inst = view.inst.clone();
-        if self.running.iter().any(|(id, _)| *id == inst.id) || running::is_running(&inst.dir) {
+        if self.instance_running(&inst) {
             self.note(format!("{} is already running", inst.config.name));
             return;
         }
@@ -3023,10 +3164,13 @@ impl App {
             }
             return;
         }
+        let mut session = None;
         let result = instance::sync(&self.ctx.paths, &mut inst)
             .and_then(|()| launch::plan(&inst, &self.steam, &self.ctx.config))
             .and_then(|p| {
                 log::info!("launch: {}", p.display());
+                session =
+                    sessions::launching(&self.ctx.paths, &inst, &self.steam, &self.ctx.config);
                 launch::spawn(&p)
             });
         match result {
@@ -3038,6 +3182,9 @@ impl App {
                 inst.config.last_played = Some(orbis::paths::now_secs());
                 if let Err(e) = inst.save() {
                     log::warn!("save last played: {e:#}");
+                }
+                if let Some(id) = session {
+                    self.session_of.insert(child.id(), id);
                 }
                 self.running.push((inst.id.clone(), child));
                 self.reload();
@@ -3105,6 +3252,8 @@ impl App {
             backups_keep: c.backups_keep.to_string(),
             auto_update_hours: c.auto_update_hours.to_string(),
             check_updates: c.check_updates,
+            session_logs: c.session_logs,
+            session_logs_keep: c.session_logs_keep.to_string(),
         };
     }
 
@@ -3176,6 +3325,9 @@ impl App {
         let Ok(auto_update_hours) = g.auto_update_hours.trim().parse() else {
             return self.error("Auto-update hours must be a number".into());
         };
+        let Ok(session_logs_keep) = g.session_logs_keep.trim().parse() else {
+            return self.error("Sessions to keep must be a number".into());
+        };
         let cfg = Config {
             steam_root: opt_path(&g.steam_root),
             proton: opt_path(&g.proton),
@@ -3186,6 +3338,8 @@ impl App {
             backups_keep,
             auto_update_hours,
             check_updates: g.check_updates,
+            session_logs: g.session_logs,
+            session_logs_keep,
         };
         match cfg.save(&self.ctx.paths) {
             Ok(()) => {
@@ -3210,6 +3364,27 @@ impl App {
             "tab: {:?}  filter: {:?}  search: {:?}",
             self.tab, self.filter, self.search
         ));
+        if self.tab == Tab::Logs {
+            line(format!(
+                "log: {} session: {} (of {} kept) marks: {}",
+                self.log_kind.label(),
+                self.log_session.as_deref().unwrap_or("current"),
+                self.sessions.len(),
+                self.log_marks.len()
+            ));
+            for m in &self.log_marks {
+                line(format!(
+                    "  mark {:?} line {:?} near: {}",
+                    m.mark.note,
+                    m.line,
+                    m.near
+                        .iter()
+                        .map(|e| format!("{}x {}", e.count, e.message))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+        }
         for v in &self.instances {
             let mark = if self.selected.as_ref() == Some(&v.inst.id) {
                 '*'
@@ -3368,26 +3543,7 @@ fn date(s: Option<&str>) -> String {
     s.map(|d| d.chars().take(10).collect()).unwrap_or_default()
 }
 
-/// A Unix time as "YYYY-MM-DD HH:MM UTC".
-pub fn when(secs: u64) -> String {
-    let days = i64::try_from(secs / 86_400).unwrap_or(0);
-    let rem = secs % 86_400;
-    // Civil-from-days (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-        rem / 3600,
-        rem % 3600 / 60
-    )
-}
+pub use orbis::paths::when;
 
 /// Marks a task error as a cancellation, which is reported as a note.
 const CANCELLED: &str = "\u{2063}cancelled";

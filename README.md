@@ -30,6 +30,7 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 * **Manual mods**: add a `.zip` or folder once, then install it into any instance. A manual mod can replace CKAN mods (for example, a Patreon Volumetric Clouds build standing in for EVE Redux and Scatterer), so mods that depend on them keep working.
 * **Any KSP install**: Steam, GOG, Heroic or a folder from the KSP store; the Windows build runs through Proton (the one Steam maps to KSP, inside the Steam Linux Runtime when it asks for it) or Wine, and the native Linux build runs directly.
 * **Updates itself**: orbis checks GitHub for a new release when it starts (or when you ask), and one click downloads it, checks its SHA-256, and replaces the binary.
+* **Session logs (optional)**: keep each game session's `KSP.log` and `Player.log`, and press **Something broke** (or run `orbis mark`) while playing to see the exceptions logged just before it, even after the next launch.
 * **Bug reports**: one button (or `orbis report`) copies your setup, mod list and grouped log errors, with your home folder and user name taken out, ready to paste into an issue.
 * **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
 * **Reliable downloads**: parallel downloads that drop stalled connections and resume where they left off, falling back to CKAN's archive.org mirror for freely licensed mods.
@@ -120,7 +121,8 @@ When only one instance exists, `-i` can be left out.
 | `orbis self-update [--check]` | Update orbis to the latest release, or only say whether one exists |
 | `orbis history list\|undo\|restore <id> [--before]` | Show changes, undo the last one, or restore an earlier mod list |
 | `orbis backup list\|create\|restore <id> [--save <name>]` | Manage save backups |
-| `orbis logs [--log ksp\|player\|launch]` | Summarise a log: exceptions grouped and blamed on mods |
+| `orbis logs [--log ksp\|player\|launch] [--sessions\|--session <n>]` | Summarise a log: exceptions grouped and blamed on mods; list kept sessions, or read one (1 is the newest) |
+| `orbis mark [-i <instance>] [<note>...]` | Mark the running game's session: something broke just now |
 | `orbis manual unmanaged\|adopt <folder>` | Find hand-added GameData folders and track them as manual mods |
 | `orbis cache [--clean\|--share]` | Show the mod store and download cache, remove what no instance uses, or make older installs share disk space |
 | `orbis star\|unstar <mod>...` | Star or unstar mods (shared by all instances) |
@@ -145,6 +147,8 @@ Settings live in `~/.config/orbis/config.toml` and can also be edited on the GUI
 | `backups_keep` | | `10` | Save backups kept per instance; `0` turns automatic backups off |
 | `auto_update_hours` | | `24` | Refresh the CKAN index on GUI start when it is older than this; `0` turns it off |
 | `check_updates` | | `true` | Look for a new orbis release when the GUI starts |
+| `session_logs` | | `false` | Keep each game session's logs in `sessions/` inside the instance |
+| `session_logs_keep` | | `10` | Sessions kept per instance when `session_logs` is on (1 to 1000) |
 | | `--root <dir>` | XDG directories | Keep config, data and cache under one directory |
 | `RUST_LOG` | | `warn` | Log level, written to stderr |
 
@@ -277,6 +281,8 @@ Any running task that downloads or installs (updating the index, applying change
 **History.** Every applied change is recorded in `history.json` with the mod list before and after it. **Undo** reverses the newest change; **Restore this point** returns to how things were right after any earlier one. orbis reinstalls the exact versions (falling back to the newest compatible release, with a warning, if one has left CKAN) and keeps dependency flags as they were.
 
 **Logs.** The **Logs** tab reads `KSP.log`, Unity's `Player.log` (in the Wine prefix, or in `~/.config/unity3d` for the native build, so instances that share one see whichever ran last) and Proton's launch log. Repeated exceptions are grouped, and each is traced to the mod whose code appears in its stack trace, by DLL name or, when the namespace differs (MechJeb's `MuMech`), by the names stored inside the mod DLLs.
+
+**Session logs.** KSP rewrites `KSP.log` on every launch, and a Wine prefix keeps only one `Player.log`, so the evidence of a problem is gone a launch or two later. With **Session logs** on (Settings), each launch starts a session in `sessions/` inside the instance, and when the game exits its `KSP.log`, `Player.log` (when it is this instance's) and launch log are kept there, gzipped. If orbis didn't see the game exit (started from the CLI, or the GUI was closed), the logs are kept on the next launch (of this instance, or of any instance sharing its `Player.log`) or the next look at the logs, before KSP overwrites them. Only logs that changed since the launch count, so a launch that failed never gets the previous run's logs. The newest `session_logs_keep` sessions stay. While the game runs, **Something broke** under Launch (or `orbis mark`, which you can bind to a key in your window manager) marks the moment with an optional note; the Logs tab, or `orbis logs --session <n>`, then lists the exceptions from the five minutes before each mark, blamed on their mods. Pick a session in the Logs tab's session menu.
 
 **Hand-added mods.** Folders in GameData that no installed mod owns are listed on the **Manual mods** tab. **Adopt** turns one into a manual mod: a copy goes into the library, and the files already in the instance are tracked as installed, so orbis can remove, back up and export it like any other mod.
 

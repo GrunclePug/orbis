@@ -224,6 +224,23 @@ pub enum Command {
         /// ksp, player or launch.
         #[arg(long, default_value = "ksp")]
         log: String,
+        /// List the kept game sessions (session logs on, in Settings or
+        /// config.toml `session_logs`).
+        #[arg(long, conflicts_with = "session")]
+        sessions: bool,
+        /// Read a kept session's log instead of the current one: 1 is the
+        /// newest, as `--sessions` numbers them.
+        #[arg(long)]
+        session: Option<usize>,
+    },
+    /// Mark the running game's session: something broke just now. The mark
+    /// points `orbis logs` at the exceptions logged around it.
+    Mark {
+        /// The instance; the one that is running when not given.
+        #[arg(short, long)]
+        instance: Option<String>,
+        /// What went wrong.
+        note: Vec<String>,
     },
 }
 
@@ -712,6 +729,7 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                 writeln!(io::stdout(), "{}", plan.display())?;
                 return Ok(());
             }
+            orbis::sessions::launching(&ctx.paths, &inst, &ctx.steam(), &ctx.config);
             let child = launch::spawn(&plan)?;
             if let Err(e) = running::mark(&inst.dir, child.id(), "direct") {
                 eprintln!("warning: {e:#}");
@@ -839,7 +857,12 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             io::stdout().write_all(text.as_bytes())?;
             Ok(())
         }
-        Command::Logs { instance, log } => {
+        Command::Logs {
+            instance,
+            log,
+            sessions: list,
+            session,
+        } => {
             let inst = ctx.instance(instance.as_deref())?;
             let kind = match log.as_str() {
                 "ksp" => logs::LogKind::Ksp,
@@ -847,10 +870,55 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                 "launch" => logs::LogKind::Launch,
                 other => bail!("unknown log {other:?}: use ksp, player or launch"),
             };
-            let path = logs::path(&inst, &ctx.steam(), kind).context("can't locate that log")?;
-            let report = logs::read(&path, &logs::assemblies(&inst)?)?;
+            let steam = ctx.steam();
+            orbis::sessions::settle(&inst, &steam, &ctx.config);
+            let kept = orbis::sessions::list(&inst)?;
+            if list {
+                if kept.is_empty() {
+                    let hint = if ctx.config.session_logs {
+                        "none yet: they start with the next launch"
+                    } else {
+                        "session logs are off: turn them on in Settings, or set session_logs = true in config.toml"
+                    };
+                    writeln!(io::stdout(), "No kept sessions ({hint})")?;
+                }
+                for (n, s) in kept.iter().enumerate() {
+                    writeln!(io::stdout(), "{:3}  {}", n + 1, session_line(s))?;
+                    for m in &s.marks {
+                        writeln!(io::stdout(), "       {}", mark_line(m))?;
+                    }
+                }
+                return Ok(());
+            }
+            let (path, text, marks) = match session {
+                Some(n) => {
+                    let s = n
+                        .checked_sub(1)
+                        .and_then(|i| kept.get(i))
+                        .with_context(|| format!("no session {n}: see `orbis logs --sessions`"))?;
+                    if !s.has(kind) {
+                        bail!("session {n} kept no {}", kind.label());
+                    }
+                    let (path, text) = orbis::sessions::read_log(&inst, &s.id, kind)?;
+                    (path, text, s.marks.clone())
+                }
+                None => {
+                    let path = logs::path(&inst, &steam, kind).context("can't locate that log")?;
+                    let bytes =
+                        std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+                    // The running session's marks point into the live KSP.log.
+                    let marks = kept
+                        .iter()
+                        .find(|s| s.is_open())
+                        .map(|s| s.marks.clone())
+                        .unwrap_or_default();
+                    (path, String::from_utf8_lossy(&bytes).into_owned(), marks)
+                }
+            };
+            let report = logs::read_text(&path, &text, &logs::assemblies(&inst)?);
+            let mut out = io::stdout();
             writeln!(
-                io::stdout(),
+                out,
                 "{}: {} lines, {} exceptions ({} distinct), {} errors, {} warnings",
                 path.display(),
                 report.lines.len(),
@@ -860,15 +928,85 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
                 report.warnings
             )?;
             for e in report.exceptions.iter().take(20) {
-                let mods = if e.mods.is_empty() {
-                    String::new()
-                } else {
-                    format!("  [{}]", e.mods.join(", "))
+                writeln!(out, "{:5}x {}{}", e.count, e.message, blame(&e.mods))?;
+            }
+            for m in &marks {
+                writeln!(out, "\n{}", mark_line(m))?;
+                let near = match (kind, orbis::sessions::mark_line(&text, m)) {
+                    (logs::LogKind::Ksp, Some(line)) => logs::around(
+                        &report,
+                        line,
+                        orbis::sessions::MARK_BEFORE_SECS,
+                        orbis::sessions::MARK_AFTER_SECS,
+                    ),
+                    _ => continue,
                 };
-                writeln!(io::stdout(), "{:5}x {}{mods}", e.count, e.message)?;
+                if near.is_empty() {
+                    writeln!(out, "  no exceptions in the 5 minutes before it")?;
+                }
+                for e in near.iter().take(10) {
+                    writeln!(out, "{:5}x {}{}", e.count, e.message, blame(&e.mods))?;
+                }
             }
             Ok(())
         }
+        Command::Mark { instance, note } => {
+            let inst = match instance {
+                Some(key) => instance::find(&ctx.paths, &key)?,
+                None => {
+                    let mut live: Vec<Instance> = instance::list(&ctx.paths)?
+                        .into_iter()
+                        .filter(|i| running::is_running(&i.dir))
+                        .collect();
+                    match live.len() {
+                        1 => live.remove(0),
+                        0 => bail!("no instance is running: start one from orbis first"),
+                        _ => bail!("several instances are running: pick one with -i <name>"),
+                    }
+                }
+            };
+            let m = orbis::sessions::mark(&inst, &note.join(" "))?;
+            writeln!(io::stdout(), "{}: {}", inst.config.name, mark_line(&m))?;
+            Ok(())
+        }
+    }
+}
+
+/// `  [Mod, Mod]` for an exception's suspects, or nothing.
+fn blame(mods: &[String]) -> String {
+    if mods.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", mods.join(", "))
+    }
+}
+
+fn session_line(s: &orbis::sessions::Session) -> String {
+    let length = match s.minutes() {
+        None => "open".to_owned(),
+        Some(m) => format!("{m} min"),
+    };
+    let marks = match s.marks.len() {
+        0 => String::new(),
+        1 => ", 1 mark".to_owned(),
+        n => format!(", {n} marks"),
+    };
+    format!(
+        "{}  {length}{marks}  ({})",
+        orbis::paths::when(s.started / 1000),
+        s.logs.join(", ")
+    )
+}
+
+fn mark_line(m: &orbis::sessions::Mark) -> String {
+    let at = m
+        .ksp_time
+        .clone()
+        .unwrap_or_else(|| orbis::paths::when(m.at / 1000));
+    if m.note.is_empty() {
+        format!("Marked at {at}")
+    } else {
+        format!("Marked at {at}: {}", m.note)
     }
 }
 
