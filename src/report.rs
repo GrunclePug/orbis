@@ -185,8 +185,17 @@ const MIN_SECRET: usize = 6;
 /// game or Proton can echo them into the logs) out of the report.
 fn hide_env(text: &str, inst: Option<&Instance>) -> String {
     let mut out = text.to_owned();
+    // Each line too: the report indents multi-line text, which would break
+    // a match on the whole value.
     let mut values: Vec<&str> = inst
-        .map(|i| i.config.launch.env.values().map(String::as_str).collect())
+        .map(|i| {
+            i.config
+                .launch
+                .env
+                .values()
+                .flat_map(|v| std::iter::once(v.as_str()).chain(v.lines().map(str::trim)))
+                .collect()
+        })
         .unwrap_or_default();
     // Longest first, so a value inside another doesn't split it.
     values.sort_by_key(|v| std::cmp::Reverse(v.len()));
@@ -279,12 +288,23 @@ mod tests {
             .launch
             .env
             .insert("SECRET".into(), "hunter2-secret".into());
+        inst.config
+            .launch
+            .env
+            .insert("KEY".into(), "private-line-one\nprivate-line-two".into());
+        fs::write(
+            tmp.path().join("orbis-launch.log"),
+            "token is hunter2-secret\nkey:\nprivate-line-one\nprivate-line-two\n",
+        )
+        .expect("write");
         let text = build(&Config::default(), &SteamInfo::default(), Some(&inst));
+        assert!(text.contains("token is <hidden>"), "{text}");
+        assert!(!text.contains("private-line"), "{text}");
         assert!(text.contains("Instance: Career"), "{text}");
         assert!(text.contains("Builds: Linux"), "{text}");
         assert!(text.contains("Runs with the native Linux build"), "{text}");
         assert!(
-            text.contains("Environment: SECRET") && !text.contains("hunter2"),
+            text.contains("Environment: KEY, SECRET") && !text.contains("hunter2"),
             "{text}"
         );
         assert!(text.contains("NullReferenceException"), "{text}");
