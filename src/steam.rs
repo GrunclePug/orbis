@@ -73,7 +73,7 @@ pub fn detect(root: Option<&Path>, proton: Option<&Path>) -> SteamInfo {
     info.libraries = library_folders(&root);
     for lib in &info.libraries {
         let dir = lib.join("steamapps/common/Kerbal Space Program");
-        if dir.join("KSP_x64.exe").is_file() {
+        if crate::game::is_game_dir(&dir) {
             info.ksp = Some(dir);
             info.ksp_library = Some(lib.clone());
             break;
@@ -253,7 +253,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         let ksp = root.join("steamapps/common/Kerbal Space Program");
-        fs::create_dir_all(&ksp).expect("mkdir");
+        fs::create_dir_all(ksp.join("GameData")).expect("mkdir");
         fs::write(ksp.join("KSP_x64.exe"), b"").expect("write");
         fs::create_dir_all(root.join("config")).expect("mkdir");
         fs::write(

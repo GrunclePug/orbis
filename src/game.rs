@@ -16,9 +16,56 @@ pub struct Dlc {
     pub version: Option<ModVersion>,
 }
 
-/// Whether `dir` looks like a Windows KSP install.
+/// The Windows build's executable (run through Proton or Wine).
+pub const WINDOWS_EXE: &str = "KSP_x64.exe";
+/// The native Linux build's executable.
+pub const LINUX_EXE: &str = "KSP.x86_64";
+
+/// Which build of KSP a directory holds. Steam, GOG and the KSP store all
+/// ship both; Steam installs the Windows one when Proton is forced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Build {
+    Windows,
+    Linux,
+}
+
+impl Build {
+    pub fn exe(self) -> &'static str {
+        match self {
+            Build::Windows => WINDOWS_EXE,
+            Build::Linux => LINUX_EXE,
+        }
+    }
+}
+
+/// The builds present in `dir`, Windows first.
+pub fn builds(dir: &Path) -> Vec<Build> {
+    [Build::Windows, Build::Linux]
+        .into_iter()
+        .filter(|b| dir.join(b.exe()).is_file())
+        .collect()
+}
+
+/// Whether `dir` looks like a KSP install (either build).
 pub fn is_game_dir(dir: &Path) -> bool {
-    dir.join("KSP_x64.exe").is_file() && dir.join("GameData").is_dir()
+    dir.join("GameData").is_dir() && !builds(dir).is_empty()
+}
+
+/// KSP installs outside Steam in their usual places: GOG's Linux
+/// installer and Heroic (GOG's Windows build).
+pub fn other_installs() -> Vec<std::path::PathBuf> {
+    let Ok(home) = crate::paths::home() else {
+        return vec![];
+    };
+    [
+        "GOG Games/Kerbal Space Program/game",
+        "Games/Heroic/Kerbal Space Program",
+        "Games/Heroic/KerbalSpaceProgram",
+    ]
+    .iter()
+    .map(|p| home.join(p))
+    .filter(|p| is_game_dir(p))
+    .collect()
 }
 
 /// Reads the game version from `readme.txt` (`Version 1.12.5`) and the
@@ -26,7 +73,7 @@ pub fn is_game_dir(dir: &Path) -> bool {
 pub fn detect_version(dir: &Path) -> Result<GameVersion> {
     if !is_game_dir(dir) {
         bail!(
-            "{} is not a KSP install (no KSP_x64.exe and GameData)",
+            "{} is not a KSP install (no GameData beside {WINDOWS_EXE} or {LINUX_EXE})",
             dir.display()
         );
     }
@@ -133,6 +180,20 @@ mod tests {
         assert_eq!(dlc.len(), 1, "MakingHistory has no readme");
         assert_eq!(dlc[0].identifier, "BreakingGround-DLC");
         assert_eq!(dlc[0].version, None);
+    }
+
+    #[test]
+    fn tells_the_builds_apart() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        assert!(!is_game_dir(dir));
+        fs::create_dir_all(dir.join("GameData")).expect("mkdir");
+        assert!(!is_game_dir(dir), "GameData alone isn't an install");
+        fs::write(dir.join(LINUX_EXE), b"").expect("write");
+        assert!(is_game_dir(dir));
+        assert_eq!(builds(dir), [Build::Linux]);
+        fs::write(dir.join(WINDOWS_EXE), b"").expect("write");
+        assert_eq!(builds(dir), [Build::Windows, Build::Linux]);
     }
 
     #[test]

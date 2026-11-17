@@ -4,6 +4,7 @@
 //! report back through a channel.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Arc;
@@ -19,7 +20,9 @@ use orbis::config::Config;
 use orbis::crafts::{self, Facility, PendingCraft};
 use orbis::download::DownloadEvent;
 use orbis::game::Dlc;
-use orbis::instance::{self, CopyMode, CreateOptions, Instance, ModSource, PrefixMode, Registry};
+use orbis::instance::{
+    self, CopyMode, CreateOptions, Instance, ModSource, PrefixMode, Registry, Runner,
+};
 use orbis::launch;
 use orbis::manual::{self, AddOptions, ManualMod};
 use orbis::metadata::Module;
@@ -31,7 +34,7 @@ use orbis::resolver::{Plan, Request, ResolveError};
 use orbis::starred::Starred;
 use orbis::steam::SteamInfo;
 use orbis::version::{GameVersion, ModVersion};
-use orbis::{backup, flags, history, logs, running, store};
+use orbis::{backup, flags, history, logs, running, store, update};
 
 /// Height of one mod table row including spacing (see `view::ROW_H`).
 pub const ROW_STEP: f32 = 34.0;
@@ -260,6 +263,7 @@ pub struct SettingsForm {
     pub allow_testing: bool,
     pub prefix_isolated: bool,
     pub via_steam: bool,
+    pub runner: Runner,
     pub args: String,
     pub env: String,
     pub notes: String,
@@ -271,11 +275,13 @@ pub struct GlobalForm {
     pub loaded: bool,
     pub steam_root: String,
     pub proton: String,
+    pub wine: String,
     pub use_runtime: bool,
     pub workers: String,
     pub repos: String,
     pub backups_keep: String,
     pub auto_update_hours: String,
+    pub check_updates: bool,
 }
 
 /// Fields of the "add manual mod" dialog.
@@ -370,7 +376,31 @@ pub enum Dialog {
         name: String,
     },
     KeyHelp,
+    /// A newer orbis release, and why it can't be installed from here.
+    OrbisUpdate {
+        release: Box<update::Release>,
+        blocker: Option<String>,
+    },
     Error(String),
+}
+
+/// What orbis knows about its own updates.
+#[derive(Clone, Debug, Default)]
+pub enum UpdateState {
+    #[default]
+    Unknown,
+    Checking,
+    Latest,
+    Available {
+        release: Box<update::Release>,
+        blocker: Option<String>,
+    },
+    Failed(String),
+    /// Installed over this binary: restarting runs it.
+    Installed {
+        version: String,
+        exe: PathBuf,
+    },
 }
 
 /// What the view asks for.
@@ -458,6 +488,11 @@ pub enum Msg {
     OpenImport(Option<PathBuf>),
     PreviewImport,
     Import,
+    CopyReport,
+    CheckOrbisUpdate,
+    OpenOrbisUpdate,
+    InstallOrbisUpdate,
+    RestartOrbis,
     CloseDialog,
     Refresh,
 }
@@ -476,6 +511,8 @@ pub enum Done {
     CkanImported(Result<ckan_import::Report, String>),
     Shared(Result<store::Shared, String>),
     CraftsSynced(Result<crafts::Report, String>),
+    /// The new version and the binary it replaced.
+    OrbisUpdated(Result<(String, PathBuf), String>),
 }
 
 /// Messages from background threads.
@@ -586,6 +623,10 @@ pub struct App {
     pub storage: Option<Result<store::Usage, String>>,
     /// KSP's launch options in Steam, as last read.
     pub steam_launch_options: Option<String>,
+    pub orbis_update: UpdateState,
+    /// The answer to a running update check, and whether the user asked
+    /// for it (a check on start stays quiet unless there's news).
+    update_check: Option<(Receiver<Result<update::Release, String>>, bool)>,
     saved_prefs: Prefs,
     /// Write `gui.toml` (off in headless mode).
     persist: bool,
@@ -661,6 +702,8 @@ impl App {
             focus_search: false,
             storage: None,
             steam_launch_options: None,
+            orbis_update: UpdateState::Unknown,
+            update_check: None,
             saved_prefs: Prefs::default(),
             persist: !opts.headless,
             generation: 0,
@@ -670,6 +713,9 @@ impl App {
             Err(e) => app.messages.push(format!("{e:#}")),
         }
         app.steam_launch_options = launch::current_steam_launch_options(&app.steam);
+        if app.persist && app.ctx.config.check_updates {
+            app.check_orbis_update(false);
+        }
         let prefs = Prefs::load(&app.ctx.paths);
         app.selected = prefs.selected.clone();
         app.filter = filter_from(&prefs.filter).unwrap_or(Filter::Installed);
@@ -1342,11 +1388,87 @@ impl App {
     }
 
     /// Whether a background task is running.
+    /// The update state in a few words, for the settings page and dumps.
+    pub fn update_label(&self) -> String {
+        match &self.orbis_update {
+            UpdateState::Unknown => "not checked".into(),
+            UpdateState::Checking => "checking".into(),
+            UpdateState::Latest => "up to date".into(),
+            UpdateState::Available { release, .. } => format!("{} available", release.version()),
+            UpdateState::Failed(e) => format!("check failed: {e}"),
+            UpdateState::Installed { version, .. } => {
+                format!("{version} installed; restart to use it")
+            }
+        }
+    }
+
     pub fn busy(&self) -> bool {
         self.task.is_some()
     }
 
+    /// Asks GitHub for the latest release on a thread of its own, so it
+    /// never waits behind (or holds up) other work.
+    fn check_orbis_update(&mut self, asked: bool) {
+        if self.update_check.is_some() || matches!(self.orbis_update, UpdateState::Installed { .. })
+        {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let paths = self.ctx.paths.clone();
+        let egui = self.egui.clone();
+        std::thread::spawn(move || {
+            let r = update::latest(&paths, update::LATEST_URL, &Cancel::default())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(r);
+            egui.request_repaint();
+        });
+        self.orbis_update = UpdateState::Checking;
+        self.update_check = Some((rx, asked));
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some((rx, asked)) = &self.update_check else {
+            return;
+        };
+        let asked = *asked;
+        let r = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("the update check stopped".into()),
+        };
+        self.update_check = None;
+        self.orbis_update = match r {
+            Ok(release) if release.is_newer() => {
+                let blocker = update::current_exe()
+                    .map_or_else(|e| Some(format!("{e:#}")), |exe| update::blocker(&exe));
+                self.note(format!("orbis {} is available", release.version()));
+                UpdateState::Available {
+                    release: Box::new(release),
+                    blocker,
+                }
+            }
+            Ok(_) => {
+                if asked {
+                    self.note(format!(
+                        "orbis {} is the latest release",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                }
+                UpdateState::Latest
+            }
+            Err(e) => {
+                if asked {
+                    self.error(format!("Checking for updates failed: {e}"));
+                } else {
+                    log::warn!("update check: {e}");
+                }
+                UpdateState::Failed(e)
+            }
+        };
+    }
+
     pub fn poll(&mut self) {
+        self.poll_update_check();
         let mut done = Vec::new();
         if let Some(task) = &mut self.task {
             while let Ok(msg) = task.rx.try_recv() {
@@ -1548,6 +1670,11 @@ impl App {
                     self.error(format!("Import failed: {e}"));
                 }
             },
+            Done::OrbisUpdated(Ok((version, exe))) => {
+                self.note(format!("Updated to orbis {version}; restart to use it"));
+                self.orbis_update = UpdateState::Installed { version, exe };
+            }
+            Done::OrbisUpdated(Err(e)) => self.error(format!("Update failed: {e}")),
             Done::CraftsSynced(r) => {
                 match r {
                     Ok(rep) => {
@@ -1892,7 +2019,8 @@ impl App {
                     source: self
                         .steam
                         .ksp
-                        .as_ref()
+                        .clone()
+                        .or_else(|| orbis::game::other_installs().into_iter().next())
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
                     with_saves: false,
@@ -2591,6 +2719,55 @@ impl App {
                     });
                 }
             }
+            Msg::CopyReport => {
+                let inst = self.current().map(|v| v.inst.clone());
+                let text = orbis::report::build(&self.ctx.config, &self.steam, inst.as_ref());
+                self.egui.copy_text(text);
+                self.note("Bug report copied: paste it into a GitHub issue");
+            }
+            Msg::CheckOrbisUpdate => self.check_orbis_update(true),
+            Msg::OpenOrbisUpdate => {
+                if let UpdateState::Available { release, blocker } = &self.orbis_update {
+                    self.dialog = Some(Dialog::OrbisUpdate {
+                        release: release.clone(),
+                        blocker: blocker.clone(),
+                    });
+                }
+            }
+            Msg::InstallOrbisUpdate => {
+                let UpdateState::Available { release, .. } = &self.orbis_update else {
+                    return;
+                };
+                self.dialog = None;
+                let release = release.clone();
+                let paths = self.ctx.paths.clone();
+                self.spawn_cancellable(
+                    &format!("Updating orbis to {}", release.version()),
+                    move |_, cancel| {
+                        Done::OrbisUpdated(
+                            update::current_exe()
+                                .and_then(|exe| {
+                                    update::install(&paths, &release, &exe, cancel)?;
+                                    Ok((release.version().to_owned(), exe))
+                                })
+                                .map_err(task_error),
+                        )
+                    },
+                );
+            }
+            Msg::RestartOrbis => {
+                let UpdateState::Installed { exe, .. } = &self.orbis_update else {
+                    return;
+                };
+                match std::process::Command::new(exe)
+                    .args(std::env::args_os().skip(1))
+                    .process_group(0)
+                    .spawn()
+                {
+                    Ok(_) => self.egui.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.error(format!("Start {}: {e}", exe.display())),
+                }
+            }
             Msg::CloseDialog => self.dialog = None,
             Msg::Refresh => {
                 self.settings.for_instance = None;
@@ -2888,6 +3065,7 @@ impl App {
             allow_testing: c.allow_testing,
             prefix_isolated: c.launch.prefix == PrefixMode::Instance,
             via_steam: c.launch.via_steam,
+            runner: c.launch.runner,
             args: c.launch.args.join(" "),
             env: c
                 .launch
@@ -2915,6 +3093,7 @@ impl App {
             loaded: true,
             steam_root: path(&c.steam_root),
             proton: path(&c.proton),
+            wine: path(&c.wine),
             use_runtime: c.use_steam_runtime,
             workers: c.download_workers.to_string(),
             repos: c
@@ -2925,6 +3104,7 @@ impl App {
                 .join("\n"),
             backups_keep: c.backups_keep.to_string(),
             auto_update_hours: c.auto_update_hours.to_string(),
+            check_updates: c.check_updates,
         };
     }
 
@@ -2952,6 +3132,7 @@ impl App {
         inst.config.compat = compat;
         inst.config.allow_testing = f.allow_testing;
         inst.config.launch.via_steam = f.via_steam;
+        inst.config.launch.runner = f.runner;
         inst.config.launch.prefix = if f.prefix_isolated {
             PrefixMode::Instance
         } else {
@@ -2998,11 +3179,13 @@ impl App {
         let cfg = Config {
             steam_root: opt_path(&g.steam_root),
             proton: opt_path(&g.proton),
+            wine: opt_path(&g.wine),
             use_steam_runtime: g.use_runtime,
             repositories: repos,
             download_workers: workers,
             backups_keep,
             auto_update_hours,
+            check_updates: g.check_updates,
         };
         match cfg.save(&self.ctx.paths) {
             Ok(()) => {
@@ -3022,6 +3205,7 @@ impl App {
             out.push('\n');
         };
         line(format!("index: {}", self.index_status));
+        line(format!("orbis update: {}", self.update_label()));
         line(format!(
             "tab: {:?}  filter: {:?}  search: {:?}",
             self.tab, self.filter, self.search

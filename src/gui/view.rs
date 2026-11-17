@@ -5,12 +5,16 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use orbis::metadata::Module;
 
 use super::app::{
-    App, Dialog, Filter, Item, Msg, Row, SortKey, Tab, data_paths, instance_paths, when,
+    App, Dialog, Filter, Item, Msg, Row, SortKey, Tab, UpdateState, data_paths, instance_paths,
+    when,
 };
 use super::theme::{self, ACCENT, BAD, GOOD, WARN};
+use orbis::instance::Runner;
 use orbis::logs;
 
 const ROW_H: f32 = 28.0;
+/// Where orbis problems are reported.
+const ISSUES_URL: &str = "https://github.com/grunclepug/orbis/issues/new/choose";
 
 pub fn draw(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     top_bar(app, ui, msgs);
@@ -65,6 +69,24 @@ fn top_bar(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 {
                     msgs.push(Msg::UpdateIndex);
                 }
+                let update = match &app.orbis_update {
+                    UpdateState::Available { release, .. } => ui
+                        .add(theme::primary(
+                            &format!("orbis {} available", release.version()),
+                            ACCENT,
+                        ))
+                        .clicked()
+                        .then_some(Msg::OpenOrbisUpdate),
+                    UpdateState::Installed { version, .. } => ui
+                        .add_enabled(!app.busy(), egui::Button::new("Restart orbis"))
+                        .on_hover_text(format!(
+                            "Start orbis {version}, which is installed and waiting"
+                        ))
+                        .clicked()
+                        .then_some(Msg::RestartOrbis),
+                    _ => None,
+                };
+                msgs.extend(update);
                 ui.label(RichText::new(&app.index_status).small().color(theme::MUTED));
             });
         });
@@ -271,9 +293,19 @@ fn instances_panel(app: &App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                 .min_size(egui::vec2(ui.available_width(), 38.0))
                 .fill(GOOD)
                 .stroke(egui::Stroke::NONE);
+                let how = app.current().map(|v| {
+                    if v.inst.config.launch.via_steam {
+                        "Start this instance through Steam".to_owned()
+                    } else {
+                        match orbis::launch::resolve(&v.inst, &app.steam) {
+                            Ok(r) => format!("Run this instance with {}", r.label()),
+                            Err(e) => format!("Can't run: {e:#}"),
+                        }
+                    }
+                });
                 if ui
                     .add_enabled(has && !app.busy(), launch)
-                    .on_hover_text("Run this instance through Proton")
+                    .on_hover_text(how.unwrap_or_default())
                     .clicked()
                 {
                     msgs.push(Msg::Launch);
@@ -1774,6 +1806,13 @@ fn craft_card(
 fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
     app.sync_settings_form();
     app.sync_global_form();
+    // What "Automatic" means for the current instance, as saved.
+    let app_current_resolved = app.current().map_or_else(String::new, |v| {
+        let mut inst = v.inst.clone();
+        inst.config.launch.runner = Runner::Auto;
+        orbis::launch::resolve(&inst, &app.steam)
+            .map_or_else(|_| "nothing found".to_owned(), |r| r.label().to_owned())
+    });
     egui::ScrollArea::vertical()
         .id_salt("settings")
         .auto_shrink([false, false])
@@ -1799,6 +1838,22 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                         ui.label("Testing releases");
                         ui.checkbox(&mut f.allow_testing, "Offer releases marked testing");
                         ui.end_row();
+                        ui.label("Runs with");
+                        let auto = app_current_resolved.clone();
+                        egui::ComboBox::from_id_salt("runner")
+                            .selected_text(if f.runner == Runner::Auto {
+                                format!("Automatic ({auto})")
+                            } else {
+                                f.runner.label().to_owned()
+                            })
+                            .show_ui(ui, |ui| {
+                                for r in Runner::ALL {
+                                    ui.selectable_value(&mut f.runner, r, r.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text("Automatic: the Windows build through Proton (or Wine without one), or the native Linux build when that's what the install holds");
+                        ui.end_row();
                         ui.label("Wine prefix");
                         ui.checkbox(
                             &mut f.prefix_isolated,
@@ -1810,7 +1865,7 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                         ui.end_row();
                         ui.label("Launch");
                         ui.checkbox(&mut f.via_steam, "Through Steam (overlay and playtime)")
-                            .on_hover_text("Off: orbis runs Proton itself, no Steam setup needed");
+                            .on_hover_text("Off: orbis starts the game itself, no Steam setup needed");
                         ui.end_row();
                         ui.label("Launch arguments");
                         ui.add(
@@ -1942,7 +1997,7 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             }
             ui.add_space(12.0);
             ui.separator();
-            ui.label(RichText::new("Steam and Proton").heading());
+            ui.label(RichText::new("Steam, Proton and Wine").heading());
             egui::Grid::new("steam")
                 .num_columns(2)
                 .spacing([16.0, 4.0])
@@ -1978,6 +2033,13 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                             .desired_width(420.0),
                     );
                     ui.end_row();
+                    ui.label("Wine");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut g.wine)
+                            .hint_text("wine from PATH")
+                            .desired_width(420.0),
+                    );
+                    ui.end_row();
                     ui.label("Steam Runtime");
                     ui.checkbox(
                         &mut g.use_runtime,
@@ -2001,6 +2063,9 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
                         );
                         ui.label("hours (0 = never automatically)");
                     });
+                    ui.end_row();
+                    ui.label("orbis updates");
+                    ui.checkbox(&mut g.check_updates, "Check for a new orbis release on start");
                     ui.end_row();
                     ui.label("Repositories");
                     ui.add(
@@ -2032,6 +2097,21 @@ fn settings_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
             ui.separator();
             ui.label(RichText::new("About").heading());
             ui.label(format!("orbis {}: a KSP mod manager with instances.", env!("CARGO_PKG_VERSION")));
+            ui.horizontal(|ui| {
+                let checking = matches!(app.orbis_update, UpdateState::Checking);
+                if ui
+                    .add_enabled(!checking, egui::Button::new("Check for updates"))
+                    .clicked()
+                {
+                    msgs.push(Msg::CheckOrbisUpdate);
+                }
+                if matches!(app.orbis_update, UpdateState::Available { .. })
+                    && ui.add(theme::primary("Update", ACCENT)).clicked()
+                {
+                    msgs.push(Msg::OpenOrbisUpdate);
+                }
+                ui.label(RichText::new(app.update_label()).small().color(theme::MUTED));
+            });
             ui.add_space(4.0);
             ui.label(theme::semibold("orbis stands on other people's work:"));
             let credits: [(&str, &str, &str); 6] = [
@@ -2225,10 +2305,22 @@ fn logs_tab(app: &mut App, ui: &mut Ui, msgs: &mut Vec<Msg>) {
         {
             msgs.push(Msg::OpenFolder(dir.to_path_buf()));
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("Copy bug report")
+                .on_hover_text("Copy this instance's setup, mods and log errors (home folder and user name taken out) to paste into a GitHub issue")
+                .clicked()
+            {
+                msgs.push(Msg::CopyReport);
+            }
+            if ui.link("Report a problem").clicked() {
+                msgs.push(Msg::OpenUrl(ISSUES_URL.into()));
+            }
+        });
     });
     if app.log_kind == logs::LogKind::Player {
         ui.label(
-            RichText::new("Player.log lives in the Wine prefix: with the shared Steam prefix it belongs to whichever instance ran last.")
+            RichText::new("Player.log is kept per Wine prefix (per user for the Linux build): instances that share one see whichever ran last.")
                 .small()
                 .weak(),
         );
@@ -2770,6 +2862,26 @@ fn dialog(app: &mut App, ctx: &egui::Context, msgs: &mut Vec<Msg>) {
                 ui.label(RichText::new("The current saves are backed up first, so this can be undone.").small().weak());
                 ui.add_space(8.0);
                 buttons(ui, msgs, "Restore", true, Msg::RestoreBackup);
+            }
+            Dialog::OrbisUpdate { release, blocker } => {
+                ui.heading(format!("orbis {} is available", release.version()));
+                ui.label(format!("You have orbis {}.", env!("CARGO_PKG_VERSION")));
+                if let Some(notes) = release.body.as_deref().filter(|b| !b.trim().is_empty()) {
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(260.0).id_salt("notes").show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(notes).small()).wrap());
+                    });
+                }
+                ui.add_space(6.0);
+                if ui.link("Release page").clicked() {
+                    msgs.push(Msg::OpenUrl(release.html_url.clone()));
+                }
+                if let Some(why) = blocker {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(format!("Can't update from here: {why}.")).color(WARN));
+                }
+                ui.add_space(8.0);
+                buttons(ui, msgs, "Update", !busy && blocker.is_none(), Msg::InstallOrbisUpdate);
             }
             Dialog::Error(e) => {
                 ui.heading(RichText::new("Something went wrong").color(BAD));

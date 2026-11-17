@@ -6,7 +6,7 @@ A Kerbal Space Program mod manager with Prism-style instances, built on CKAN met
 
 ## Overview
 
-orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, built on the metadata the CKAN project maintains and inspired by [Prism Launcher](https://prismlauncher.org/). Every instance has its own mods, saves and settings, like Prism Launcher instances for Minecraft, and links the stock game from your Steam install without ever changing it, so launching KSP from Steam stays vanilla. Mods come from the CKAN index with full dependency resolution, and mods CKAN doesn't carry (Patreon builds, betas, personal patches) live in a manual mod library that any instance can use. It ships as a single binary with a GUI and a scriptable CLI, and it launches the Windows build of KSP through the Proton that Steam uses.
+orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, built on the metadata the CKAN project maintains and inspired by [Prism Launcher](https://prismlauncher.org/). Every instance has its own mods, saves and settings, like Prism Launcher instances for Minecraft, and links the stock game from your KSP install (Steam, GOG or any other) without ever changing it, so launching KSP from Steam stays vanilla. Mods come from the CKAN index with full dependency resolution, and mods CKAN doesn't carry (Patreon builds, betas, personal patches) live in a manual mod library that any instance can use. It ships as a single binary with a GUI and a scriptable CLI, keeps itself up to date from GitHub releases, and runs the Windows build of KSP through Proton or Wine, or the native Linux build directly.
 
 ## Features
 
@@ -28,7 +28,9 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 * **Migrate from CKAN**: point orbis at a KSP folder CKAN manages and get an instance with the same mods, tracked at the same versions, plus its saves and settings.
 * **Launch through Steam (optional)**: start an instance through Steam for the overlay and playtime tracking, while Steam's own Play button stays vanilla.
 * **Manual mods**: add a `.zip` or folder once, then install it into any instance. A manual mod can replace CKAN mods (for example, a Patreon Volumetric Clouds build standing in for EVE Redux and Scatterer), so mods that depend on them keep working.
-* **Proton launch**: start any instance with the Proton build Steam has mapped to KSP, inside the Steam Linux Runtime when Proton asks for it.
+* **Any KSP install**: Steam, GOG, Heroic or a folder from the KSP store; the Windows build runs through Proton (the one Steam maps to KSP, inside the Steam Linux Runtime when it asks for it) or Wine, and the native Linux build runs directly.
+* **Updates itself**: orbis checks GitHub for a new release when it starts (or when you ask), and one click downloads it, checks its SHA-256, and replaces the binary.
+* **Bug reports**: one button (or `orbis report`) copies your setup, mod list and grouped log errors, with your home folder and user name taken out, ready to paste into an issue.
 * **Per-instance settings**: compatible KSP versions, testing releases, launch arguments, environment variables, and a shared or separate Wine prefix.
 * **Reliable downloads**: parallel downloads that drop stalled connections and resume where they left off, falling back to CKAN's archive.org mirror for freely licensed mods.
 * **One copy of each mod**: every mod version is unpacked once into a shared store; on btrfs and XFS instances get reflinked copies that share disk space but keep their own files.
@@ -42,10 +44,22 @@ orbis is a Linux rewrite of [CKAN](https://github.com/KSP-CKAN/CKAN) for KSP 1, 
 
 ### Requirements
 
-* Rust 1.100 or newer and Make
-* `curl` and `bsdtar` (libarchive) at runtime; both come with any Arch install
+* Linux on x86_64
+* `curl` and `bsdtar` at runtime (on Debian and Ubuntu, `bsdtar` is in `libarchive-tools`)
 * A Vulkan driver (any GPU driver, or lavapipe for software rendering)
-* Steam with KSP installed, set to run under Proton (Proton-GE or Valve Proton)
+* KSP 1 from Steam, GOG or the KSP store: the Windows build with Proton (Proton-GE or Valve Proton) or Wine, or the native Linux build
+* To build from source: Rust 1.100 or newer and Make
+
+### Download
+
+Download `orbis-x86_64-linux.tar.gz` from the [latest release](https://github.com/grunclepug/orbis/releases/latest), unpack it, and put `orbis` somewhere you can write to and that's on your `PATH`, such as `~/.local/bin`:
+
+```sh
+tar xzf orbis-x86_64-linux.tar.gz
+install -Dm755 orbis-x86_64-linux/orbis ~/.local/bin/orbis
+```
+
+orbis can then update itself (Settings > About, the button that appears in the top bar, or `orbis self-update`). It can't replace a binary installed by a package manager or with `sudo`; update those the way you installed them.
 
 ### Build
 
@@ -61,7 +75,7 @@ sudo make install    # optional, installs to /usr/local/bin
 Run `orbis` with no arguments to open the GUI:
 
 1. Press **Update index** to download the CKAN catalogue.
-2. Press **+ New** to create an instance from your Steam install.
+2. Press **+ New** to create an instance from your KSP install (Steam's, or a GOG or other folder).
 3. Tick mods in the **Compatible** list, press **Apply changes**, and confirm.
 4. Press **Launch**.
 
@@ -69,7 +83,7 @@ The same steps from the CLI:
 
 ```sh
 orbis update
-orbis instance create "Stock Career"      # linked to the Steam install
+orbis instance create "Stock Career"      # linked to the Steam install (--from <dir> for another)
 orbis search scatterer -i "Stock Career"
 orbis install -i "Stock Career" Scatterer EnvironmentalVisualEnhancements
 orbis launch "Stock Career"
@@ -91,7 +105,7 @@ When only one instance exists, `-i` can be left out.
 | `orbis upgrade [-i <instance>] [<mod>...]` | Upgrade the named mods, or every upgradable one |
 | `orbis instance list\|create\|clone\|sync\|rename\|delete\|info\|compat` | Manage instances |
 | `orbis instance import-ckan <dir> [--copy]` | Create an instance from a KSP install CKAN manages |
-| `orbis instance launcher [<instance>] --via direct\|steam` | Start the instance directly through Proton or through Steam |
+| `orbis instance launcher [<instance>] [--via direct\|steam] [--runner auto\|proton\|wine\|native]` | Start the instance directly or through Steam, and pick what runs it |
 | `orbis manual list\|add\|show\|install\|delete` | Manage the manual mod library |
 | `orbis flag list\|add <png> [--name]\|remove <name>` | Manage the custom flag library |
 | `orbis craft list [-i <instance>] [--trash]` | List the craft library and whether each craft fits an instance |
@@ -101,7 +115,9 @@ When only one instance exists, `-i` can be left out.
 | `orbis craft history <craft>`, `orbis craft fork <craft> <n> --name <name>` | Show a craft's revisions, or save one as a new craft |
 | `orbis craft pending [--delete <n>\|--put-back <n>]` | List or settle craft that went missing and wait for a decision |
 | `orbis launch [<instance>] [--dry-run]` | Start an instance, or print the command |
-| `orbis steam` | Show the detected Steam, KSP and Proton paths |
+| `orbis steam` | Show the detected Steam, KSP and Proton paths, and KSP installs outside Steam |
+| `orbis report [-i <instance>]` | Print a bug report to paste into a GitHub issue |
+| `orbis self-update [--check]` | Update orbis to the latest release, or only say whether one exists |
 | `orbis history list\|undo\|restore <id> [--before]` | Show changes, undo the last one, or restore an earlier mod list |
 | `orbis backup list\|create\|restore <id> [--save <name>]` | Manage save backups |
 | `orbis logs [--log ksp\|player\|launch]` | Summarise a log: exceptions grouped and blamed on mods |
@@ -122,15 +138,19 @@ Settings live in `~/.config/orbis/config.toml` and can also be edited on the GUI
 |----------|------|---------|-------------|
 | `steam_root` | | detected | Steam's root directory |
 | `proton` | | the Proton Steam maps to KSP | Directory holding the `proton` script |
+| `wine` | | `wine` on `PATH` | The Wine binary for instances that run through Wine |
 | `use_steam_runtime` | | `true` | Run Proton inside the Steam Linux Runtime when Proton asks for it |
 | `repositories` | | CKAN-meta `master.tar.gz` | CKAN metadata archives, each a `{ name, url }` table |
 | `download_workers` | | `4` | Parallel mod downloads (1 to 16) |
 | `backups_keep` | | `10` | Save backups kept per instance; `0` turns automatic backups off |
 | `auto_update_hours` | | `24` | Refresh the CKAN index on GUI start when it is older than this; `0` turns it off |
+| `check_updates` | | `true` | Look for a new orbis release when the GUI starts |
 | | `--root <dir>` | XDG directories | Keep config, data and cache under one directory |
 | `RUST_LOG` | | `warn` | Log level, written to stderr |
 
-Per-instance settings (compatible versions, testing releases, launch arguments, environment, prefix) live in each instance's `instance.toml` and on the Settings tab.
+Per-instance settings (compatible versions, testing releases, what runs the game, launch arguments, environment, prefix) live in each instance's `instance.toml` and on the Settings tab.
+
+orbis records the layout of its data in `~/.local/share/orbis/format.toml`. An older orbis refuses data that a newer one has moved to a new layout, instead of misreading it.
 
 ## Instances
 
@@ -152,7 +172,7 @@ By default an instance links to a game install (the Steam one, or `--from <dir>`
 * `saves` (starting with the stock scenarios and training; add `--with-saves` to copy your existing saves)
 * `Ships`, `Missions`, `UserLoadingScreens`, `settings.cfg` and `Physics.cfg`
 
-Everything else (`KSP_x64.exe`, `KSP_x64_Data`, the DLLs and so on) is a symlink into the install. orbis never writes to the install: the installer refuses any file that would land behind a link, and deleting an instance removes only the links. Launching KSP from Steam therefore stays vanilla, and Steam Cloud never sees an instance's saves.
+Everything else (`KSP_x64.exe`, `KSP_x64_Data`, the DLLs and so on) is a symlink into the install. The native Linux build is the exception: Unity finds the game through the executable's real path, so `KSP.x86_64` and `UnityPlayer.so` are copied (reflinked on btrfs and XFS, refreshed when the install updates), and `KSP_Data` is a real folder of links. orbis never writes to the install: the installer refuses any file that would land behind a link, and deleting an instance removes only the links. Launching KSP from Steam therefore stays vanilla, and Steam Cloud never sees an instance's saves.
 
 Before every launch, orbis re-checks the links (`orbis instance sync` does the same by hand): it adds links for files a Steam update introduced, drops links to removed ones, and records the install's current game version. If you'd rather an instance keep its game version when Steam updates, create it with `--copy` (or tick **Full copy** in the GUI) for a complete, independent copy. On btrfs or XFS that copy is reflinked, so it is instant and takes no extra space.
 
@@ -256,7 +276,7 @@ Any running task that downloads or installs (updating the index, applying change
 
 **History.** Every applied change is recorded in `history.json` with the mod list before and after it. **Undo** reverses the newest change; **Restore this point** returns to how things were right after any earlier one. orbis reinstalls the exact versions (falling back to the newest compatible release, with a warning, if one has left CKAN) and keeps dependency flags as they were.
 
-**Logs.** The **Logs** tab reads `KSP.log`, Unity's `Player.log` (in the Wine prefix, so with the shared Steam prefix it belongs to whichever instance ran last) and Proton's launch log. Repeated exceptions are grouped, and each is traced to the mod whose code appears in its stack trace, by DLL name or, when the namespace differs (MechJeb's `MuMech`), by the names stored inside the mod DLLs.
+**Logs.** The **Logs** tab reads `KSP.log`, Unity's `Player.log` (in the Wine prefix, or in `~/.config/unity3d` for the native build, so instances that share one see whichever ran last) and Proton's launch log. Repeated exceptions are grouped, and each is traced to the mod whose code appears in its stack trace, by DLL name or, when the namespace differs (MechJeb's `MuMech`), by the names stored inside the mod DLLs.
 
 **Hand-added mods.** Folders in GameData that no installed mod owns are listed on the **Manual mods** tab. **Adopt** turns one into a manual mod: a copy goes into the library, and the files already in the instance are tracked as installed, so orbis can remove, back up and export it like any other mod.
 
@@ -281,7 +301,13 @@ Manual mod files are left out unless you pass `--manual-files`, since mods like 
 
 ## Launching
 
-orbis runs `KSP_x64.exe` from the instance's `game/` directory with the Proton build Steam has mapped to KSP, passing the same `STEAM_COMPAT_*` environment Steam does (plus `STEAM_COMPAT_MOUNTS`, so the runtime container can see the linked install). When that Proton requires the Steam Linux Runtime, orbis starts it through the runtime's entry point just as Steam does. KSP 1 has no DRM, so Steam doesn't need to start the game, though the Steam overlay and playtime tracking don't apply. Proton's output goes to `orbis-launch.log` in the instance directory. `orbis launch --dry-run` prints the exact command.
+An instance's **Runs with** setting (`orbis instance launcher --runner`) picks what starts the game. **Automatic** runs the Windows build through Proton when one is found and through Wine otherwise, and runs the native Linux build when that's the build the install holds. Steam installs the native build when KSP's **Force the use of a specific Steam Play compatibility tool** is off; GOG and the KSP store offer both.
+
+* **Native**: orbis runs `KSP.x86_64` from the instance's `game/` directory with `LC_ALL=C` (KSP misreads its config files under locales with a decimal comma; set `LC_ALL` in the instance's environment to override). Unity writes `Player.log` to `~/.config/unity3d/Squad/Kerbal Space Program/`.
+* **Wine**: orbis runs `wine KSP_x64.exe` with `WINEPREFIX` set to the instance's own prefix, `prefix/pfx`.
+* **Proton**: below. Proton also works without Steam (set `proton` in `config.toml`); the instance then gets its own prefix.
+
+With Proton, orbis runs `KSP_x64.exe` from the instance's `game/` directory with the Proton build Steam has mapped to KSP, passing the same `STEAM_COMPAT_*` environment Steam does (plus `STEAM_COMPAT_MOUNTS`, so the runtime container can see the linked install). When that Proton requires the Steam Linux Runtime, orbis starts it through the runtime's entry point just as Steam does. KSP 1 has no DRM, so Steam doesn't need to start the game, though the Steam overlay and playtime tracking don't apply. The game's console output, whatever runs it, goes to `orbis-launch.log` in the instance directory. `orbis launch --dry-run` prints the exact command.
 
 ### Through Steam
 
@@ -291,7 +317,7 @@ For the Steam overlay and playtime tracking, tick **Launch: Through Steam** in a
 /usr/local/bin/orbis steam-run %command%
 ```
 
-When you press **Launch**, orbis leaves a short-lived note naming the instance and asks Steam to start KSP. Steam runs its usual Proton command through `orbis steam-run`, which consumes the note and points the command at the instance's game directory. Without a fresh note (pressing Play in Steam, or a note older than two minutes) the command runs unchanged, so KSP from the Steam library stays vanilla. If you move the orbis binary, update the launch options. The wrapper logs its last decision to `~/.cache/orbis/steam-run.log`.
+When you press **Launch**, orbis leaves a short-lived note naming the instance and asks Steam to start KSP. Steam runs its usual command (Proton for the Windows build, the Steam Runtime for the native one) through `orbis steam-run`, which consumes the note and points the command at the instance's game directory. Without a fresh note (pressing Play in Steam, or a note older than two minutes) the command runs unchanged, so KSP from the Steam library stays vanilla. If you move the orbis binary, update the launch options. The wrapper logs its last decision to `~/.cache/orbis/steam-run.log`.
 
 ## Credits
 

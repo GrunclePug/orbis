@@ -20,6 +20,9 @@ pub struct Config {
     /// Proton directory (holding the `proton` script); when unset, orbis
     /// uses the tool Steam has mapped to KSP.
     pub proton: Option<PathBuf>,
+    /// The Wine binary for instances that run through Wine; `wine` from
+    /// PATH when unset.
+    pub wine: Option<PathBuf>,
     /// Run Proton inside the Steam Linux Runtime when Proton asks for it,
     /// as Steam does.
     pub use_steam_runtime: bool,
@@ -33,6 +36,8 @@ pub struct Config {
     /// Refresh the mod index on GUI start when it is older than this many
     /// hours; 0 turns it off.
     pub auto_update_hours: u64,
+    /// Look for a newer orbis release when the GUI starts.
+    pub check_updates: bool,
 }
 
 /// One CKAN metadata repository.
@@ -48,6 +53,7 @@ impl Default for Config {
         Self {
             steam_root: None,
             proton: None,
+            wine: None,
             use_steam_runtime: true,
             repositories: vec![Repository {
                 name: "KSP-default".into(),
@@ -56,6 +62,7 @@ impl Default for Config {
             download_workers: 4,
             backups_keep: 10,
             auto_update_hours: 24,
+            check_updates: true,
         }
     }
 }

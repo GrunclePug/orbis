@@ -1,9 +1,10 @@
-//! Starting an instance through Proton, the way Steam does but pointed at
-//! the instance's own game directory.
+//! Starting an instance: the Windows build through Proton (the way Steam
+//! does, but pointed at the instance's own game directory) or Wine, or the
+//! native Linux build directly.
 //!
-//! KSP 1 has no DRM, so it runs fine outside Steam. Orbis uses the Proton
-//! build Steam has mapped to KSP and, when that Proton asks for it, wraps
-//! it in the Steam Linux Runtime container exactly like Steam.
+//! KSP 1 has no DRM, so it runs fine outside Steam. For Proton, orbis uses
+//! the build Steam has mapped to KSP and, when that Proton asks for it,
+//! wraps it in the Steam Linux Runtime container exactly like Steam.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -14,7 +15,8 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::instance::{Instance, PrefixMode};
+use crate::game::{self, Build};
+use crate::instance::{Instance, PrefixMode, Runner};
 use crate::steam::{self, KSP_APP_ID, SteamInfo};
 
 /// A fully worked-out launch command.
@@ -49,29 +51,155 @@ impl LaunchPlan {
     }
 }
 
+/// What runs an instance, once `Runner::Auto` is settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    Proton,
+    Wine,
+    Native,
+}
+
+impl Resolved {
+    pub fn label(self) -> &'static str {
+        match self {
+            Resolved::Proton => "Proton",
+            Resolved::Wine => "Wine",
+            Resolved::Native => "the native Linux build",
+        }
+    }
+}
+
+/// Settles what runs the instance: its runner setting, checked against the
+/// builds its game directory holds. `Auto` runs the Windows build through
+/// Proton when one is found and Wine otherwise, and the Linux build when
+/// that's the only one.
+pub fn resolve(inst: &Instance, steam: &SteamInfo) -> Result<Resolved> {
+    let builds = game::builds(&inst.game_dir());
+    let windows = builds.contains(&Build::Windows);
+    let linux = builds.contains(&Build::Linux);
+    let no_windows = |how: &str| {
+        anyhow::anyhow!(
+            "{} has no {} (the Windows build) to run through {how}",
+            inst.config.name,
+            game::WINDOWS_EXE
+        )
+    };
+    Ok(match inst.config.launch.runner {
+        Runner::Proton if windows => Resolved::Proton,
+        Runner::Proton => return Err(no_windows("Proton")),
+        Runner::Wine if windows => Resolved::Wine,
+        Runner::Wine => return Err(no_windows("Wine")),
+        Runner::Native if linux => Resolved::Native,
+        Runner::Native => bail!(
+            "{} has no {} (the native Linux build). Steam installs it when KSP's \
+             compatibility tool is off; GOG and the KSP store offer it as a download",
+            inst.config.name,
+            game::LINUX_EXE
+        ),
+        Runner::Auto if windows && steam.proton.is_some() => Resolved::Proton,
+        Runner::Auto if windows => Resolved::Wine,
+        Runner::Auto if linux => Resolved::Native,
+        Runner::Auto => bail!(
+            "{} has neither {} nor {}",
+            inst.game_dir().display(),
+            game::WINDOWS_EXE,
+            game::LINUX_EXE
+        ),
+    })
+}
+
 /// Works out how to start an instance.
 pub fn plan(inst: &Instance, steam: &SteamInfo, config: &Config) -> Result<LaunchPlan> {
-    let game = inst.game_dir();
-    let exe = game.join("KSP_x64.exe");
-    if !exe.is_file() {
-        bail!("{} is missing", exe.display());
+    match resolve(inst, steam)? {
+        Resolved::Proton => plan_proton(inst, steam, config),
+        Resolved::Wine => plan_wine(inst, config),
+        Resolved::Native => Ok(plan_native(inst)),
     }
+}
+
+/// The Wine prefix of an instance run through Wine, laid out like Proton's
+/// (the Wine prefix proper in `pfx/`).
+pub fn wine_prefix(inst: &Instance) -> PathBuf {
+    inst.prefix_dir().join("pfx")
+}
+
+fn plan_wine(inst: &Instance, config: &Config) -> Result<LaunchPlan> {
+    let game = inst.game_dir();
+    let wine = match &config.wine {
+        Some(w) if w.is_file() => w.clone(),
+        Some(w) => bail!("{} (wine in config.toml) doesn't exist", w.display()),
+        None => find_in_path("wine").context(
+            "no Proton or Wine found: install Wine, set `wine` or `proton` in config.toml, or pick a Proton for KSP in Steam",
+        )?,
+    };
+    let prefix = wine_prefix(inst);
+    fs::create_dir_all(&prefix).with_context(|| format!("create {}", prefix.display()))?;
+    let mut env: Vec<(String, OsString)> = vec![("WINEPREFIX".into(), prefix.into_os_string())];
+    add_user_env(inst, &mut env);
+    let mut args = vec![game.join(game::WINDOWS_EXE).into_os_string()];
+    args.extend(inst.config.launch.args.iter().map(OsString::from));
+    Ok(LaunchPlan {
+        program: wine,
+        args,
+        env,
+        cwd: game,
+        log: inst.dir.join("orbis-launch.log"),
+    })
+}
+
+fn plan_native(inst: &Instance) -> LaunchPlan {
+    let game = inst.game_dir();
+    // KSP reads numbers in config files with the system locale: where the
+    // decimal separator is a comma, parts and mods load wrong.
+    let mut env: Vec<(String, OsString)> = vec![("LC_ALL".into(), "C".into())];
+    add_user_env(inst, &mut env);
+    LaunchPlan {
+        program: game.join(game::LINUX_EXE),
+        args: inst.config.launch.args.iter().map(OsString::from).collect(),
+        env,
+        cwd: game,
+        log: inst.dir.join("orbis-launch.log"),
+    }
+}
+
+/// The instance's own environment variables, overriding orbis's.
+fn add_user_env(inst: &Instance, env: &mut Vec<(String, OsString)>) {
+    for (k, v) in &inst.config.launch.env {
+        env.retain(|(ek, _)| ek != k);
+        env.push((k.clone(), v.into()));
+    }
+}
+
+/// The first executable called `name` on PATH.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// The Proton prefix an instance runs in: Steam's KSP prefix when it shares
+/// it, and its own when it doesn't or there's no Steam.
+pub fn proton_prefix(inst: &Instance, steam: &SteamInfo) -> PathBuf {
+    match (inst.config.launch.prefix, steam.ksp_prefix()) {
+        (PrefixMode::Steam, Some(p)) => p,
+        _ => inst.prefix_dir(),
+    }
+}
+
+fn plan_proton(inst: &Instance, steam: &SteamInfo, config: &Config) -> Result<LaunchPlan> {
+    let game = inst.game_dir();
+    let exe = game.join(game::WINDOWS_EXE);
     let proton = steam.proton.clone().context(
         "no Proton found: set `proton` in config.toml or pick a Proton for KSP in Steam",
     )?;
     if !proton.join("proton").is_file() {
         bail!("{} has no proton script", proton.display());
     }
-    let root = steam
-        .root
-        .clone()
-        .context("Steam not found: set `steam_root` in config.toml")?;
-    let prefix = match inst.config.launch.prefix {
-        PrefixMode::Steam => steam.ksp_prefix().context(
-            "Steam's KSP prefix not found; run KSP from Steam once or use an instance prefix",
-        )?,
-        PrefixMode::Instance => inst.prefix_dir(),
-    };
+    // Proton runs without Steam too (KSP has no DRM); it only uses Steam's
+    // folder for the Steam client libraries, which KSP doesn't need.
+    let root = steam.root.clone().unwrap_or_default();
+    let prefix = proton_prefix(inst, steam);
     fs::create_dir_all(&prefix).with_context(|| format!("create {}", prefix.display()))?;
 
     let mut tool_paths = vec![proton.clone()];
@@ -115,10 +243,7 @@ pub fn plan(inst: &Instance, steam: &SteamInfo, config: &Config) -> Result<Launc
             join(&[base.clone(), inst.dir.clone()]),
         ));
     }
-    for (k, v) in &inst.config.launch.env {
-        env.retain(|(ek, _)| ek != k);
-        env.push((k.clone(), v.into()));
-    }
+    add_user_env(inst, &mut env);
 
     let mut args: Vec<OsString> = Vec::new();
     let program = match &sniper {
@@ -246,8 +371,8 @@ pub fn launch_via_steam(
     steam: &SteamInfo,
 ) -> Result<()> {
     let game = inst.game_dir();
-    if !game.join("KSP_x64.exe").is_file() {
-        bail!("{} is missing KSP_x64.exe", game.display());
+    if !game::is_game_dir(&game) {
+        bail!("{} holds no KSP build", game.display());
     }
     let opts = current_steam_launch_options(steam).unwrap_or_default();
     if !opts.contains("steam-run") {
@@ -303,15 +428,19 @@ pub fn rewrite(command: &[OsString], note: Option<&SteamNote>, now: u64) -> Rewr
     let Some(note) = note.filter(|n| now.saturating_sub(n.created) <= NOTE_TTL_SECS) else {
         return untouched;
     };
-    let Some(i) = command.iter().position(|a| {
-        std::path::Path::new(a)
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("KSP_x64.exe"))
+    // Steam's command ends in the Windows build under Proton, or the Linux
+    // build in the Steam Runtime: point whichever it is at the instance.
+    let Some((i, exe)) = command.iter().enumerate().find_map(|(i, a)| {
+        let name = std::path::Path::new(a).file_name()?.to_str()?;
+        [game::WINDOWS_EXE, game::LINUX_EXE]
+            .into_iter()
+            .find(|e| e.eq_ignore_ascii_case(name))
+            .map(|e| (i, e))
     }) else {
         return untouched;
     };
     let mut args = command.to_vec();
-    args[i] = note.game_dir.join("KSP_x64.exe").into_os_string();
+    args[i] = note.game_dir.join(exe).into_os_string();
     args.extend(note.args.iter().map(OsString::from));
     let mut mounts = std::env::var_os("STEAM_COMPAT_MOUNTS").unwrap_or_default();
     for p in note.base.iter().chain(std::iter::once(&note.instance_dir)) {
@@ -362,7 +491,7 @@ pub fn steam_run(paths: &crate::paths::Paths, command: &[OsString]) -> Result<i3
             n.game_dir.display()
         ),
         (Some(_), false) => {
-            "launch note ignored (stale, or no KSP_x64.exe in Steam's command)".to_owned()
+            "launch note ignored (stale, or no KSP executable in Steam's command)".to_owned()
         }
         (None, _) => "no launch note: running KSP from the Steam install".to_owned(),
     };
@@ -401,7 +530,10 @@ pub fn steam_run(paths: &crate::paths::Paths, command: &[OsString]) -> Result<i3
         .with_context(|| format!("run {}", r.args[0].to_string_lossy()));
     if let Some(dir) = &instance_dir {
         crate::running::clear(dir, std::process::id());
-        let line = match crate::crafts::sync(paths) {
+        let line = match paths
+            .check_format()
+            .and_then(|()| crate::crafts::sync(paths))
+        {
             Ok(rep) => format!("craft sync: {}\n", rep.summary()),
             Err(e) => format!("craft sync failed: {e:#}\n"),
         };
@@ -428,6 +560,126 @@ mod tests {
             args: vec!["-popupwindow".into()],
             env: vec![("DXVK_HUD".into(), "fps".into())],
         }
+    }
+
+    fn instance_with(dir: &std::path::Path, exes: &[&str], runner: Runner) -> Instance {
+        let game = dir.join("game");
+        fs::create_dir_all(game.join("GameData")).expect("mkdir");
+        for e in exes {
+            fs::write(game.join(e), b"").expect("write");
+        }
+        let mut inst = Instance {
+            id: "t".into(),
+            dir: dir.to_path_buf(),
+            config: toml::from_str("name = \"T\"\ngame_version = \"1.12.5\"\ncreated = 0\n")
+                .expect("config"),
+        };
+        inst.config.launch.runner = runner;
+        inst
+    }
+
+    #[test]
+    fn picks_what_runs_the_game() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let with_proton = SteamInfo {
+            proton: Some(PathBuf::from("/proton")),
+            ..SteamInfo::default()
+        };
+        let none = SteamInfo::default();
+        let (win, lin) = (game::WINDOWS_EXE, game::LINUX_EXE);
+        let cases: [(&[&str], Runner, &SteamInfo, Option<Resolved>); 9] = [
+            (&[win], Runner::Auto, &with_proton, Some(Resolved::Proton)),
+            (&[win], Runner::Auto, &none, Some(Resolved::Wine)),
+            (&[lin], Runner::Auto, &with_proton, Some(Resolved::Native)),
+            (
+                &[win, lin],
+                Runner::Auto,
+                &with_proton,
+                Some(Resolved::Proton),
+            ),
+            (
+                &[win, lin],
+                Runner::Native,
+                &with_proton,
+                Some(Resolved::Native),
+            ),
+            (&[win], Runner::Wine, &with_proton, Some(Resolved::Wine)),
+            (&[lin], Runner::Proton, &with_proton, None),
+            (&[win], Runner::Native, &with_proton, None),
+            (&[], Runner::Auto, &with_proton, None),
+        ];
+        for (i, (exes, runner, steam, want)) in cases.into_iter().enumerate() {
+            let inst = instance_with(&tmp.path().join(i.to_string()), exes, runner);
+            assert_eq!(
+                resolve(&inst, steam).ok(),
+                want,
+                "case {i}: {exes:?} {runner:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plans_native_and_wine_launches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut inst = instance_with(tmp.path(), &[game::LINUX_EXE], Runner::Native);
+        inst.config.launch.args = vec!["-popupwindow".into()];
+        let p = plan(&inst, &SteamInfo::default(), &Config::default()).expect("native");
+        assert_eq!(p.program, inst.game_dir().join(game::LINUX_EXE));
+        assert_eq!(p.args, [OsString::from("-popupwindow")]);
+        assert!(p.env.contains(&("LC_ALL".into(), "C".into())));
+
+        // The instance's own variables win.
+        inst.config
+            .launch
+            .env
+            .insert("LC_ALL".into(), "en_US.UTF-8".into());
+        let p = plan(&inst, &SteamInfo::default(), &Config::default()).expect("native");
+        assert_eq!(
+            p.env,
+            [("LC_ALL".to_owned(), OsString::from("en_US.UTF-8"))]
+        );
+
+        let wine = tmp.path().join("bin/wine");
+        fs::create_dir_all(wine.parent().expect("parent")).expect("mkdir");
+        fs::write(&wine, b"").expect("write");
+        let inst = instance_with(&tmp.path().join("w"), &[game::WINDOWS_EXE], Runner::Wine);
+        let config = Config {
+            wine: Some(wine.clone()),
+            ..Config::default()
+        };
+        let p = plan(&inst, &SteamInfo::default(), &config).expect("wine");
+        assert_eq!(p.program, wine);
+        assert_eq!(
+            p.args[0],
+            inst.game_dir().join(game::WINDOWS_EXE).into_os_string()
+        );
+        assert!(
+            p.env
+                .contains(&("WINEPREFIX".into(), wine_prefix(&inst).into_os_string()))
+        );
+        assert!(wine_prefix(&inst).is_dir());
+    }
+
+    #[test]
+    fn rewrites_the_native_build_too() {
+        let steam: Vec<OsString> = [
+            "/steam/ubuntu12_32/reaper",
+            "SteamLaunch",
+            "AppId=220200",
+            "--",
+            "/steam/common/SteamLinuxRuntime_sniper/_v2-entry-point",
+            "--verb=waitforexitandrun",
+            "--",
+            "/steam/common/Kerbal Space Program/KSP.x86_64",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let r = rewrite(&steam, Some(&note(1000)), 1010);
+        assert_eq!(
+            r.args[7],
+            OsString::from("/orbis/instances/career/game/KSP.x86_64")
+        );
     }
 
     #[test]

@@ -39,9 +39,20 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(root: Option<&Path>) -> Result<Self> {
+    /// Opens orbis's directories. `strict` refuses data in a newer format
+    /// and a broken `config.toml`; the Steam wrapper isn't strict, since it
+    /// must start the game whatever state orbis's files are in.
+    pub fn new(root: Option<&Path>, strict: bool) -> Result<Self> {
         let paths = Paths::new(root)?;
-        let config = Config::load(&paths)?;
+        let config = if strict {
+            paths.check_format()?;
+            Config::load(&paths)?
+        } else {
+            Config::load(&paths).unwrap_or_else(|e| {
+                log::warn!("{e:#}");
+                Config::default()
+            })
+        };
         Ok(Self {
             paths,
             config,
@@ -55,6 +66,14 @@ impl Context {
             self.config.steam_root.as_deref(),
             self.config.proton.as_deref(),
         )
+    }
+
+    /// Steam's KSP, or else one found in GOG's or Heroic's usual places.
+    fn default_install(&self) -> Result<PathBuf> {
+        self.steam()
+            .ksp
+            .or_else(|| orbis::game::other_installs().into_iter().next())
+            .context("no KSP install found in Steam, GOG or Heroic; pass --from <dir>")
     }
 
     fn index(&self) -> Result<Index> {
@@ -81,6 +100,12 @@ pub enum Command {
     Gui(gui::Options),
     /// Download the latest CKAN mod index.
     Update,
+    /// Update orbis itself to the latest GitHub release.
+    SelfUpdate {
+        /// Only say whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+    },
     /// Search mods by name, identifier, abstract, author or tag.
     Search {
         query: String,
@@ -136,7 +161,8 @@ pub enum Command {
     /// Manage the custom flag library (shared by all instances).
     #[command(subcommand)]
     Flag(FlagCmd),
-    /// Start an instance through Proton.
+    /// Start an instance (through Proton, Wine or natively; see
+    /// `instance launcher`).
     Launch {
         instance: Option<String>,
         /// Print the command instead of running it.
@@ -183,6 +209,13 @@ pub enum Command {
         /// with it (btrfs and XFS).
         #[arg(long)]
         share: bool,
+    },
+    /// Print a bug report (system, Steam, the instance's mods and log
+    /// errors) with your home folder and user name taken out, to paste into
+    /// a GitHub issue.
+    Report {
+        #[arg(short, long)]
+        instance: Option<String>,
     },
     /// Summarise a log: exceptions grouped, with the mods they came from.
     Logs {
@@ -276,8 +309,12 @@ pub enum InstanceCmd {
     /// Steam, for the overlay and playtime).
     Launcher {
         instance: Option<String>,
+        /// Start the game directly, or through Steam (overlay, playtime).
         #[arg(long, value_parser = ["direct", "steam"])]
-        via: String,
+        via: Option<String>,
+        /// What runs the game when started directly.
+        #[arg(long, value_parser = ["auto", "proton", "wine", "native"])]
+        runner: Option<String>,
     },
     /// Re-link a linked instance to its base install (done before every launch).
     Sync { instance: Option<String> },
@@ -495,6 +532,33 @@ pub enum HistoryCmd {
 pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
     match cmd {
         Command::Gui(_) => unreachable!("main handles the GUI"),
+        Command::SelfUpdate { check } => {
+            let cancel = Cancel::default();
+            let release = orbis::update::latest(&ctx.paths, orbis::update::LATEST_URL, &cancel)?;
+            let current = env!("CARGO_PKG_VERSION");
+            if !release.is_newer() {
+                writeln!(io::stdout(), "orbis {current} is the latest release")?;
+                return Ok(());
+            }
+            writeln!(
+                io::stdout(),
+                "orbis {} is available (this is {current}): {}",
+                release.version(),
+                release.html_url
+            )?;
+            if check {
+                return Ok(());
+            }
+            let exe = orbis::update::current_exe()?;
+            orbis::update::install(&ctx.paths, &release, &exe, &cancel)?;
+            writeln!(
+                io::stdout(),
+                "Updated {} to {}",
+                exe.display(),
+                release.version()
+            )?;
+            Ok(())
+        }
         Command::Update => {
             let s = repo::update(
                 &ctx.paths,
@@ -689,6 +753,9 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             for (k, v) in steam.report() {
                 writeln!(io::stdout(), "{k:14} {v}")?;
             }
+            for dir in orbis::game::other_installs() {
+                writeln!(io::stdout(), "{:14} {}", "Other KSP", dir.display())?;
+            }
             Ok(())
         }
         Command::Star { mods } => {
@@ -762,6 +829,16 @@ pub fn run(ctx: &Context, cmd: Command) -> Result<()> {
             Ok(())
         }
         Command::History(c) => history_cmd(ctx, c),
+        Command::Report { instance } => {
+            // Without -i, report on the only instance when there's one.
+            let inst = match instance {
+                Some(key) => Some(ctx.instance(Some(&key))?),
+                None => ctx.instance(None).ok(),
+            };
+            let text = orbis::report::build(&ctx.config, &ctx.steam(), inst.as_ref());
+            io::stdout().write_all(text.as_bytes())?;
+            Ok(())
+        }
         Command::Logs { instance, log } => {
             let inst = ctx.instance(instance.as_deref())?;
             let kind = match log.as_str() {
@@ -935,10 +1012,7 @@ fn pack_cmd(ctx: &Context, cmd: PackCmd) -> Result<()> {
             let index = ctx.index()?;
             let base = match from {
                 Some(p) => p,
-                None => ctx
-                    .steam()
-                    .ksp
-                    .context("KSP not found in Steam; pass --from <dir>")?,
+                None => ctx.default_install()?,
             };
             let opts = modpack::ImportOptions {
                 path: file,
@@ -1233,10 +1307,7 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
         } => {
             let source = match from {
                 Some(p) => p,
-                None => ctx
-                    .steam()
-                    .ksp
-                    .context("KSP not found in Steam; pass --from <dir>")?,
+                None => ctx.default_install()?,
             };
             let opts = CreateOptions {
                 name,
@@ -1276,20 +1347,33 @@ fn instance_cmd(ctx: &Context, cmd: InstanceCmd) -> Result<()> {
             )?;
             Ok(())
         }
-        InstanceCmd::Launcher { instance, via } => {
+        InstanceCmd::Launcher {
+            instance,
+            via,
+            runner,
+        } => {
             let mut inst = ctx.instance(instance.as_deref())?;
-            inst.config.launch.via_steam = via == "steam";
+            if let Some(via) = via {
+                inst.config.launch.via_steam = via == "steam";
+            }
+            if let Some(r) = runner {
+                inst.config.launch.runner =
+                    instance::Runner::from_name(&r).context("unknown runner")?;
+            }
             inst.save()?;
-            writeln!(
-                io::stdout(),
-                "{} now launches {}",
-                inst.config.name,
-                if inst.config.launch.via_steam {
-                    "through Steam"
-                } else {
-                    "directly through Proton"
+            let how = if inst.config.launch.via_steam {
+                "through Steam".to_owned()
+            } else {
+                let runner = inst.config.launch.runner;
+                match launch::resolve(&inst, &ctx.steam()) {
+                    Ok(r) => format!("with {} (runner: {})", r.label(), runner.name()),
+                    Err(e) => format!(
+                        "with runner {}, which can't start it yet: {e:#}",
+                        runner.name()
+                    ),
                 }
-            )?;
+            };
+            writeln!(io::stdout(), "{} launches {how}", inst.config.name)?;
             Ok(())
         }
         InstanceCmd::ImportCkan { dir, name, copy } => {

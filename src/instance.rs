@@ -55,7 +55,7 @@ pub struct InstanceConfig {
 /// How an instance starts.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct LaunchConfig {
-    /// Extra arguments for KSP_x64.exe (for example `-popupwindow`).
+    /// Extra arguments for the game (for example `-popupwindow`).
     #[serde(default)]
     pub args: Vec<String>,
     /// Extra environment variables (for example `DXVK_HUD=fps`).
@@ -68,6 +68,51 @@ pub struct LaunchConfig {
     /// `orbis steam-run %command%`.
     #[serde(default)]
     pub via_steam: bool,
+    /// What runs the game.
+    #[serde(default)]
+    pub runner: Runner,
+}
+
+/// What runs the game.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Runner {
+    /// The Windows build through Proton when one is found, then Wine; the
+    /// Linux build natively.
+    #[default]
+    Auto,
+    /// The Windows build through Proton.
+    Proton,
+    /// The Windows build through Wine (`wine` in config.toml, or on PATH).
+    Wine,
+    /// The native Linux build.
+    Native,
+}
+
+impl Runner {
+    pub const ALL: [Runner; 4] = [Runner::Auto, Runner::Proton, Runner::Wine, Runner::Native];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Runner::Auto => "auto",
+            Runner::Proton => "proton",
+            Runner::Wine => "wine",
+            Runner::Native => "native",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Runner::Auto => "Automatic",
+            Runner::Proton => "Proton",
+            Runner::Wine => "Wine",
+            Runner::Native => "Native Linux build",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.name() == s)
+    }
 }
 
 /// Which Wine prefix the instance runs in.
@@ -453,6 +498,16 @@ const GENERATED: [&str; 7] = [
 /// Stock GameData folders a linked instance links from its base.
 const STOCK_GAMEDATA: [&str; 2] = ["Squad", "SquadExpansion"];
 
+/// The Linux build's executable and player library are copied, not linked:
+/// Unity finds the game through the executable's real path, so a link would
+/// run the base install (its GameData and saves) instead of the instance.
+/// On btrfs and XFS the copies share disk space with the base.
+const COPIED: [&str; 2] = [game::LINUX_EXE, "UnityPlayer.so"];
+
+/// The Linux build's data folder is a real folder of links, so its path
+/// stays inside the instance whatever Unity resolves.
+const LINKED_CONTENTS: [&str; 1] = ["KSP_Data"];
+
 fn is_in(list: &[&str], name: &str) -> bool {
     list.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
@@ -485,6 +540,7 @@ fn build_linked(base: &Path, game: &Path, with_saves: bool, progress: CopyProgre
 fn link_missing(base: &Path, game: &Path) -> Result<usize> {
     let mut changed = 0;
     let mut wanted: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut real_dirs = vec![game.to_path_buf(), game.join("GameData")];
     for entry in fs::read_dir(base).with_context(|| format!("read {}", base.display()))? {
         let name = entry
             .with_context(|| format!("read {}", base.display()))?
@@ -493,7 +549,27 @@ fn link_missing(base: &Path, game: &Path) -> Result<usize> {
         if is_in(&OWNED, &n) || is_in(&GENERATED, &n) {
             continue;
         }
-        wanted.push((base.join(&name), game.join(&name)));
+        let (from, to) = (base.join(&name), game.join(&name));
+        if COPIED.contains(&n.as_ref()) && from.is_file() {
+            if refresh_copy(&from, &to)? {
+                changed += 1;
+            }
+        } else if LINKED_CONTENTS.contains(&n.as_ref()) && from.is_dir() {
+            if fs::symlink_metadata(&to).is_ok_and(|m| m.file_type().is_symlink()) {
+                fs::remove_file(&to).with_context(|| format!("replace {}", to.display()))?;
+                changed += 1;
+            }
+            fs::create_dir_all(&to).with_context(|| format!("create {}", to.display()))?;
+            for child in fs::read_dir(&from).with_context(|| format!("read {}", from.display()))? {
+                let child = child
+                    .with_context(|| format!("read {}", from.display()))?
+                    .file_name();
+                wanted.push((from.join(&child), to.join(&child)));
+            }
+            real_dirs.push(to);
+        } else {
+            wanted.push((from, to));
+        }
     }
     for stock in STOCK_GAMEDATA {
         let target = base.join("GameData").join(stock);
@@ -517,7 +593,7 @@ fn link_missing(base: &Path, game: &Path) -> Result<usize> {
             .with_context(|| format!("link {}", link.display()))?;
         changed += 1;
     }
-    for dir in [game.to_path_buf(), game.join("GameData")] {
+    for dir in real_dirs {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -531,6 +607,24 @@ fn link_missing(base: &Path, game: &Path) -> Result<usize> {
         }
     }
     Ok(changed)
+}
+
+/// Makes `to` a copy of `from`, unless it already is one (same size, and
+/// not older). Returns whether it copied.
+fn refresh_copy(from: &Path, to: &Path) -> Result<bool> {
+    let src = fs::metadata(from).with_context(|| format!("stat {}", from.display()))?;
+    if let Ok(dst) = fs::symlink_metadata(to)
+        && dst.is_file()
+        && dst.len() == src.len()
+        && dst.modified().ok() >= src.modified().ok()
+    {
+        return Ok(false);
+    }
+    if fs::symlink_metadata(to).is_ok() {
+        fs::remove_file(to).with_context(|| format!("replace {}", to.display()))?;
+    }
+    fs::copy(from, to).with_context(|| format!("copy {}", from.display()))?;
+    Ok(true)
 }
 
 /// Brings a linked instance in line with its base install: adds links for
@@ -777,6 +871,52 @@ mod tests {
         delete(&inst).expect("delete");
         assert!(ksp.join("KSP_x64.exe").is_file());
         assert!(ksp.join("GameData/Squad/Parts/part.cfg").is_file());
+    }
+
+    #[test]
+    fn links_the_linux_build_so_it_runs_from_the_instance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ksp = tmp.path().join("ksp");
+        fake_ksp(&ksp);
+        fs::remove_file(ksp.join("KSP_x64.exe")).expect("remove");
+        fs::write(ksp.join(game::LINUX_EXE), b"elf").expect("write");
+        fs::write(ksp.join("UnityPlayer.so"), b"so").expect("write");
+        fs::create_dir_all(ksp.join("KSP_Data/Managed")).expect("mkdir");
+        fs::write(ksp.join("KSP_Data/globalgamemanagers"), b"g").expect("write");
+        fs::create_dir_all(ksp.join("MonoBleedingEdge")).expect("mkdir");
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let opts = CreateOptions {
+            name: "Native".into(),
+            source: ksp.clone(),
+            stock_only: true,
+            with_saves: false,
+            mode: CopyMode::Link,
+        };
+        let mut inst = create(&paths, &opts, &mut |_, _| {}).expect("create");
+        let g = inst.game_dir();
+        let is_link = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+        for f in [game::LINUX_EXE, "UnityPlayer.so"] {
+            assert!(g.join(f).is_file() && !is_link(&g.join(f)), "{f} is a copy");
+        }
+        assert!(g.join("KSP_Data").is_dir() && !is_link(&g.join("KSP_Data")));
+        assert!(is_link(&g.join("KSP_Data/Managed")));
+        assert!(is_link(&g.join("KSP_Data/globalgamemanagers")));
+        assert!(is_link(&g.join("MonoBleedingEdge")));
+
+        // A game update replaces the executable and drops a data file.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(ksp.join(game::LINUX_EXE), b"elf v2").expect("write");
+        fs::remove_file(ksp.join("KSP_Data/globalgamemanagers")).expect("remove");
+        sync_links(&mut inst).expect("sync");
+        assert_eq!(fs::read(g.join(game::LINUX_EXE)).expect("read"), b"elf v2");
+        assert!(fs::symlink_metadata(g.join("KSP_Data/globalgamemanagers")).is_err());
+
+        delete(&inst).expect("delete");
+        assert_eq!(
+            fs::read(ksp.join(game::LINUX_EXE)).expect("read"),
+            b"elf v2"
+        );
+        assert!(ksp.join("KSP_Data/Managed").is_dir());
     }
 
     #[test]

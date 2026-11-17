@@ -1,0 +1,11 @@
+name: Feature request
+description: Something orbis should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you'd like
+      description: What you're trying to do, and how orbis could help.
+    validations:
+      required: true

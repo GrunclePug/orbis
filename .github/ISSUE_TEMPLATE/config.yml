@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: A problem with a mod itself
+    url: https://forum.kerbalspaceprogram.com/forum/70-ksp1-mod-releases/
+    about: If a mod misbehaves the same way when installed by hand or with CKAN, ask in its forum thread. Please don't send mod authors or the CKAN team problems caused by orbis.

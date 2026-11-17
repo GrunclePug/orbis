@@ -1,0 +1,38 @@
+name: Release
+
+# Push a tag named after the version in Cargo.toml (v0.14.0) to publish it.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # The oldest supported Ubuntu, so the binary runs on older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+      - name: Build
+        run: make build
+      - name: Package
+        run: |
+          dir=orbis-x86_64-linux
+          mkdir "$dir"
+          cp target/release/orbis LICENSE NOTICE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            orbis-x86_64-linux.tar.gz orbis-x86_64-linux.tar.gz.sha256 \
+            --title "orbis ${GITHUB_REF_NAME#v}" --generate-notes

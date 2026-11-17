@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 
 use crate::install::{self, Source};
 use crate::instance::Instance;
+use crate::launch::Resolved;
 use crate::steam::SteamInfo;
 
 /// Which log to read.
@@ -16,7 +17,8 @@ use crate::steam::SteamInfo;
 pub enum LogKind {
     /// `KSP.log` in the game directory, written by KSP itself.
     Ksp,
-    /// Unity's `Player.log` in the Wine prefix (full stack traces).
+    /// Unity's `Player.log` (full stack traces), in the Wine prefix or, for
+    /// the Linux build, `~/.config/unity3d`.
     Player,
     /// Proton's output, captured by orbis at launch.
     Launch,
@@ -34,19 +36,30 @@ impl LogKind {
     }
 }
 
-/// Where a log lives for an instance. `Player.log` is in the prefix, so with
-/// the shared Steam prefix it belongs to whichever instance ran last.
+/// Where a log lives for an instance. `Player.log` is per prefix (or per
+/// user, for the Linux build), so when instances share one it belongs to
+/// whichever ran last.
 pub fn path(inst: &Instance, steam: &SteamInfo, kind: LogKind) -> Option<PathBuf> {
+    const UNITY: &str = "Squad/Kerbal Space Program/Player.log";
     match kind {
         LogKind::Ksp => Some(inst.game_dir().join("KSP.log")),
         LogKind::Launch => Some(inst.dir.join("orbis-launch.log")),
-        LogKind::Player => {
-            let prefix = match inst.config.launch.prefix {
-                crate::instance::PrefixMode::Steam => steam.ksp_prefix()?,
-                crate::instance::PrefixMode::Instance => inst.prefix_dir(),
-            };
-            Some(prefix.join("pfx/drive_c/users/steamuser/AppData/LocalLow/Squad/Kerbal Space Program/Player.log"))
-        }
+        LogKind::Player => Some(match crate::launch::resolve(inst, steam).ok()? {
+            Resolved::Proton => crate::launch::proton_prefix(inst, steam)
+                .join("pfx/drive_c/users/steamuser/AppData/LocalLow")
+                .join(UNITY),
+            Resolved::Wine => crate::launch::wine_prefix(inst)
+                .join("drive_c/users")
+                .join(std::env::var_os("USER")?)
+                .join("AppData/LocalLow")
+                .join(UNITY),
+            Resolved::Native => std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .or_else(|| crate::paths::home().ok().map(|h| h.join(".config")))?
+                .join("unity3d")
+                .join(UNITY),
+        }),
     }
 }
 

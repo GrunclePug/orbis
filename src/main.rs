@@ -25,7 +25,8 @@ struct Args {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = Args::parse();
-    let ctx = cli::Context::new(args.root.as_deref())?;
+    let strict = !matches!(args.command, Some(cli::Command::SteamRun { .. }));
+    let ctx = cli::Context::new(args.root.as_deref(), strict)?;
     let result = match args.command {
         None => gui::run(ctx, gui::Options::default()),
         Some(cli::Command::Gui(opts)) => gui::run(ctx, opts),

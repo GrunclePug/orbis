@@ -1,6 +1,6 @@
 [package]
 name = "orbis"
-version = "0.13.4"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.100"
 description = "KSP mod manager with Prism-style instances, built on CKAN metadata"

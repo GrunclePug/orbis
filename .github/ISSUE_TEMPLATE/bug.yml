@@ -1,0 +1,24 @@
+name: Bug report
+description: orbis did something wrong, or KSP misbehaves only with orbis.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Bug report
+      description: In orbis, open the Logs tab and press **Copy bug report**, or run `orbis report -i <instance>`, and paste the result. It leaves out your home folder and user name; check it before posting.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: If KSP misbehaves, attach KSP.log (Logs tab > Open folder). Drag the file in rather than pasting it.

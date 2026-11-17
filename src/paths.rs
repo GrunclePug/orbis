@@ -3,7 +3,23 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+/// The layout of everything orbis keeps under its config and data
+/// directories. Bump it when a change would confuse an older orbis (a file
+/// renamed, a field whose meaning changed), and migrate older data up to it
+/// in `Paths::check_format`.
+pub const DATA_FORMAT: u32 = 1;
+
+/// `<data>/format.toml`: which layout the data is in, and which orbis
+/// wrote it last.
+#[derive(Debug, Serialize, Deserialize)]
+struct FormatFile {
+    format: u32,
+    #[serde(default)]
+    written_by: String,
+}
 
 /// The directories orbis reads and writes.
 #[derive(Clone, Debug)]
@@ -62,6 +78,47 @@ impl Paths {
     pub fn repo(&self) -> PathBuf {
         self.cache.join("repo")
     }
+
+    fn format_file(&self) -> PathBuf {
+        self.data.join("format.toml")
+    }
+
+    /// Makes sure this orbis understands the data on disk. Data written by
+    /// a newer orbis, in a layout this one doesn't know, is refused before
+    /// anything reads or rewrites it. Data from before the format was
+    /// recorded is format 1.
+    pub fn check_format(&self) -> Result<()> {
+        let path = self.format_file();
+        let found = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(
+                toml::from_str::<FormatFile>(&text)
+                    .with_context(|| format!("parse {}", path.display()))?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        if let Some(f) = &found
+            && f.format > DATA_FORMAT
+        {
+            bail!(
+                "orbis {} saved its data in a newer format ({} > {DATA_FORMAT}); \
+                 update orbis to {} or later to use it",
+                f.written_by,
+                f.format,
+                f.written_by
+            );
+        }
+        // Migrations from older formats go here, oldest first.
+        let current = FormatFile {
+            format: DATA_FORMAT,
+            written_by: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+        if found.is_none_or(|f| f.format != current.format || f.written_by != current.written_by) {
+            let text = toml::to_string(&current).context("serialize format")?;
+            write_atomic(&path, text.as_bytes())?;
+        }
+        Ok(())
+    }
 }
 
 /// The user's home directory from `$HOME`.
@@ -114,6 +171,26 @@ pub fn slug(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_data_from_a_newer_format() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path())).expect("paths");
+        paths.check_format().expect("first use records the format");
+        let text = std::fs::read_to_string(paths.format_file()).expect("written");
+        assert!(text.contains(&format!("format = {DATA_FORMAT}")), "{text}");
+        paths.check_format().expect("same format");
+
+        let newer = format!("format = {}\nwritten_by = \"9.0.0\"\n", DATA_FORMAT + 1);
+        std::fs::write(paths.format_file(), &newer).expect("write");
+        let err = paths.check_format().expect_err("newer format");
+        assert!(format!("{err:#}").contains("9.0.0"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(paths.format_file()).expect("read"),
+            newer,
+            "left alone"
+        );
+    }
 
     #[test]
     fn slugs() {
