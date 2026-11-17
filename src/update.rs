@@ -89,10 +89,59 @@ pub fn latest(paths: &Paths, url: &str, cancel: &Cancel) -> Result<Release> {
         // An ETag without the answer it belongs to would only get a 304.
         let _ = fs::remove_file(&etag);
     }
-    download::fetch(&[url.to_owned()], &json, Some(&etag), &mut |_| {}, cancel)
+    // curl saves the new ETag before the body arrives, so it goes to a
+    // scratch copy that replaces the real one only once its answer is in.
+    let pending = dir.join("latest.etag.new");
+    let _ = fs::remove_file(&pending);
+    if etag.is_file() {
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        fs::copy(&etag, &pending).with_context(|| format!("copy {}", etag.display()))?;
+    }
+    let result = (|| -> Result<Release> {
+        download::fetch(
+            &[url.to_owned()],
+            &json,
+            Some(&pending),
+            &mut |_| {},
+            cancel,
+        )
         .context("ask GitHub for the latest orbis release")?;
-    let text = fs::read_to_string(&json).with_context(|| format!("read {}", json.display()))?;
-    serde_json::from_str(&text).context("read the latest release")
+        let text = fs::read_to_string(&json).with_context(|| format!("read {}", json.display()))?;
+        serde_json::from_str(&text).context("read the latest release")
+    })();
+    match &result {
+        Ok(_) if pending.is_file() => {
+            fs::rename(&pending, &etag).with_context(|| format!("save {}", etag.display()))?;
+        }
+        Ok(_) => {}
+        Err(_) => {
+            let _ = fs::remove_file(&pending);
+        }
+    }
+    result
+}
+
+/// A file in `dir` that didn't exist before, opened for writing: never an
+/// existing file or a link someone left there.
+fn create_unique(dir: &Path, stem: &str) -> std::io::Result<(PathBuf, fs::File)> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let mut attempt = 0u32;
+    loop {
+        let path = dir.join(format!(".{stem}-{}-{nanos}-{attempt}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Why orbis can't replace the binary at `exe` itself, if it can't.
@@ -107,9 +156,8 @@ pub fn blocker(exe: &Path) -> Option<String> {
             "this orbis was built from source; update it with git pull and make build".into(),
         );
     }
-    let probe = dir.join(format!(".orbis-update-{}", std::process::id()));
-    match fs::File::create(&probe) {
-        Ok(_) => {
+    match create_unique(dir, "orbis-probe") {
+        Ok((probe, _)) => {
             let _ = fs::remove_file(&probe);
             None
         }
@@ -172,9 +220,10 @@ pub fn install(paths: &Paths, release: &Release, exe: &Path, cancel: &Cancel) ->
     )?;
 
     let parent = exe.parent().context("orbis has no parent directory")?;
-    let new = parent.join(".orbis.new");
+    let (new, file) = create_unique(parent, "orbis-new")
+        .with_context(|| format!("create a file in {}", parent.display()))?;
     let result = (|| -> Result<()> {
-        extract_binary(&tarball, &new)?;
+        extract_binary(&tarball, file)?;
         check_runs(&new, release.version())?;
         fs::rename(&new, exe).with_context(|| format!("replace {}", exe.display()))
     })();
@@ -186,8 +235,9 @@ pub fn install(paths: &Paths, release: &Release, exe: &Path, cancel: &Cancel) ->
     result
 }
 
-/// Writes the `orbis` file from the release archive to `dest`.
-fn extract_binary(tarball: &Path, dest: &Path) -> Result<()> {
+/// Writes the `orbis` file from the release archive into `dest`.
+fn extract_binary(tarball: &Path, mut dest: fs::File) -> Result<()> {
+    use std::io::Write as _;
     let file = fs::File::open(tarball).with_context(|| format!("open {}", tarball.display()))?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
     for entry in archive.entries().context("read the release archive")? {
@@ -200,9 +250,10 @@ fn extract_binary(tarball: &Path, dest: &Path) -> Result<()> {
         entry
             .read_to_end(&mut bytes)
             .context("unpack the orbis binary")?;
-        fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
-        fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("make {} executable", dest.display()))?;
+        dest.write_all(&bytes).context("write the new orbis")?;
+        dest.set_permissions(fs::Permissions::from_mode(0o755))
+            .context("make the new orbis executable")?;
+        dest.sync_all().context("write the new orbis")?;
         return Ok(());
     }
     bail!("the release archive holds no orbis binary")
@@ -319,7 +370,36 @@ mod tests {
         install(&paths, &release, &exe, &cancel).expect("install");
         let out = Command::new(&exe).arg("--version").output().expect("run");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "orbis 99.0.0");
-        assert!(!bin.join(".orbis.new").exists());
+        let left: Vec<_> = fs::read_dir(&bin)
+            .expect("read")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["orbis"], "no staging files left");
+    }
+
+    #[test]
+    fn staging_never_follows_a_planted_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let victim = tmp.path().join("notes.txt");
+        fs::write(&victim, "keep").expect("write");
+        let (path, _f) = create_unique(tmp.path(), "orbis-new").expect("create");
+        assert!(fs::symlink_metadata(&path).expect("stat").is_file());
+        assert_eq!(fs::read_to_string(&victim).expect("read"), "keep");
+    }
+
+    #[test]
+    fn a_broken_answer_doesnt_keep_its_etag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(&tmp.path().join("orbis"))).expect("paths");
+        let server = tmp.path().join("server");
+        fs::create_dir_all(&server).expect("mkdir");
+        let cancel = Cancel::default();
+        let url = fake_release(&server, "99.0.0", false);
+        latest(&paths, &url, &cancel).expect("first answer");
+        fs::write(server.join("latest.json"), "{ truncated").expect("write");
+        latest(&paths, &url, &cancel).expect_err("broken answer");
+        assert!(!paths.cache.join("update/latest.etag.new").exists());
     }
 
     #[test]

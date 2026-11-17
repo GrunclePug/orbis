@@ -68,6 +68,8 @@ pub fn detect(root: Option<&Path>, proton: Option<&Path>) -> SteamInfo {
         ..SteamInfo::default()
     };
     let Some(root) = info.root.clone() else {
+        // Proton runs without Steam: keep the one the user named.
+        info.proton = proton.map(Path::to_path_buf);
         return info;
     };
     info.libraries = library_folders(&root);

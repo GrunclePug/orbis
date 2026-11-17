@@ -51,7 +51,7 @@ pub fn build(config: &Config, steam: &SteamInfo, inst: Option<&Instance>) -> Str
         line(String::new());
         instance(inst, steam, &mut line);
     }
-    scrub(&out)
+    scrub(&hide_env(&out, inst))
 }
 
 fn instance(inst: &Instance, steam: &SteamInfo, line: &mut impl FnMut(String)) {
@@ -177,12 +177,38 @@ fn read_trim(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
 }
 
-/// Takes the home folder and user name out of the report.
+/// Environment values shorter than this stay in the report: they are
+/// switches like `1` or `fps`, and hiding them would garble every number.
+const MIN_SECRET: usize = 6;
+
+/// Takes the instance's environment values (they may be tokens, and the
+/// game or Proton can echo them into the logs) out of the report.
+fn hide_env(text: &str, inst: Option<&Instance>) -> String {
+    let mut out = text.to_owned();
+    let mut values: Vec<&str> = inst
+        .map(|i| i.config.launch.env.values().map(String::as_str).collect())
+        .unwrap_or_default();
+    // Longest first, so a value inside another doesn't split it.
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    for v in values {
+        if v.trim().len() >= MIN_SECRET {
+            out = out.replace(v, "<hidden>");
+        }
+    }
+    out
+}
+
+/// Takes the home folder and user name out of the report, in Unix paths
+/// and in the Windows paths Wine and Proton write (`Z:\home\me`, also
+/// with escaped backslashes).
 fn scrub(text: &str) -> String {
     let mut out = text.to_owned();
     if let Ok(home) = crate::paths::home() {
         let home = home.display().to_string();
         if home.len() > 1 {
+            for sep in ["\\\\", "\\"] {
+                out = out.replace(&home.replace('/', sep), "~");
+            }
             out = out.replace(&home, "~");
         }
     }
@@ -196,18 +222,18 @@ fn scrub(text: &str) -> String {
 
 /// Replaces `user` where it is a whole path component.
 fn scrub_user(text: &str, user: &str) -> String {
-    let needle = format!("/{user}");
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = rest.find(&needle) {
-        let after = &rest[i + needle.len()..];
-        let whole = after
-            .chars()
-            .next()
-            .is_none_or(|c| c == '/' || c.is_whitespace() || c == '"' || c == '\'');
+    while let Some(i) = rest.find(user) {
+        let before = rest[..i].chars().next_back();
+        let after = rest[i + user.len()..].chars().next();
+        let whole = before.is_some_and(|c| c == '/' || c == '\\')
+            && after.is_none_or(|c| {
+                c == '/' || c == '\\' || c.is_whitespace() || c == '"' || c == '\''
+            });
         out.push_str(&rest[..i]);
-        out.push_str(if whole { "/<user>" } else { &needle });
-        rest = after;
+        out.push_str(if whole { "<user>" } else { user });
+        rest = &rest[i + user.len()..];
     }
     out.push_str(rest);
     out
@@ -224,6 +250,8 @@ mod tests {
             ("/mnt/chad", "/mnt/<user>"),
             ("/home/chadwick/x", "/home/chadwick/x"),
             ("chad wrote this", "chad wrote this"),
+            (r"Z:\home\chad\Games", r"Z:\home\<user>\Games"),
+            (r"C:\\users\\chad\\x", r"C:\\users\\<user>\\x"),
         ];
         for (input, want) in cases {
             assert_eq!(scrub_user(input, "chad"), want, "{input}");
@@ -250,7 +278,7 @@ mod tests {
         inst.config
             .launch
             .env
-            .insert("SECRET".into(), "hunter2".into());
+            .insert("SECRET".into(), "hunter2-secret".into());
         let text = build(&Config::default(), &SteamInfo::default(), Some(&inst));
         assert!(text.contains("Instance: Career"), "{text}");
         assert!(text.contains("Builds: Linux"), "{text}");

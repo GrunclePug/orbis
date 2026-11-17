@@ -609,14 +609,14 @@ fn link_missing(base: &Path, game: &Path) -> Result<usize> {
     Ok(changed)
 }
 
-/// Makes `to` a copy of `from`, unless it already is one (same size, and
-/// not older). Returns whether it copied.
+/// Makes `to` a copy of `from`, unless it already holds the same bytes.
+/// Returns whether it copied.
 fn refresh_copy(from: &Path, to: &Path) -> Result<bool> {
     let src = fs::metadata(from).with_context(|| format!("stat {}", from.display()))?;
     if let Ok(dst) = fs::symlink_metadata(to)
         && dst.is_file()
         && dst.len() == src.len()
-        && dst.modified().ok() >= src.modified().ok()
+        && same_bytes(from, to)?
     {
         return Ok(false);
     }
@@ -625,6 +625,26 @@ fn refresh_copy(from: &Path, to: &Path) -> Result<bool> {
     }
     fs::copy(from, to).with_context(|| format!("copy {}", from.display()))?;
     Ok(true)
+}
+
+fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read as _;
+    let open = |p: &Path| File::open(p).with_context(|| format!("open {}", p.display()));
+    let (mut fa, mut fb) = (open(a)?, open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let n = fa
+            .read(&mut ba)
+            .with_context(|| format!("read {}", a.display()))?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])
+            .with_context(|| format!("read {}", b.display()))?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Brings a linked instance in line with its base install: adds links for
@@ -903,8 +923,21 @@ mod tests {
         assert!(is_link(&g.join("KSP_Data/globalgamemanagers")));
         assert!(is_link(&g.join("MonoBleedingEdge")));
 
-        // A game update replaces the executable and drops a data file.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A game update (here a same-size, older-looking one) replaces the
+        // executable and drops a data file.
+        fs::write(ksp.join(game::LINUX_EXE), b"ELF").expect("write");
+        let old = fs::metadata(g.join(game::LINUX_EXE))
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        fs::File::options()
+            .write(true)
+            .open(ksp.join(game::LINUX_EXE))
+            .expect("open")
+            .set_modified(old - std::time::Duration::from_secs(3600))
+            .expect("touch");
+        sync_links(&mut inst).expect("sync");
+        assert_eq!(fs::read(g.join(game::LINUX_EXE)).expect("read"), b"ELF");
         fs::write(ksp.join(game::LINUX_EXE), b"elf v2").expect("write");
         fs::remove_file(ksp.join("KSP_Data/globalgamemanagers")).expect("remove");
         sync_links(&mut inst).expect("sync");

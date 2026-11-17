@@ -456,6 +456,11 @@ pub fn rewrite(command: &[OsString], note: Option<&SteamNote>, now: u64) -> Rewr
         ),
         ("STEAM_COMPAT_MOUNTS".to_owned(), mounts),
     ];
+    if exe == game::LINUX_EXE {
+        // As for a direct native launch (see `plan_native`); the
+        // instance's own variables come after, so they still win.
+        env.push(("LC_ALL".to_owned(), "C".into()));
+    }
     if let Some(prefix) = &note.prefix {
         env.push((
             "STEAM_COMPAT_DATA_PATH".to_owned(),
@@ -680,6 +685,7 @@ mod tests {
             r.args[7],
             OsString::from("/orbis/instances/career/game/KSP.x86_64")
         );
+        assert!(r.env.contains(&("LC_ALL".to_owned(), OsString::from("C"))));
     }
 
     #[test]
