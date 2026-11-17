@@ -28,13 +28,17 @@ fn path(instance_dir: &Path) -> PathBuf {
     instance_dir.join("running.toml")
 }
 
-/// The start time of a live process, or `None` when it doesn't exist.
+/// The start time of a live process, or `None` when it doesn't exist or
+/// has already exited (a zombie its parent hasn't collected yet).
 fn start_time(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Fields after the command name, which is in parentheses and may hold
-    // spaces; starttime is field 22, the 20th after it.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(19)?.parse().ok()
+    // spaces: the state first, then starttime as the 20th after it.
+    let mut rest = stat[stat.rfind(')')? + 1..].split_whitespace();
+    if matches!(rest.next()?, "Z" | "X" | "x") {
+        return None;
+    }
+    rest.nth(18)?.parse().ok()
 }
 
 /// Records that `pid` runs the instance in `instance_dir`.
@@ -98,6 +102,21 @@ mod tests {
         assert!(is_running(tmp.path()), "another pid can't clear it");
         clear(tmp.path(), me);
         assert!(!is_running(tmp.path()));
+    }
+
+    #[test]
+    fn an_exited_but_uncollected_process_is_not_running() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .expect("spawn");
+        mark(tmp.path(), child.id(), "direct").expect("mark");
+        assert!(is_running(tmp.path()));
+        // Let it exit without collecting it: it stays a zombie.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(!is_running(tmp.path()), "a zombie isn't running");
+        child.wait().expect("reap");
     }
 
     #[test]
